@@ -1,0 +1,899 @@
+"""
+OpenAI 客户端实现
+
+OpenAI 兼容 API 客户端，唯一的 LLM 实现。
+"""
+
+# pyright: reportImportCycles=false, reportIncompatibleMethodOverride=false
+
+import asyncio
+import base64
+import json
+import mimetypes
+import os
+from io import BytesIO
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
+from PIL import Image
+
+from src.modules.llm.client import BaseLLMClient, LLMResponse
+from src.modules.llm.clients.openai.arguments import decode_tool_call
+from src.modules.llm.clients.openai.compat import build_openai_compatible_client_config
+from src.modules.llm.errors import FatalError, LLMError, LLMTimeoutError, RetryableError
+from src.modules.llm.interrupt import guarded_call
+from src.modules.llm.payload import (
+    GenerateRequest,
+    ImagePart,
+    ImageRefPart,
+    Message,
+    Reasoning,
+    Response,
+    TextPart,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
+from src.modules.llm.reasoning import ReasoningParseMode, split_reasoning
+from src.modules.logging import get_logger
+
+# 具体的 SDK 异常集合：Client 翻译处只捕获这些类型并翻译为分类异常
+_TRANSLATABLE_SDK_ERRORS = (APITimeoutError, APIConnectionError, RateLimitError, APIStatusError)
+
+# 无参数工具的协议兜底 schema：OpenAI 兼容端点普遍严格要求 function.parameters
+# 为 type:object 的 JSON Schema（DeepSeek 对 null/缺失直接 400 拒绝整个请求），
+# 中立 ToolSpec 允许 parameters=None（"无参数"），由本适配层负责补齐协议形态
+_EMPTY_OBJECT_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {}}
+
+# 非 SDK 契约路径的刻意兜底（流式降级 / legacy 失败包装 / 流关闭清理）：
+# 兼容端点的失败形态无法枚举，这些位置任何异常都不得逃出 legacy 语义；
+# 错误翻译路径不走此处——那里对 SDK 异常类型的捕获是具体的
+_LEGACY_FALLBACK_ERRORS = (Exception,)
+
+# 错误消息携带的服务端响应体长度上限：足够容纳拒绝原因原文，
+# 又不撑爆决策卡与日志里的单行展示
+_MAX_ERROR_DETAIL_CHARS = 500
+
+
+def _server_error_detail(exc: BaseException) -> str:
+    """提取服务端错误响应文本（压成单行、超长截断），供错误消息携带定位上下文。
+
+    SDK 的 APIStatusError 把响应体解析进 ``body``（4xx 时是服务端给出的
+    拒绝原因原文，如"消息序列非法/字段不识别"——定位 400 类问题的第一手
+    证据，缺失时回退异常自身的 message。
+    """
+    body = getattr(exc, "body", None)
+    text = " ".join(str(body).split()) if body else " ".join(str(exc).split())
+    if len(text) > _MAX_ERROR_DETAIL_CHARS:
+        text = text[:_MAX_ERROR_DETAIL_CHARS] + "…（截断）"
+    return text
+
+
+class OpenAIClient(BaseLLMClient):
+    """OpenAI 兼容 API 客户端。
+
+    按 provider 维度共享：构造时只持有连接信息（base_url/api_key/headers/
+    retry），model 由每次调用通过 ``model`` 参数传入。
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        super().__init__(config)
+        self.logger = get_logger(self.__class__.__name__)
+        client_config = build_openai_compatible_client_config(config)
+        api_key = client_config.api_key or "sk-dummy"
+        if not client_config.api_key or client_config.api_key == "your-api-key":
+            self.logger.warning("API Key 未配置，请在 config/model.toml 的 [[llm_providers]] 中设置")
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=client_config.base_url,
+            default_headers=client_config.default_headers or None,
+            default_query=client_config.default_query or None,
+            # 长生成持续等待服务端完成，用户取消由外层任务负责。
+            timeout=None,
+        )
+        # provider 级默认（profile 显式给值时覆盖）
+        self.temperature = config.get("temperature", 0.2)
+        self.logger.info(f"OpenAI 客户端初始化完成 (端点: {client_config.base_url})")
+
+    def _infer_mime_from_bytes(self, data: bytes) -> str:
+        """根据图片字节推断 MIME 类型，默认 image/png"""
+        try:
+            with Image.open(BytesIO(data)) as img:
+                format_to_mime = {
+                    "PNG": "image/png",
+                    "JPEG": "image/jpeg",
+                    "JPG": "image/jpeg",
+                    "WEBP": "image/webp",
+                    "GIF": "image/gif",
+                }
+                return format_to_mime.get(str(img.format), "image/png")
+        except (OSError, ValueError, TypeError, Image.DecompressionBombError):
+            return "image/png"
+
+    def _path_or_url_to_data_url(self, image: Union[str, bytes]) -> str:
+        """将 URL/本地路径/字节 转为 URL 或 data URL"""
+        if isinstance(image, str):
+            if image.startswith("http://") or image.startswith("https://"):
+                return image
+            if os.path.exists(image) and os.path.isfile(image):
+                with open(image, "rb") as f:
+                    data = f.read()
+                mime, _ = mimetypes.guess_type(image)
+                if mime is None:
+                    mime = self._infer_mime_from_bytes(data)
+                b64 = base64.b64encode(data).decode("ascii")
+                return f"data:{mime};base64,{b64}"
+            return image
+        if isinstance(image, (bytes, bytearray)):
+            data = bytes(image)
+            mime = self._infer_mime_from_bytes(data)
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"data:{mime};base64,{b64}"
+        raise TypeError("image 参数必须为 str(路径或URL) 或 bytes")
+
+    def _build_vision_user_content(
+        self, prompt: str, images: Union[str, bytes, List[Union[str, bytes]]]
+    ) -> List[Dict[str, Any]]:
+        """构建多模态 user content 列表，兼容 OpenAI Chat Completions 识图格式"""
+        contents: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        image_list: List[Union[str, bytes]] = images if isinstance(images, list) else [images]
+        for img in image_list:
+            contents.append({"type": "image_url", "image_url": {"url": self._path_or_url_to_data_url(img)}})
+        return contents
+
+    @staticmethod
+    def _normalize_tool_definitions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把内部扁平工具定义规范化为 OpenAI 协议形态。
+
+        项目内工具定义统一用扁平结构 {name, description, parameters}；
+        OpenAI 协议要求 {"type": "function", "function": {...}} 包装。
+        部分严格端点会拒绝扁平格式（400: missing field `type`），
+        已带 type 字段的定义原样保留。
+        """
+        normalized: List[Dict[str, Any]] = []
+        for tool in tools:
+            if "type" in tool:
+                normalized.append(tool)
+            else:
+                normalized.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                            # 缺键 / None / 空 dict 都不是合法 JSON Schema，
+                            # 统一兜底为空对象 schema（严格端点会 400 拒收）
+                            "parameters": tool.get("parameters") or _EMPTY_OBJECT_SCHEMA,
+                        },
+                    }
+                )
+        return normalized
+
+    # === 中立 payload 契约（Engine 入口）：payload ↔ OpenAI 协议形状的双向翻译 ===
+
+    @staticmethod
+    def _translate_sdk_error(exc: Exception) -> LLMError:
+        """把 OpenAI SDK 异常翻译为错误分类异常（分类产出只在 Client，Engine 只消费）。
+
+        - 超时 → LLMTimeoutError（切下一个模型）
+        - 限流 429 / 服务端 5xx / 网络连接失败 → RetryableError（有上限重试）
+        - 参数错误 400 / 鉴权失败 401 等其余 HTTP 状态 → FatalError（不重试），
+          携带服务端响应体原文（截断）——拒绝原因是定位参数问题的第一手证据
+        """
+        if isinstance(exc, APITimeoutError):
+            return LLMTimeoutError("LLM 请求超时", original=exc)
+        if isinstance(exc, RateLimitError):
+            return RetryableError("请求过于频繁（429），稍后重试", original=exc)
+        if isinstance(exc, APIConnectionError):
+            return RetryableError("网络连接失败，请检查网络或端点可达性", original=exc)
+        if isinstance(exc, APIStatusError):
+            status = exc.status_code
+            if status == 429 or status >= 500:
+                return RetryableError(f"服务端临时性失败（HTTP {status}）", original=exc)
+            return FatalError(
+                f"请求被服务端拒绝（HTTP {status}）：{_server_error_detail(exc)}，重试无意义",
+                original=exc,
+            )
+        # 防御：调用方应传入 _TRANSLATABLE_SDK_ERRORS 内的类型
+        return FatalError(f"未识别的 SDK 异常: {type(exc).__name__}", original=exc)
+
+    @staticmethod
+    def _ensure_not_empty(result: LLMResponse) -> None:
+        """空响应（无内容且无工具调用）视为临时性失败，归入 Retryable 由 Engine 重试。"""
+        if not result.content and not result.tool_calls:
+            # 只记录诊断量级，让调用者区分输出上限与正常结束的空回执，不暴露思考正文。
+            completion_tokens = (result.usage or {}).get("completion_tokens", "unknown")
+            raise RetryableError(
+                f"响应内容为空（finish_reason={result.finish_reason or 'unknown'}, "
+                f"completion_tokens={completion_tokens}, reasoning_chars={len(result.reasoning_content or '')}）"
+            )
+
+    @staticmethod
+    def _part_to_openai(part: Any) -> Dict[str, Any]:
+        """单个中立片段 → OpenAI content 片段（文本直出，图像转 image_url）
+
+        裸字符串是中立契约里文本的简写形式（``Part`` 联合类型），必须与
+        ``TextPart`` 等价处理——Engine 归一化文本消息时产出的正是这种形态。
+        """
+        if isinstance(part, str):
+            return {"type": "text", "text": part}
+        if isinstance(part, TextPart) or (isinstance(part, dict) and part.get("type") == "text"):
+            text = part.text if isinstance(part, TextPart) else part.get("text", "")
+            return {"type": "text", "text": text}
+        if isinstance(part, ImagePart):
+            return {"type": "image_url", "image_url": {"url": part.image}}
+        if isinstance(part, ImageRefPart):
+            # 第二道结构校验：图像引用只允许存在于历史，到达翻译层即装配期
+            # 注水未执行（引擎 image store 缺失或注水遗漏），把句柄字符串发
+            # 给服务端是结构性缺陷，就地硬错
+            raise TypeError("图像引用未经装配期注水就到达翻译层（引擎注水遗漏），禁止把引用句柄发给服务端")
+        raise TypeError(f"未知的消息片段类型: {type(part).__name__}")
+
+    @classmethod
+    def _message_to_openai(cls, message: Message) -> List[Dict[str, Any]]:
+        """中立 Message → OpenAI 消息 dict 列表（1..N 条）
+
+        assistant 既往发起的调用还原为 ``tool_calls``（arguments 回到协议要求
+        的 JSON 字符串形态），tool 观察还原 ``tool_call_id``——喂回多轮工具
+        循环时这两项是协议合法性前提，缺则服务端拒绝整个消息序列。
+
+        tool 观察携带图像片段时按协议拆分：OpenAI 协议 tool 角色只收文本
+        （图像仅 user 角色可带），tool 消息保留文本、图像提升为 user 消息；
+        提图消息的落位由 ``_request_to_openai_messages`` 统一
+        推迟到整段回执结束之后——紧邻插入会在多工具并发轮里打断回执连续
+        性，被严格端点 400 拒收。能走到这里的带图观察必然来自视觉调用方
+        （组装层已按主模型 visual 位分叉），此处不做能力兜底。
+        """
+        contents = [cls._part_to_openai(p) for p in message.parts]
+        result: Dict[str, Any] = {"role": message.role, "content": contents}
+        if message.tool_calls:
+            result["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.raw_arguments
+                        if call.raw_arguments is not None
+                        else json.dumps(call.arguments, ensure_ascii=False, default=str),
+                    },
+                }
+                for call in message.tool_calls
+            ]
+        if message.tool_call_id:
+            result["tool_call_id"] = message.tool_call_id
+        if message.role == "tool":
+            images = [c for c in contents if c["type"] == "image_url"]
+            if images:
+                result["content"] = "".join(c["text"] for c in contents if c["type"] == "text")
+                note_content: List[Dict[str, Any]] = [
+                    {"type": "text", "text": "[系统附图：上方工具回执的截图]"},
+                    *images,
+                ]
+                return [result, {"role": "user", "content": note_content}]
+        if contents and all(c["type"] == "text" for c in contents):
+            content: Any = "".join(c["text"] for c in contents)
+            result["content"] = content
+        if message.role == "assistant" and message.reasoning is not None:
+            cls._attach_reasoning(result, message.reasoning)
+        return [result]
+
+    @staticmethod
+    def _attach_reasoning(result: Dict[str, Any], reasoning: Reasoning) -> None:
+        """把上一步的思考按收到时的格式写回 assistant 消息。
+
+        独立字段写成 ``reasoning_content``；从正文 ``<think>`` 标签切出来的
+        包回正文开头，与模型当初输出的正文一致。引擎已按模型开关和产出模型
+        筛过，走到这里的思考都该发出。
+        """
+        if reasoning.format == "field":
+            result["reasoning_content"] = reasoning.text
+            return
+        tag = f"<think>{reasoning.text}</think>"
+        content = result.get("content")
+        if isinstance(content, list) and content:
+            result["content"] = [{"type": "text", "text": tag}, *content]
+        else:
+            result["content"] = tag + (content if isinstance(content, str) else "")
+
+    @classmethod
+    def _request_to_openai_messages(cls, request: GenerateRequest) -> List[Dict[str, Any]]:
+        """GenerateRequest → OpenAI messages 列表（system 置于首条）
+
+        带图 tool 观察提升出的 user 消息统一推迟到整段 tool 回执结束之后
+        落位：协议要求 assistant 带 tool_calls 后连续跟完全部回执，多工具
+        并发轮里提图消息若紧随自己的回执插入，会打断回执连续性被严格端点
+        400 拒收（DeepSeek 实测：insufficient tool messages following
+        tool_calls message）。按来源回执分组挂起，段尾按序落位，配对语义
+        不变。
+        """
+        messages: List[Dict[str, Any]] = []
+        if request.system:
+            messages.append({"role": "system", "content": request.system})
+        lifted: List[Dict[str, Any]] = []
+        for message in request.messages:
+            wire = cls._message_to_openai(message)
+            if message.role == "tool":
+                # 回执段还在继续：回执本体落位，提图 user 消息挂起到段尾
+                messages.append(wire[0])
+                lifted.extend(wire[1:])
+                continue
+            messages.extend(lifted)
+            lifted = []
+            messages.extend(wire)
+        messages.extend(lifted)
+        return messages
+
+    @staticmethod
+    def _tool_spec_to_openai(spec: ToolSpec) -> Dict[str, Any]:
+        """中立 ToolSpec → 项目内扁平工具定义（chat 内再做 OpenAI 协议包装）
+
+        ``parameters`` 空值（None/{} = 无参数工具）兜底为空对象 schema——
+        严格端点（DeepSeek 等）对非 object schema 直接 400 拒绝整个请求。
+        """
+        return {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters or _EMPTY_OBJECT_SCHEMA,
+        }
+
+    def _apply_reasoning_effort_and_extra_body(
+        self,
+        request_params: Dict[str, Any],
+        reasoning_effort: Optional[str],
+    ) -> None:
+        """把思考强度档位与 provider 级方言逃生舱按"设了才发"原则合入请求参数。
+
+        ``reasoning_effort`` 非 None 且非空串 → ``request_params["reasoning_effort"]`` 带上；
+        ``self.config["extra_body"]`` 为非空 dict → ``request_params["extra_body"]`` 带上。
+        任一未配置则对应键完全不出现（OpenAI SDK 缺省不发送）。
+        """
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            request_params["reasoning_effort"] = reasoning_effort
+        extra_body = self.config.get("extra_body")
+        if isinstance(extra_body, dict) and extra_body:
+            request_params["extra_body"] = extra_body
+
+    @staticmethod
+    def _extract_usage(vendor_usage: Any) -> Optional[Dict[str, int]]:
+        """厂商响应 usage → 遗留 usage dict（缓存 / 思考字段归一化在此完成）。
+
+        缓存上报两种风格都收：
+        - OpenAI 风格 ``prompt_tokens_details.cached_tokens`` → ``cache_hit_tokens``；
+          OpenAI 不上报 miss 时按 ``max(prompt_tokens - hit, 0)`` 反推填充
+          ``cache_miss_tokens``，避免分段计价把 hit 也按全价算
+        - DeepSeek 风格 ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens`` 同名直取
+        双字段路径不走反推（DeepSeek 自报 miss）；响应对象属性缺失一律用
+        getattr 兜底，兼容 SDK 模型与测试桩。
+
+        思考 token 两种风格都收（OpenAI 风格 ``completion_tokens_details.reasoning_tokens``
+        与 DeepSeek 同名）；未上报则不进 dict——下游转 ``payload.Usage`` 映射为
+        None = 未上报，与 ``cache_*_tokens`` 的"未上报不进 dict"语义一致。
+        """
+        if vendor_usage is None:
+            return None
+
+        def _get(name: str, default: Any = None) -> Any:
+            if isinstance(vendor_usage, dict):
+                return vendor_usage.get(name, default)
+            return getattr(vendor_usage, name, default)
+
+        usage: Dict[str, int] = {
+            "prompt_tokens": int(_get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(_get("completion_tokens", 0) or 0),
+            "total_tokens": int(_get("total_tokens", 0) or 0),
+        }
+        details = _get("prompt_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+        ds_hit = _get("prompt_cache_hit_tokens")
+        ds_miss = _get("prompt_cache_miss_tokens")
+        if ds_hit is not None:
+            usage["cache_hit_tokens"] = int(ds_hit)
+        elif cached is not None:
+            usage["cache_hit_tokens"] = int(cached)
+        if ds_miss is not None:
+            usage["cache_miss_tokens"] = int(ds_miss)
+        elif cached is not None and "cache_hit_tokens" in usage:
+            # OpenAI 单字段：未报 miss 时按 prompt_tokens 减去 hit 反推，保证分段计价有 miss 部分
+            usage["cache_miss_tokens"] = max(int(usage["prompt_tokens"]) - int(usage["cache_hit_tokens"]), 0)
+        # 思考 token：OpenAI 风格走 completion_tokens_details；DeepSeek 同名字段。
+        # 两条路径任一上报即写入 dict；未上报则不进 dict（与缓存字段同语义）。
+        completion_details = _get("completion_tokens_details")
+        comp_reasoning = (
+            completion_details.get("reasoning_tokens")
+            if isinstance(completion_details, dict)
+            else getattr(completion_details, "reasoning_tokens", None)
+        )
+        deepseek_reasoning = _get("completion_reasoning_tokens") or _get("reasoning_tokens")
+        if deepseek_reasoning is not None:
+            usage["reasoning_tokens"] = int(deepseek_reasoning)
+        elif comp_reasoning is not None:
+            usage["reasoning_tokens"] = int(comp_reasoning)
+        return usage
+
+    @staticmethod
+    def _usage_to_payload(usage: Optional[Dict[str, int]]) -> Optional[Usage]:
+        """遗留 usage dict → 中立 Usage（缓存 / 思考键缺省视为未上报）"""
+        if usage is None:
+            return None
+        return Usage(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            cache_hit_tokens=usage.get("cache_hit_tokens"),
+            cache_miss_tokens=usage.get("cache_miss_tokens"),
+            reasoning_tokens=usage.get("reasoning_tokens"),
+        )
+
+    @staticmethod
+    def _vendor_usage_to_raw_json(vendor_usage: Any) -> Optional[str]:
+        """厂商响应 usage → JSON 字符串（落库 ``usage_raw_json`` 唯一兜底）。
+
+        SDK 模型对象（``CompletionUsage``）经 ``model_dump`` 转 dict 再 JSON 化；
+        dict 直接 JSON 化；其他兜底为空字符串序列化为 None。失败仅记 debug，
+        返回 None 时上层视为无 raw 可用——不阻断调用链。
+        """
+        if vendor_usage is None:
+            return None
+        payload: Any
+        if isinstance(vendor_usage, dict):
+            payload = vendor_usage
+        elif hasattr(vendor_usage, "model_dump"):
+            try:
+                payload = vendor_usage.model_dump()
+            except Exception:
+                return None
+        elif hasattr(vendor_usage, "__dict__"):
+            payload = vars(vendor_usage)
+        else:
+            return None
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _to_payload_response(cls, result: LLMResponse) -> Response:
+        """遗留 LLMResponse → 中立 payload.Response（含 tool_calls 形状转换）"""
+        tool_calls = [
+            ToolCall(
+                id=tc.get("id", ""),
+                name=tc.get("function", {}).get("name", ""),
+                arguments=tc.get("function", {}).get("arguments", {}),
+                raw_arguments=tc.get("raw_arguments"),
+                arguments_error=tc.get("arguments_error"),
+            )
+            for tc in (result.tool_calls or [])
+            if isinstance(tc, dict)
+        ]
+        return Response(
+            success=result.success,
+            content=result.content,
+            tool_calls=tool_calls,
+            finish_reason=result.finish_reason,
+            usage=cls._usage_to_payload(result.usage),
+            model=result.model,
+            reasoning_content=result.reasoning_content,
+            reasoning_format=result.reasoning_format,
+            error=result.error,
+            request_id=result.request_id,
+            usage_raw_json=result.usage_raw_json,
+            audio_base64=result.audio_base64,
+            audio_format=result.audio_format,
+        )
+
+    async def generate(
+        self,
+        request: GenerateRequest,
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        on_delta: Optional[Callable[[str, str], None]] = None,
+        interrupt_flag: Optional[asyncio.Event] = None,
+    ) -> Response:
+        """中立契约聊天请求：payload → OpenAI 协议翻译后复用既有 chat 能力。
+
+        生成参数以 Engine 传入的 profile 档位优先，请求内字段兜底。
+        """
+        tools = [self._tool_spec_to_openai(t) for t in request.tools] or None
+        result = await self._chat_impl(
+            self._request_to_openai_messages(request),
+            model=model,
+            temperature=temperature if temperature is not None else request.temperature,
+            reasoning_effort=reasoning_effort if reasoning_effort is not None else request.reasoning_effort,
+            tools=tools,
+            interrupt_flag=interrupt_flag,
+            on_delta=on_delta,
+            strict_tool_arguments=request.strict_tool_arguments,
+        )
+        return self._to_payload_response(result)
+
+    async def generate_vision(
+        self,
+        request: GenerateRequest,
+        images: List[Union[str, bytes]],
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        interrupt_flag: Optional[asyncio.Event] = None,
+    ) -> Response:
+        """中立契约视觉请求：payload → OpenAI 协议翻译后复用既有 vision 能力。
+
+        走抛分类异常的实现（``_vision_impl``），错误分类由 Engine 表驱动消费。
+        """
+        result = await self._vision_impl(
+            self._request_to_openai_messages(request),
+            images,
+            model=model,
+            temperature=temperature if temperature is not None else request.temperature,
+            reasoning_effort=reasoning_effort if reasoning_effort is not None else request.reasoning_effort,
+        )
+        return self._to_payload_response(result)
+
+    async def generate_audio(
+        self,
+        request: GenerateRequest,
+        *,
+        model: str,
+        voice: str,
+        audio_format: str = "wav",
+        temperature: Optional[float] = None,
+        interrupt_flag: Optional[asyncio.Event] = None,
+    ) -> Response:
+        """中立契约音频输出请求：payload → OpenAI 协议 modalities=audio 形态翻译。
+
+        面向带语音输出模态的大模型（qwen-omni / gpt-4o-audio 等 OpenAI 兼容
+        端点）；仅非流式（音频模态无增量回调路径），错误分类同聊天路径。
+        """
+        result = await self._chat_impl(
+            self._request_to_openai_messages(request),
+            model=model,
+            temperature=temperature if temperature is not None else request.temperature,
+            interrupt_flag=interrupt_flag,
+            request_extra={
+                "modalities": ["text", "audio"],
+                "audio": {"voice": voice, "format": audio_format},
+            },
+        )
+        result.audio_format = audio_format
+        return self._to_payload_response(result)
+
+    async def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        interrupt_flag: Optional[asyncio.Event] = None,
+        on_delta: Optional[Callable[[str, str], None]] = None,
+    ) -> LLMResponse:
+        """聊天调用（legacy 包装）：任何失败都折叠为 ``success=False`` 响应。
+
+        中断（CancelledError）原样传播语义在此折叠为失败响应是 legacy 契约；
+        错误分类消费走 ``_chat_impl``（payload 契约路径）。
+        """
+        try:
+            return await self._chat_impl(
+                messages,
+                model=model,
+                temperature=temperature,
+                tools=tools,
+                interrupt_flag=interrupt_flag,
+                on_delta=on_delta,
+            )
+        except asyncio.CancelledError as e:
+            error_msg = f"LLM 请求被中断: {e}"
+            self.logger.error(error_msg)
+            return LLMResponse(success=False, content=None, error=error_msg)
+        except LLMError as e:
+            error_msg = f"LLM 请求失败: {e}"
+            self.logger.error(error_msg)
+            return LLMResponse(success=False, content=None, error=error_msg)
+
+    @staticmethod
+    def _extract_message_audio(message: Any) -> Tuple[Optional[str], Optional[str]]:
+        """提取音频输出模态响应的 base64 载荷与语音 transcript；无音频返回 (None, None)。
+
+        兼容两种形态：SDK typed message.audio 与兼容端点透传的 dict。
+        """
+        audio = getattr(message, "audio", None)
+        if audio is None:
+            return None, None
+        if isinstance(audio, dict):
+            return audio.get("data"), audio.get("transcript")
+        return getattr(audio, "data", None), getattr(audio, "transcript", None)
+
+    async def _chat_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        interrupt_flag: Optional[asyncio.Event] = None,
+        on_delta: Optional[Callable[[str, str], None]] = None,
+        strict_tool_arguments: bool = False,
+        request_extra: Optional[Dict[str, Any]] = None,
+    ) -> LLMResponse:
+        """聊天调用实现：SDK 异常翻译为错误分类异常后抛出（不自行重试）。
+
+        on_delta 非 None 时走流式传输：SSE 逐帧接收、边收边回调，流结束后
+        组装完整 LLMResponse 返回（传输层流式、语义层整段）。
+        流式请求建立失败时自动降级为非流式一次性调用（回调不触发）。
+        """
+        use_streaming = on_delta is not None and self.config.get("supports_streaming", True)
+        if request_extra and use_streaming:
+            # 扩展参数（音频模态等）只在非流式路径生效，静默丢弃会造成请求形态错乱
+            raise ValueError("request_extra 不支持流式路径")
+        if on_delta is not None and use_streaming:
+            try:
+                return await self._chat_streaming(
+                    messages,
+                    model=model,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    tools=tools,
+                    interrupt_flag=interrupt_flag,
+                    on_delta=on_delta,
+                    strict_tool_arguments=strict_tool_arguments,
+                )
+            except asyncio.CancelledError:
+                raise
+            except LLMError:
+                # 完整收流后的内容校验已完成错误分类，统一交给 Engine 重试，避免每轮再加一次非流式请求。
+                raise
+            except _LEGACY_FALLBACK_ERRORS as e:
+                self.logger.warning(f"流式请求失败，降级为非流式: {e}")
+                # 落到下方非流式路径
+
+        try:
+            request_params: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                # 显式零温度也是调用方选择，只有 None 才采用客户端默认值。
+                "temperature": self.temperature if temperature is None else temperature,
+            }
+            self._apply_reasoning_effort_and_extra_body(request_params, reasoning_effort)
+            if request_extra:
+                request_params.update(request_extra)
+            if tools:
+                request_params["tools"] = self._normalize_tool_definitions(tools)
+                request_params["tool_choice"] = "auto"
+            self.logger.debug(f"发送 LLM 请求: {request_params}")
+            response = await guarded_call(
+                lambda: self.client.chat.completions.create(**request_params),
+                interrupt_flag=interrupt_flag,
+            )
+            message = response.choices[0].message
+            audio_base64, transcript = self._extract_message_audio(message)
+            raw_content = message.content or ""
+            if audio_base64 is not None and not raw_content:
+                # 音频模态响应：语音文本由 transcript 回填 content（即模型产出
+                # 文本），不做 reasoning 解析
+                content, reasoning_content, reasoning_format = transcript or "", None, None
+            else:
+                content, reasoning_content, reasoning_format = split_reasoning(
+                    raw_content,
+                    getattr(message, "reasoning_content", None),
+                    ReasoningParseMode(self.config.get("reasoning_parse_mode", "auto")),
+                )
+            usage = self._extract_usage(response.usage)
+            result = LLMResponse(
+                success=True,
+                content=content,
+                model=response.model,
+                usage=usage,
+                reasoning_content=reasoning_content,
+                reasoning_format=reasoning_format,
+                finish_reason=getattr(response.choices[0], "finish_reason", None),
+                usage_raw_json=self._vendor_usage_to_raw_json(response.usage),
+                audio_base64=audio_base64,
+            )
+            if message.tool_calls:
+                result.tool_calls = []
+                for tool_call in message.tool_calls:
+                    result.tool_calls.append(
+                        decode_tool_call(
+                            tool_call.id,
+                            tool_call.function.name,
+                            tool_call.function.arguments,
+                            strict=strict_tool_arguments,
+                        )
+                    )
+            self._ensure_not_empty(result)
+            return result
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as e:
+            # 服务端或传输层返回超时错误时，保留故障切换所需的原因分类。
+            raise LLMTimeoutError("LLM 请求超时", original=e) from e
+        except _TRANSLATABLE_SDK_ERRORS as e:
+            raise self._translate_sdk_error(e) from e
+
+    async def _chat_streaming(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: str,
+        temperature: Optional[float],
+        reasoning_effort: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]],
+        interrupt_flag: Optional[asyncio.Event],
+        on_delta: Callable[[str, str], None],
+        strict_tool_arguments: bool = False,
+    ) -> LLMResponse:
+        """流式传输路径：SSE 逐帧接收，reasoning/content 增量实时回调，最终组装完整响应。
+
+        增量三分：reasoning 外发回调；content 外发回调（调用方自行取舍）；
+        tool call arguments 碎片只在客户端拼接成完整 JSON，不外发。
+        拼接语义与非流式一致：严格调用保留 JSON 解析错误，普通调用沿用语法修复。
+        """
+        request_params: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            # 流式与普通调用采用同样的优先级，不能把零温度误判成缺省。
+            "temperature": self.temperature if temperature is None else temperature,
+            "stream": True,
+            # usage 随末帧返回；不支持该参数的兼容端点会在 create 阶段抛错，
+            # 由调用方（chat）降级为非流式路径兜底
+            "stream_options": {"include_usage": True},
+        }
+        self._apply_reasoning_effort_and_extra_body(request_params, reasoning_effort)
+        if tools:
+            request_params["tools"] = self._normalize_tool_definitions(tools)
+            request_params["tool_choice"] = "auto"
+
+        stream = await self.client.chat.completions.create(**request_params)
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        # index -> {"id": str, "name": str, "arguments": list[str]}（arguments 碎片按序拼接）
+        tool_states: Dict[int, Dict[str, Any]] = {}
+        usage: Optional[Dict[str, int]] = None
+        usage_raw: Optional[str] = None
+        model_name: Optional[str] = None
+        finish_reason: Optional[str] = None
+        try:
+            async for chunk in stream:
+                if interrupt_flag is not None and interrupt_flag.is_set():
+                    # 中断不构成完整响应，不能把已经接收的部分参数交给工具执行器。
+                    raise asyncio.CancelledError
+                if getattr(chunk, "usage", None) is not None:
+                    usage = self._extract_usage(chunk.usage)
+                    usage_raw = self._vendor_usage_to_raw_json(chunk.usage)
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                if getattr(choices[0], "finish_reason", None) is not None:
+                    finish_reason = choices[0].finish_reason
+                model_name = getattr(chunk, "model", None) or model_name
+                delta = choices[0].delta
+                # 原生 reasoning 字段（DeepSeek R1 系）；<think> 内嵌型不走此路径，
+                # 其思考随 content 外发、最终由 parse_reasoning 统一切分
+                reasoning_piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                    on_delta("reasoning", reasoning_piece)
+                content_piece = getattr(delta, "content", None)
+                if content_piece:
+                    content_parts.append(content_piece)
+                    on_delta("content", content_piece)
+                for tc_delta in getattr(delta, "tool_calls", None) or []:
+                    state = tool_states.setdefault(tc_delta.index, {"id": "", "name": "", "arguments": []})
+                    if tc_delta.id:
+                        state["id"] = tc_delta.id
+                    fn = getattr(tc_delta, "function", None)
+                    if fn is not None and fn.name:
+                        state["name"] = fn.name
+                    if fn is not None and fn.arguments:
+                        state["arguments"].append(fn.arguments)
+        finally:
+            try:
+                await stream.aclose()
+            except _LEGACY_FALLBACK_ERRORS as e:
+                self.logger.debug(f"关闭流失败（已忽略）: {e}")
+
+        raw_content = "".join(content_parts)
+        native_reasoning = "".join(reasoning_parts) or None
+        content, reasoning_content, reasoning_format = split_reasoning(
+            raw_content,
+            native_reasoning,
+            ReasoningParseMode(self.config.get("reasoning_parse_mode", "auto")),
+        )
+        result = LLMResponse(
+            success=True,
+            content=content,
+            model=model_name or model,
+            usage=usage,
+            reasoning_content=reasoning_content,
+            reasoning_format=reasoning_format,
+            finish_reason=finish_reason,
+            usage_raw_json=usage_raw,
+        )
+        if tool_states:
+            result.tool_calls = []
+            for index in sorted(tool_states):
+                state = tool_states[index]
+                raw_arguments = "".join(state["arguments"])
+                result.tool_calls.append(
+                    decode_tool_call(state["id"], state["name"], raw_arguments, strict=strict_tool_arguments)
+                )
+        self._ensure_not_empty(result)
+        return result
+
+    async def vision(
+        self,
+        messages: List[Dict[str, Any]],
+        images: List[Union[str, bytes]],
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+    ) -> LLMResponse:
+        """视觉理解调用（legacy 包装）：任何失败都折叠为 ``success=False`` 响应。"""
+        try:
+            return await self._vision_impl(
+                messages,
+                images,
+                model=model,
+                temperature=temperature,
+            )
+        except _LEGACY_FALLBACK_ERRORS as e:
+            error_msg = f"VLM 请求失败: {e}"
+            self.logger.error(error_msg)
+            return LLMResponse(success=False, content=None, error=error_msg)
+
+    async def _vision_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        images: List[Union[str, bytes]],
+        *,
+        model: str,
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> LLMResponse:
+        """视觉理解实现：SDK 异常翻译为错误分类异常后抛出（不自行重试）。"""
+        try:
+            user_content = self._build_vision_user_content(messages[-1]["content"], images)
+            vision_messages = messages[:-1] + [{"role": "user", "content": user_content}]
+            request_params: Dict[str, Any] = {
+                "model": model,
+                "messages": vision_messages,
+                # 视觉请求同样保留调用方显式给出的零温度。
+                "temperature": self.temperature if temperature is None else temperature,
+            }
+            self._apply_reasoning_effort_and_extra_body(request_params, reasoning_effort)
+            response = await self.client.chat.completions.create(**request_params)
+            usage = self._extract_usage(response.usage)
+            result = LLMResponse(
+                success=True,
+                content=response.choices[0].message.content,
+                model=response.model,
+                usage=usage,
+                reasoning_content=getattr(response.choices[0].message, "reasoning_content", None),
+                usage_raw_json=self._vendor_usage_to_raw_json(response.usage),
+            )
+            self._ensure_not_empty(result)
+            return result
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as e:
+            # 服务端或传输层返回超时错误时，保留故障切换所需的原因分类。
+            raise LLMTimeoutError("LLM 请求超时", original=e) from e
+        except _TRANSLATABLE_SDK_ERRORS as e:
+            raise self._translate_sdk_error(e) from e
+
+    def get_info(self) -> Dict[str, Any]:
+        return {
+            "name": self.__class__.__name__,
+            "model": self.config.get("model"),
+            "base_url": self.config.get("base_url"),
+        }

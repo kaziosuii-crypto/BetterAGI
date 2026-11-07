@@ -1,0 +1,61 @@
+{
+  "input": {
+    "chunks": 40,
+    "group_interval_ms": 21.0
+  },
+  "A_sync": {
+    "underrun": 0,
+    "late": 0,
+    "gap": 0,
+    "overlap": 0,
+    "stuck": 0,
+    "executed": 240,
+    "total": 240,
+    "first_input_p50": 143.3333,
+    "duration_p50": 200.0
+  },
+  "B_asap": {
+    "underrun": 0,
+    "late": 0,
+    "gap": 0,
+    "overlap": 200,
+    "stuck": 0,
+    "executed": 240,
+    "total": 240,
+    "first_input_p50": 21.0,
+    "duration_p50": 138.3333
+  },
+  "C_fixed33": {
+    "underrun": 0,
+    "late": 0,
+    "gap": 0,
+    "overlap": 0,
+    "stuck": 0,
+    "executed": 240,
+    "total": 240,
+    "first_input_p50": 33.3333,
+    "duration_p50": 200.0
+  },
+  "D_extend": {
+    "underrun": 0,
+    "late": 0,
+    "gap": 0,
+    "overlap": 0,
+    "stuck": 0,
+    "executed": 240,
+    "total": 240,
+    "first_input_p50": 33.3333,
+    "duration_p50": 200.0
+  },
+  "D_release": {
+    "underrun": 0,
+    "late": 0,
+    "gap": 0,
+    "overlap": 0,
+    "stuck": 0,
+    "executed": 240,
+    "total": 240,
+    "first_input_p50": 33.3333,
+    "duration_p50": 200.0
+  }
+}

@@ -1,0 +1,91 @@
+/**
+ * Settings 页面类型定义
+ */
+
+// 字段类型枚举
+export enum ConfigFieldType {
+  STRING = 'string',
+  INTEGER = 'integer',
+  FLOAT = 'float',
+  BOOLEAN = 'boolean',
+  SELECT = 'select',
+  ARRAY = 'array',
+  OBJECT = 'object',
+}
+
+// 验证规则
+export interface ValidationRule {
+  min?: number;
+  max?: number;
+  min_length?: number;
+  max_length?: number;
+  pattern?: string;
+  options?: string[];
+}
+
+// 配置字段 Schema
+export interface ConfigFieldSchema {
+  key: string;
+  label: string;
+  description?: string;
+  type: ConfigFieldType;
+  default?: unknown;
+  value?: unknown;
+  validation?: ValidationRule;
+  properties?: Record<string, ConfigFieldSchema>;
+  items?: ConfigFieldSchema;
+  /** 对象数组的元素子字段树（items.type === 'object' 时由后端下发） */
+  fields?: ConfigFieldSchema[];
+  children?: ConfigFieldSchema[];
+  required: boolean;
+  sensitive: boolean;
+  group?: string;
+  readonly?: boolean;
+  /** x-ui-advanced 标记：收进默认折叠的「高级参数」区（鉴权细节、重试参数等） */
+  advanced?: boolean;
+  /** x-ui-widget 标记：控件形态覆盖（fixed-tuple = 定长数值元组，一行并排数字输入） */
+  widget?: string;
+  /** x-ui-tuple-length 标记：定长元组的元素个数（widget === 'fixed-tuple' 时生效） */
+  tupleLength?: number;
+  /** x-ui-precision 标记：浮点小数位数；缺省 = 不强制舍入 */
+  precision?: number;
+  /** 描述展示形态：icon = 标签旁 ⓘ 悬浮，inline = 内联段落；缺省 inline */
+  descriptionDisplay?: 'icon' | 'inline';
+}
+
+// 配置分组 Schema
+export interface ConfigGroupSchema {
+  key: string;
+  label: string;
+  description?: string;
+  icon?: string;
+  fields: ConfigFieldSchema[];
+  order: number;
+  file_name?: string;
+  file_label?: string;
+  /** 文件 [meta].version（只读，分组头角标展示） */
+  version?: string;
+}
+
+// 配置 Schema 响应
+export interface ConfigSchemaResponse {
+  groups: ConfigGroupSchema[];
+  version: string;
+}
+
+// 配置更新响应
+export interface ConfigUpdateResponse {
+  success: boolean;
+  message: string;
+  requires_restart?: boolean;
+  /** 批量保存失败时逐 key 的校验错误；key 与前端字段 key 同构，可直接定位跳转 */
+  errors?: { key: string; message: string }[];
+}
+
+// 待保存的变更
+export interface PendingChange {
+  key: string;
+  oldValue: unknown;
+  newValue: unknown;
+  field: ConfigFieldSchema;
+}

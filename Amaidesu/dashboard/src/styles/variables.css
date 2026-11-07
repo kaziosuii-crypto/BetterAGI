@@ -1,0 +1,237 @@
+/**
+ * 全局 CSS 变量 - 支持主题切换
+ * 基于 WEBUI_STYLE_SPEC.md 规范
+ *
+ * 色板维持组件库默认值，不做品牌化定制：多轮自定义配色（角色橙、鲜亮橙、
+ * 交互蓝）经使用裁定均不如出厂体系，保留默认是审慎后的决定。深浅两主题
+ * 仅在此处定义，Element Plus 的深色对齐见文件尾。
+ */
+
+/* ===== 浅色主题（默认）===== */
+:root,
+[data-theme='light'] {
+  /* 主色调 */
+  --color-primary: #409eff;
+  --color-primary-light: #66b1ff;
+  --color-primary-dark: #337ecc;
+  /* 主色 RGB 分量，供 rgba(var(--color-primary-rgb), a) 调透明度 */
+  --color-primary-rgb: 64, 158, 255;
+  --color-primary-bg: rgba(64, 158, 255, 0.1);
+
+  /* 状态色 */
+  --color-success: #67c23a;
+  --color-success-light: #e1f3d8;
+  --color-success-bg: rgba(103, 194, 58, 0.1);
+
+  --color-warning: #e6a23c;
+  --color-warning-light: #fdf6ec;
+  --color-warning-bg: rgba(230, 162, 60, 0.1);
+
+  --color-danger: #f56c6c;
+  --color-danger-light: #fde2e2;
+  --color-danger-bg: rgba(245, 108, 108, 0.1);
+
+  --color-info: #909399;
+  --color-info-light: #f4f4f5;
+
+  /* 致命级（日志 CRITICAL）：紫色，与 error 红区分 */
+  --color-critical: #9c27b0;
+  --color-critical-bg: rgba(156, 39, 176, 0.12);
+
+  /* 背景色 */
+  --bg-app: #f5f7fa;
+  --bg-sidebar: #ffffff;
+  --bg-header: #ffffff;
+  --bg-card: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-hover: #f0f2f5;
+  --bg-active: #ecf5ff;
+  --bg-overlay: #ffffff;
+
+  /* 文字色 */
+  --text-primary: #303133;
+  --text-regular: #606266;
+  --text-secondary: #909399;
+  --text-placeholder: #c0c4cc;
+  --text-inverse: #ffffff;
+
+  /* 边框 */
+  --border-color: #e4e7ed;
+  --border-color-light: #ebeef5;
+  --border-color-dark: #d4d7de;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+  /* 圆角 */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  /* 间距 */
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+  --spacing-xl: 32px;
+
+  /* 布局 */
+  --sidebar-width: 220px;
+  --header-height: 56px;
+
+  /* 字体 */
+  --font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei',
+    'Noto Sans CJK SC', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace;
+
+  /* 字号阶梯：新样式从这里取值，不再新写 11px 以下的裸值 */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+
+  /* Domain 颜色（v2 三组语义） */
+  --color-collector: #3b82f6;
+  --color-collector-bg: rgba(59, 130, 246, 0.1);
+  --color-agent: #8b5cf6;
+  --color-agent-bg: rgba(139, 92, 246, 0.1);
+  --color-tool: #10b981;
+  --color-tool-bg: rgba(16, 185, 129, 0.1);
+  --color-rundown: #f59e0b;
+  --color-rundown-bg: rgba(245, 158, 11, 0.1);
+  --color-planner: #6366f1;
+  --color-planner-bg: rgba(99, 102, 241, 0.1);
+  --color-game: #ec4899;
+  --color-game-bg: rgba(236, 72, 153, 0.1);
+  --color-live: #14b8a6;
+  --color-live-bg: rgba(20, 184, 166, 0.1);
+  --color-system: #6b7280;
+  --color-system-bg: rgba(107, 114, 128, 0.1);
+
+  /* 动画：出场用 ease-out 快起慢收，弹性用于小图标与指示条 */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --transition-fast: 0.15s ease;
+  --transition-normal: 0.25s ease;
+  --transition-slow: 0.35s ease;
+}
+
+/* ===== 深色主题 ===== */
+[data-theme='dark'] {
+  /* 主色调 */
+  --color-primary: #409eff;
+  --color-primary-light: #66b1ff;
+  --color-primary-dark: #337ecc;
+  --color-primary-bg: rgba(64, 158, 255, 0.15);
+
+  /* 状态色 */
+  --color-success: #67c23a;
+  --color-success-light: rgba(103, 194, 58, 0.2);
+  --color-success-bg: rgba(103, 194, 58, 0.15);
+
+  --color-warning: #e6a23c;
+  --color-warning-light: rgba(230, 162, 60, 0.2);
+  --color-warning-bg: rgba(230, 162, 60, 0.15);
+
+  --color-danger: #f56c6c;
+  --color-danger-light: rgba(245, 108, 108, 0.2);
+  --color-danger-bg: rgba(245, 108, 108, 0.15);
+
+  --color-info: #909399;
+  --color-info-light: rgba(144, 147, 153, 0.2);
+
+  /* 深紫在深底上读不清，换成浅紫 */
+  --color-critical: #d2a8ff;
+  --color-critical-bg: rgba(210, 168, 255, 0.15);
+
+  /* 背景色 */
+  --bg-app: #0d1117;
+  --bg-sidebar: #161b22;
+  --bg-header: #161b22;
+  --bg-card: #161b22;
+  --bg-elevated: #21262d;
+  --bg-hover: #21262d;
+  --bg-active: #1f6feb33;
+  --bg-overlay: #1c2128;
+
+  /* 文字色（占位色比边框亮一档，否则表头注释、空态提示在卡片底上几乎看不见） */
+  --text-primary: #f0f6fc;
+  --text-regular: #c9d1d9;
+  --text-secondary: #8b949e;
+  --text-placeholder: #6e7681;
+  --text-inverse: #0d1117;
+
+  /* 边框 */
+  --border-color: #30363d;
+  --border-color-light: #21262d;
+  --border-color-dark: #484f58;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  /* Domain 颜色 - 深色模式（v2 三组语义） */
+  --color-collector: #58a6ff;
+  --color-collector-bg: rgba(56, 139, 253, 0.15);
+  --color-agent: #bc8cff;
+  --color-agent-bg: rgba(163, 113, 247, 0.15);
+  --color-tool: #3fb950;
+  --color-tool-bg: rgba(63, 185, 80, 0.15);
+  --color-rundown: #fbbf24;
+  --color-rundown-bg: rgba(251, 191, 36, 0.15);
+  --color-planner: #818cf8;
+  --color-planner-bg: rgba(129, 140, 248, 0.15);
+  --color-game: #f472b6;
+  --color-game-bg: rgba(244, 114, 182, 0.15);
+  --color-live: #2dd4bf;
+  --color-live-bg: rgba(45, 212, 191, 0.15);
+  --color-system: #9ca3af;
+  --color-system-bg: rgba(156, 163, 175, 0.15);
+}
+
+/*
+ * Element Plus 深色变量对齐项目色板。
+ * Element Plus 自带的暗色是纯灰阶（#141414），项目深色是偏蓝的深灰；不覆盖的话
+ * 输入框、表格、弹层和自绘卡片是两套底色。选择器用 html.dark 与官方暗色文件同权重，
+ * 本文件在其后加载，因而覆盖生效。
+ */
+html.dark {
+  --el-bg-color-page: var(--bg-app);
+  --el-bg-color: var(--bg-card);
+  --el-bg-color-overlay: var(--bg-overlay);
+
+  --el-text-color-primary: var(--text-primary);
+  --el-text-color-regular: var(--text-regular);
+  --el-text-color-secondary: var(--text-secondary);
+  --el-text-color-placeholder: var(--text-placeholder);
+  --el-text-color-disabled: #545d68;
+
+  --el-border-color-darker: #545d68;
+  --el-border-color-dark: #484f58;
+  --el-border-color: var(--border-color);
+  --el-border-color-light: #2d333b;
+  --el-border-color-lighter: #262c34;
+  --el-border-color-extra-light: #1f242b;
+
+  /* 填充色：blank 是输入框与按钮底，取卡片色让控件靠描边区分而不是一块黑洞 */
+  --el-fill-color-darker: #373e47;
+  --el-fill-color-dark: #2d333b;
+  --el-fill-color: #262c34;
+  --el-fill-color-light: #21262d;
+  --el-fill-color-lighter: #1c2128;
+  --el-fill-color-extra-light: #181d23;
+  --el-fill-color-blank: var(--bg-card);
+
+  --el-mask-color: rgba(1, 4, 9, 0.72);
+  --el-mask-color-extra-light: rgba(1, 4, 9, 0.3);
+  --el-box-shadow-light: 0 8px 24px rgba(1, 4, 9, 0.6);
+  --el-box-shadow-lighter: 0 4px 12px rgba(1, 4, 9, 0.5);
+}

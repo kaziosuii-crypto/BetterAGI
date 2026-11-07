@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "style": "cute",
+  "sample_rate": 24000,
+  "load_seconds": 14.99,
+  "peak_vram_gb": 3.29,
+  "results": [
+    {
+      "index": 1,
+      "text": "你好呀。",
+      "path": "E:\\BetterAGI\\demo\\feiyu_vram\\tts-001.wav",
+      "seconds": 1.2,
+      "peak": 0.41256,
+      "elapsed": 20.405
+    }
+  ]
+}

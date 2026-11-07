@@ -1,0 +1,323 @@
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.GameTask.AutoArtifactSalvage;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Model.GameUI;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.Helpers;
+using Microsoft.Extensions.Logging;
+using OpenCvSharp;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using BetterGenshinImpact.Core.Script.Dependence;
+using BetterGenshinImpact.GameTask.SoloTask;
+
+namespace BetterGenshinImpact.GameTask.Common.Job
+{
+    /// <summary>
+    /// 背包数物品：按背包页扫描目标物品并识别数量
+    /// </summary>
+    internal class CountInventoryItem : ISoloTask<CountInventoryItemParam, InventoryCountData>
+    {
+        private readonly ILogger logger = App.GetLogger<CountInventoryItem>();
+
+        /// <summary>
+        /// 本次运行使用的运行环境
+        /// </summary>
+        private readonly GameRuntime _runtime;
+        private IInputChannel input => InputHub.Foreground;
+        private CancellationToken ct;
+
+        /// <summary>
+        /// 指定扫描的背包页，为空时按物品所在页自动分组；在 RunAsync 开头由参数赋值
+        /// </summary>
+        private GridScreenName? gridScreenName;
+
+        /// <summary>
+        /// 去重后的目标物品名称；在 RunAsync 开头由参数赋值
+        /// </summary>
+        private IReadOnlyCollection<string> itemNames = [];
+
+        /// <summary>
+        /// 物品图标识别方式；在 RunAsync 开头由参数赋值
+        /// </summary>
+        private ItemIconRecognitionMode iconRecognitionMode;
+
+        /// <summary>
+        /// 是否按物品排序提前结束扫描；在 RunAsync 开头由参数赋值
+        /// </summary>
+        private bool stopByItemSort;
+
+        /// <summary>
+        /// 创建背包数物品任务
+        /// </summary>
+        /// <param name="runtime">本次运行使用的运行环境</param>
+        public CountInventoryItem(GameRuntime runtime)
+        {
+            _runtime = runtime;
+        }
+
+        /// <summary>
+        /// 校验参数并读取到字段中。参数无效时保持原来的抛异常行为，供 JS 脚本按原方式感知错误。
+        /// </summary>
+        /// <param name="param">任务参数</param>
+        /// <exception cref="ArgumentNullException">参数为空。</exception>
+        /// <exception cref="ArgumentException">目标物品列表为空或包含空名称。</exception>
+        private void Initialize(CountInventoryItemParam param)
+        {
+            if (param == null)
+            {
+                throw new ArgumentNullException(nameof(param));
+            }
+
+            param.Validate();
+
+            this.gridScreenName = param.GridScreenName;
+            // 目标物品去重，避免重复扫描同一物品
+            List<string> distinctItemNames = param.ItemNames.Distinct().ToList();
+            if (distinctItemNames.Count != param.ItemNames.Count)
+            {
+                logger.LogWarning("目标物品列表存在重复名称，已自动去重：{original} → {distinct}", param.ItemNames.Count, distinctItemNames.Count);
+            }
+            this.itemNames = distinctItemNames;
+            this.iconRecognitionMode = param.IconRecognitionMode;
+            this.stopByItemSort = param.StopByItemSort;
+        }
+
+        /// <summary>
+        /// 逐页扫描背包，统计目标物品数量。
+        /// </summary>
+        /// <param name="param">任务参数</param>
+        /// <param name="ct">取消令牌</param>
+        /// <returns>扫描结束返回 Success，数据中包含找到的物品数量；未找到的物品不在结果中。</returns>
+        public async Task<SoloTaskResult<InventoryCountData>> RunAsync(CountInventoryItemParam param, CancellationToken ct)
+        {
+            this.ct = ct;
+            Initialize(param);
+
+            //构造扫描批次
+            List<(GridScreenName Page, List<string> PageItemNames)> pageBatches = BuildPageBatches();
+            using IItemIconRecognizer iconRecognizer = ItemIconRecognizerFactory.Create(this.iconRecognitionMode);
+            Dictionary<string, int> results = new();
+            await new ReturnMainUiTask(_runtime).Start(ct);
+
+            //逐页扫描
+            for (int i = 0; i < pageBatches.Count; i++)
+            {
+                var (page, pageItemNames) = pageBatches[i];
+
+                logger.LogInformation("在{page}寻找{first}等，共{count}类物品……", page, pageItemNames.First(), pageItemNames.Count);
+
+                if (i == 0)
+                {
+                    await AutoArtifactSalvageTask.OpenInventory(_runtime, page, input, logger, this.ct);
+                }
+                else
+                {
+                    await AutoArtifactSalvageTask.SwitchInventoryTab(_runtime, page, input, logger, this.ct);
+                }
+
+                await ScanPageForTargets(iconRecognizer, page, pageItemNames, results);
+
+                var pageNotFound = pageItemNames.Except(results.Keys).ToList();
+                if (pageNotFound.Count > 0)
+                {
+                    logger.LogInformation("在{page}没有找到{name}", page, string.Join(", ", pageNotFound));
+                }
+
+            }
+
+            await new ReturnMainUiTask(_runtime).Start(ct);
+            return SoloTaskResult.Success(new InventoryCountData { Counts = results },
+                $"找到 {results.Count}/{this.itemNames.Count} 类物品");
+        }
+
+        /// <summary>
+        /// 构造扫描批次：传入 gridScreenName 时直接构造单批次；未传入时自动按所在背包页分组。
+        /// </summary>
+        /// <returns>按背包页顺序排序的批次列表。</returns>
+        private List<(GridScreenName Page, List<string> PageItemNames)> BuildPageBatches()
+        {
+
+            if (this.gridScreenName.HasValue)
+            {
+                return [(this.gridScreenName.Value, this.itemNames.ToList())];
+            }
+
+            // 未传入 gridScreenName 时，自动按所在背包页分组
+            var batchesByPage = new Dictionary<GridScreenName, List<string>>();
+            List<string> skipped = [];
+            foreach (string name in this.itemNames)
+            {
+                if (ItemMetadataCache.TryGetPage(name, out GridScreenName page))
+                {
+                    if (!batchesByPage.TryGetValue(page, out var list))
+                    {
+                        list = [];
+                        batchesByPage[page] = list;
+                    }
+                    list.Add(name);
+                }
+                else
+                {
+                    skipped.Add(name);
+                }
+            }
+
+            if (skipped.Count > 0)
+            {
+                throw new InvalidOperationException($"以下目标物品无法解析所在的背包页面: {string.Join(", ", skipped)}");
+            }
+
+            var pageBatches = new List<(GridScreenName Page, List<string> PageItemNames)>();
+            foreach (GridScreenName page in Enum.GetValues<GridScreenName>().OrderBy(p => (int)p))
+            {
+                if (batchesByPage.TryGetValue(page, out var list))
+                {
+                    pageBatches.Add((page, list));
+                }
+            }
+
+            if (pageBatches.Count == 0)
+            {
+                throw new InvalidOperationException("无法解析任何目标物品所在的背包页面");
+            }
+
+            return pageBatches;
+        }
+
+        /// <summary>
+        /// 扫描当前页的目标物品
+        /// </summary>
+        /// <param name="iconRecognizer">物品图标识别器。</param>
+        /// <param name="page">当前扫描页面。</param>
+        /// <param name="pageItemNames">本页目标物品名列表。</param>
+        /// <param name="results">累积结果字典。</param>
+        private async Task ScanPageForTargets(IItemIconRecognizer iconRecognizer, GridScreenName page, List<string> pageItemNames, Dictionary<string, int> results)
+        {
+            GridScreen gridScreen = new GridScreen(_runtime, CreateGridParams(page), logger, ct);
+            gridScreen.OnAfterTurnToNewPage += GridScreen.DrawItemsAfterTurnToNewPage;
+            gridScreen.OnBeforeScroll += () => _runtime.MaskWindowDrawingBoard.ClearAll();
+
+            // 本页尚未找到的目标物品
+            List<string> notFound = pageItemNames.Where(name => !results.ContainsKey(name)).ToList();
+
+            try
+            {
+                // 如果包含武器页的武器经验道具，直接翻页到最底部
+                bool hasOre = pageItemNames.Any(name => name.StartsWith("精锻用"));
+                if (page == GridScreenName.Weapons && hasOre)
+                {
+                    await PreScrollToBottomForWeaponOre();
+                }
+
+                int? maxSortOfItem = ComputeMaxSortOfItem(page, pageItemNames);
+
+                await foreach ((ImageRegion pageRegion, Rect itemRect) in gridScreen)
+                {
+                    using ImageRegion itemRegion = pageRegion.DeriveCrop(itemRect);
+                    string? predName = RecognizeItemName(itemRegion, iconRecognizer);
+                    if (predName == null)
+                    {
+                        continue;
+                    }
+
+                    // 背包物品顺序固定；遍历到排序晚于目标的条目仍未找到目标，即可提前退出扫描。
+                    if (maxSortOfItem.HasValue
+                        && ItemMetadataCache.TryGetSortOrder(predName, out int predSort)
+                        && predSort > maxSortOfItem.Value)
+                    {
+                        logger.LogInformation("识别到 {name} 页有物品排序 (sort_order={sort}) 超过阈值 {threshold}，提前结束 {page} 扫描", predName, predSort, maxSortOfItem.Value, page);
+                        break;
+                    }
+
+                    if (pageItemNames.Contains(predName) && !results.ContainsKey(predName))
+                    {
+                        int count = ReadItemCount(itemRegion);
+                        results.TryAdd(predName, count);
+                        notFound.RemoveAll(n => n == predName);
+
+                        if (notFound.Count == 0)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                _runtime.MaskWindowDrawingBoard.ClearAll();
+            }
+        }
+
+        private int? ComputeMaxSortOfItem(GridScreenName page, List<string> pageItemNames)
+        {
+            if (!this.stopByItemSort)
+            {
+                return null;
+            }
+
+            int maxSort = int.MinValue;
+            foreach (string pageItemName in pageItemNames)
+            {
+                if (!ItemMetadataCache.TryGetSortOrder(pageItemName, out int sort))
+                {
+                    logger.LogWarning("无法获取目标物品 {name} 在 {page} 的排序值，不启用按物品顺序提前结束扫描", pageItemName, page);
+                    return null;
+                }
+                if (sort > maxSort)
+                {
+                    maxSort = sort;
+                }
+            }
+            return maxSort;
+        }
+
+        private GridParams CreateGridParams(GridScreenName page)
+        {
+            return GridParams.Templates[page];
+        }
+
+        private async Task PreScrollToBottomForWeaponOre()
+        {
+            // 长按滑动栏底部，快速翻页到底部后，再继续滚动确保在最后一页
+            _runtime.GameRegion1080PPosMove(1289, 936);
+            try
+            {
+                GlobalMethod.LeftButtonDown();
+                await _runtime.Delay(2000, ct);
+            }
+            finally
+            {
+                GlobalMethod.LeftButtonUp();
+            }
+            var gridScroller = new GridScroller(_runtime, GridParams.Templates[GridScreenName.Weapons], logger, input, ct);
+            while (await gridScroller.TryVerticalScollDown((src, columns) => GridScreen.GridEnumerator.GetGridItems(src, columns)))
+            {
+                await _runtime.Delay(300, ct);
+            }
+        }
+
+        private static string? RecognizeItemName(ImageRegion itemRegion, IItemIconRecognizer iconRecognizer)
+        {
+            using Mat icon = itemRegion.SrcMat.GetGridIcon();
+            return iconRecognizer.Recognize(icon);
+        }
+
+        private int ReadItemCount(ImageRegion itemRegion)
+        {
+            using GridItemCountRecognitionResult result =
+                GridItemCountRecognizer.RecognizeCropped(itemRegion.SrcMat, OcrFactory.Paddle);
+            if (result.Count >= 0)
+            {
+                return result.Count;
+            }
+
+            logger.LogWarning("无法识别数量，OCR 原文：{Text}，原因：{Reason}", result.RawText, result.Reason);
+            return -2;
+        }
+    }
+}

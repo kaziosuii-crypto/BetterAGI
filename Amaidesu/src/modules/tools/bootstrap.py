@@ -1,0 +1,286 @@
+"""
+工具层组合根装配入口
+
+集中装配 Amaidesu 框架自带的"核心"工具包到指定 ``ToolRegistry``。
+
+## 设计要点
+- **显式注入**——registry 由调用方构造并传入，本模块**不**触碰任何全局单例
+  （``default_tool_registry()``）。生产代码请使用本入口
+- **分类开关装配**——``[tools.<domain>.<key>].enabled``（如
+  ``[tools.studio.obs].enabled``）与 avatar 平台名单（``avatar.toml``
+  ``[avatar.platform].enabled``）驱动各提供者的装配；名单外/段缺失或
+  false 时不装配（避免"配置里没启用但工具进入 registry"的隐式行为）
+- **按包隔离**——每个提供者的注册调用都被 ``try/except`` 包裹，
+  单包失败（缺配置 / 缺 endpoint / 缺依赖）只记 ERROR 日志 + 报告里
+  ``count=0``，不阻断其它包
+- **无目录扫描**——绑定关系全部写死在下方 ``_DOMAIN_MEMBERS`` 中，
+  避免动态 import / 文件系统扫描引入隐式耦合
+- **与 L2 Provider 注册语义对齐**——输出包内已有 ``register_<x>_tools``
+  函数，统一调用入口（不改 provider 内部）
+- **不感知 Agent 层**——bootstrap 只调 provider 的 register 函数，
+  不引入对 ``src/agents/**`` 的依赖（架构红线：工具不感知 Agent 层）
+
+## 调用示例（main.py 装配阶段）
+
+```python
+from src.modules.tools import ToolRegistry
+from src.modules.tools.bootstrap import bind_core_tools
+
+registry = ToolRegistry()
+report = bind_core_tools(registry, config=tools_section_dict)
+```
+
+## 当前覆盖的核心工具包
+
+### 输出控制包（按分类开关/平台名单装配）
+| 分类段 | register 函数 | 描述 |
+|---|---|---|
+| ``[avatar.platform.vts]``（名单成员） | ``register_vts_tools`` | VTubeStudio 控制 |
+| ``[avatar.platform.vrchat]``（名单成员） | ``register_vrchat_tools`` | VRChat OSC 桥接 |
+| ``[avatar.platform.warudo]``（名单成员） | ``register_warudo_tools`` | Warudo 控制 |
+| ``[avatar.platform.expression_sheet]``（名单成员） | ``register_expression_sheet_tools`` | 表情差分形象控制 |
+| ``[tools.studio.obs]`` | ``register_obs_tools`` | OBS Studio 控制 |
+| ``[tools.web.search]`` | ``register_web_search_tools`` | 联网搜索（web_search / web_fetch_url） |
+
+注意：
+
+- ``perception``（vision_look_at_screen）是 L2 DI 工具（需 ``ScreenCapture``
+  注入），无 ``register_*_tools`` 入口，由组合根在知道具体依赖后再
+  ``registry.register_provider(...)`` 注入——**不在本 bootstrap 范围**
+  （架构红线：工具不感知 Agent 层）
+
+## TTS 与字幕装配说明
+
+TTS 与字幕均为基础设施而非工具：
+
+- TTS 由 ``src/modules/tts/build_tts_infrastructure`` 按核心 ``[tts]``
+  段构造引擎实例并由 ``StreamerAgent`` 直接持有调用
+- 字幕由 ``src/modules/subtitle/build_subtitle_infrastructure`` 按核心
+  ``[subtitle]`` 段构造 ``SubtitleService`` 实例并注入
+  ``StreamerAgent`` 直接调用
+
+两者均不经 ``ToolRegistry``，本模块不介入 TTS / 字幕装配。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Tuple
+
+from src.modules.logging import get_logger
+from src.modules.tools.registry import ToolRegistry
+
+logger = get_logger("ToolBootstrap")
+
+
+# (成员身份, 描述, 注册函数加载器)
+# 成员身份 = (分类段, 提供者键)：分类段开关（avatar.vts 等）驱动装配。
+# 注册函数加载器：返回 ``Callable[[registry, config], provider]``，
+# 延迟 import 避免本模块被加载时拖入整条 avatar/studio 依赖链。
+_EntrySpec = Tuple[Tuple[str, str], str, Callable[[], Callable[..., Any]]]
+
+
+def _load_vts() -> Callable[..., Any]:
+    from src.modules.avatar.platform.vts.vts_provider import register_vts_tools
+
+    return register_vts_tools
+
+
+def _load_vrchat() -> Callable[..., Any]:
+    from src.modules.avatar.platform.vrchat.vrchat_provider import register_vrchat_tools
+
+    return register_vrchat_tools
+
+
+def _load_warudo() -> Callable[..., Any]:
+    from src.modules.avatar.platform.warudo.warudo_provider import register_warudo_tools
+
+    return register_warudo_tools
+
+
+def _load_expression_sheet() -> Callable[..., Any]:
+    from src.modules.avatar.platform.expression_sheet.expression_sheet_provider import (
+        register_expression_sheet_tools,
+    )
+
+    return register_expression_sheet_tools
+
+
+def _load_obs() -> Callable[..., Any]:
+    from src.modules.studio.obs.obs_provider import register_obs_tools
+
+    return register_obs_tools
+
+
+def _load_web_search() -> Callable[..., Any]:
+    from src.modules.web.search_provider import register_web_search_tools
+
+    return register_web_search_tools
+
+
+# 工具分类成员表：每个提供者绑定其分类段（avatar.vts / avatar.warudo / studio.obs）。
+# 分类段缺失或 enabled=false 时不装配（开关控制权归属人类：配置 + Web UI）。
+_DOMAIN_MEMBERS: List[_EntrySpec] = [
+    (("avatar", "vts"), "VTubeStudio 控制", _load_vts),
+    (("avatar", "vrchat"), "VRChat OSC 桥接", _load_vrchat),
+    (("avatar", "warudo"), "Warudo 控制", _load_warudo),
+    (("avatar", "expression_sheet"), "表情差分形象控制", _load_expression_sheet),
+    (("studio", "obs"), "OBS Studio 控制", _load_obs),
+    (("web", "search"), "联网搜索", _load_web_search),
+]
+
+
+def _resolve_domain_config(tools_cfg: Dict[str, Any], domain: str, key: str) -> Dict[str, Any]:
+    """从 ``[tools]`` 顶层配置读出 ``domain.key`` 子段开关配置。
+
+    返回该分类的 ``config`` 字典（provider 具体配置）：
+    - ``[tools.studio.obs] {enabled: true, config: {...}}`` → ``{...}``
+    - 分类段缺失 / 非 dict → {}（下游 register 走默认 / 抛错兜底）
+
+    开关语义：分类段不存在于配置即视为未启用（不装配），避免隐式行为漂移。
+    """
+    if not isinstance(tools_cfg, dict):
+        return {}
+    domain_cfg = tools_cfg.get(domain)
+    if not isinstance(domain_cfg, dict):
+        return {}
+    member_cfg = domain_cfg.get(key)
+    if not isinstance(member_cfg, dict):
+        return {}
+    cfg = member_cfg.get("config")
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def _avatar_platform_state(avatar_platform: Dict[str, Any], key: str) -> Tuple[bool, Dict[str, Any]]:
+    """读平台装配态：``[avatar.platform]`` 启用名单 + 成员段。
+
+    ``avatar_platform`` 为 avatar.toml 在拍平合并视图中的顶层 ``platform``
+    段。返回 (是否启用, 成员配置)：名单含 ``key`` 即启用；成员段缺省 =
+    空配置（provider 侧走全默认构造，与 Schema 缺段补默认一致）。成员段
+    直接铺参数键，无 ``.config`` 中间层。
+    """
+    platform = avatar_platform if isinstance(avatar_platform, dict) else {}
+    enabled = platform.get("enabled", [])
+    enabled = enabled if isinstance(enabled, list) else []
+    member = platform.get(key)
+    member = member if isinstance(member, dict) else {}
+    return key in enabled, dict(member)
+
+
+def _domain_enabled(tools_cfg: Dict[str, Any], domain: str, key: str) -> bool:
+    """分类开关：``[tools.<domain>.<key>].enabled``，默认 False（缺省不装配）。"""
+    if not isinstance(tools_cfg, dict):
+        return False
+    domain_cfg = tools_cfg.get(domain)
+    if not isinstance(domain_cfg, dict):
+        return False
+    member_cfg = domain_cfg.get(key)
+    if not isinstance(member_cfg, dict):
+        return False
+    return bool(member_cfg.get("enabled", False))
+
+
+def bind_core_tools(
+    registry: ToolRegistry,
+    config: Dict[str, Any] | None = None,
+    event_bus: Any | None = None,
+    lipsync_analyzer: Any | None = None,
+    avatar_platform: Dict[str, Any] | None = None,
+    subtitle_service: Any | None = None,
+) -> Dict[str, int]:
+    """绑定 Amaidesu 核心分类工具包到 ``registry``。
+
+    装配规则：
+
+    - **按分类开关装配**——studio 分类段 ``[tools.studio.obs].enabled`` 为
+      true、avatar 平台名在 ``[avatar.platform].enabled`` 名单内时装配该
+      提供者；名单外 / false / 段缺失则不装配
+    - TTS / 字幕为基础设施（core.toml 驱动），不在本 bootstrap 范围
+
+    Args:
+        registry: 目标注册器（由调用方构造并持有）
+        config: ``[tools]`` 段（分类开关容器），键名见 ``_DOMAIN_MEMBERS``；
+            传 ``None`` 表示所有分类走"空配置"，一律不装配
+        avatar_platform: avatar.toml 拍平合并视图中的顶层 ``platform`` 段
+            （启用名单 + 各平台成员段）；``None`` 表示 avatar 域未提供配置，
+            平台一律不装配
+        event_bus: 事件总线（虚拟形象适配器的被动半订阅 streamer.speech /
+            tts.utterance.* 需要；组合根透传，None 时适配器退化为仅工具面）
+        lipsync_analyzer: 共享口型分析器（avatar 域渲染器接线；组合根透传，
+            None = 不渲染口型；统一装配签名，studio 域忽略）
+        subtitle_service: 字幕服务（平台自带的字幕显示面登记为它的后端，如 VRChat
+            头顶聊天框；组合根透传，None = 不接；统一装配签名，其余成员忽略）
+
+    Returns:
+        ``{member_key: new_tool_count}`` 报告，只含**实际尝试装配**的成员
+        （未启用的成员不进报告，由 INFO 日志记"跳过"）；报告内 ``count=0``
+        即尝试装配但失败。
+    """
+    if not isinstance(registry, ToolRegistry):
+        raise TypeError(f"bind_core_tools: registry 必须是 ToolRegistry 实例，得到 {type(registry).__name__}")
+
+    tools_cfg: Dict[str, Any] = config if isinstance(config, dict) else {}
+    avatar_cfg: Dict[str, Any] = avatar_platform if isinstance(avatar_platform, dict) else {}
+
+    report: Dict[str, int] = {}
+
+    # --- 按分类开关装配（studio 走 tools 段成员开关；avatar 走平台名单）---
+    for (domain, key), description, loader in _DOMAIN_MEMBERS:
+        if domain == "avatar":
+            enabled, provider_config = _avatar_platform_state(avatar_cfg, key)
+        else:
+            enabled = _domain_enabled(tools_cfg, domain, key)
+            provider_config = _resolve_domain_config(tools_cfg, domain, key)
+        if not enabled:
+            # 分类未启用：跳过（预期行为，不入报告；INFO 可见）
+            logger.info(f"bind_core_tools: '{key}' 未启用，跳过（{description}）")
+            continue
+        before_count = len(registry)
+
+        try:
+            register_fn = loader()
+        except Exception:  # noqa: BLE001 - 单成员隔离边界
+            logger.error(
+                f"bind_core_tools: 加载 '{key}' 的 register 函数失败（{description}）",
+                exc=True,
+            )
+            report[key] = 0
+            continue
+
+        try:
+            register_fn(
+                registry=registry,
+                config=provider_config,
+                event_bus=event_bus,
+                lipsync_analyzer=lipsync_analyzer,
+                subtitle_service=subtitle_service,
+            )
+        except Exception as exc:  # noqa: BLE001 - 单成员隔离边界
+            logger.error(
+                f"bind_core_tools: 绑定 '{key}' 失败（{description}）: {type(exc).__name__}: {exc}",
+                exc=True,
+            )
+            report[key] = 0
+            continue
+
+        new_count = len(registry) - before_count
+        report[key] = new_count
+        if new_count > 0:
+            logger.info(f"bind_core_tools: '{key}' 已绑定，新增 {new_count} 个工具（{description}）")
+        else:
+            # 连接型 Provider（VTS 等）装配期未连接 → 降级登记 0 工具属预期；
+            # 静态 Provider 0 工具仍是异常信号，保留 warning 提示排查
+            logger.warning(
+                f"bind_core_tools: '{key}' 装配成功但 0 工具（{description}）；"
+                "连接型 Provider 降级登记属预期（连接成功后自动补注册），静态 Provider 需排查注册实现"
+            )
+
+    return report
+
+
+CORE_MEMBER_COUNT = len(_DOMAIN_MEMBERS)
+
+__all__ = [
+    "CORE_MEMBER_COUNT",
+    "bind_core_tools",
+    "_DOMAIN_MEMBERS",
+]

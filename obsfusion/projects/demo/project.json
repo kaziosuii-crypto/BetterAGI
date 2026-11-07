@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "id": "demo",
+  "title": "ObsFusion · 文字与画面缝合演示",
+  "canvas": {
+    "width": 1920,
+    "height": 1080
+  },
+  "video": {
+    "src": "media/demo.mp4",
+    "loop": true,
+    "muted": true,
+    "fit": "cover",
+    "opacity": 1
+  },
+  "audio": {
+    "ttsGain": 1,
+    "bgm": null
+  },
+  "theme": {
+    "accent": "#E8B05A",
+    "subtitleSize": 62
+  },
+  "sync": {
+    "mode": "audio",
+    "tailPadding": 0.25
+  },
+  "cues": [
+    {
+      "id": "c1",
+      "start": 0.8,
+      "end": 4,
+      "text": "当文字得到时间，它就不再只是文字。",
+      "speaker": "解说",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    },
+    {
+      "id": "c2",
+      "start": 4.55,
+      "end": 7.75,
+      "text": "ObsFusion 把文案、语音和画面缝成一条时间线。",
+      "speaker": "解说",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    },
+    {
+      "id": "c3",
+      "start": 8.3,
+      "end": 11.5,
+      "text": "# 第二幕 · 扩展登场",
+      "speaker": "章节",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    },
+    {
+      "id": "c4",
+      "start": 12.05,
+      "end": 15.25,
+      "text": "叠加层跑在 OBS 浏览器源里，透明、可编程。",
+      "speaker": "解说",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    },
+    {
+      "id": "c5",
+      "start": 15.8,
+      "end": 19,
+      "text": "# 第二幕 · 扩展登场",
+      "speaker": "章节",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    },
+    {
+      "id": "c6",
+      "start": 19.55,
+      "end": 22.75,
+      "text": "改一行 JSON，或者调用一次 API，画面就变。",
+      "speaker": "解说",
+      "anchor": "bottom-center",
+      "style": "subtitle",
+      "karaoke": true,
+      "tts": {
+        "enabled": true,
+        "voice": "Microsoft Huihui Desktop",
+        "rate": 0,
+        "volume": 100
+      }
+    }
+  ],
+  "extensions": [
+    {
+      "id": "danmaku",
+      "enabled": true,
+      "config": {
+        "lanes": 6,
+        "area": "top",
+        "avoidSubtitles": true,
+        "routes": [
+          {
+            "name": "SC 固定",
+            "when": { "regex": "SC" },
+            "target": { "zone": "top-right", "mode": "fixed", "duration": 8, "color": "#E8B05A" }
+          },
+          {
+            "name": "置顶弹幕",
+            "when": { "user": "主播" },
+            "target": { "zone": "bottom-left", "mode": "fixed", "duration": 6 }
+          }
+        ]
+      }
+    },
+    {
+      "id": "chapters",
+      "enabled": true,
+      "config": {
+        "position": "left",
+        "offsetY": 220
+      }
+    }
+  ],
+  "meta": {
+    "createdAt": "2026-11-04T09:03:20.709Z",
+    "updatedAt": "2026-11-04T09:03:20.711Z"
+  }
+}

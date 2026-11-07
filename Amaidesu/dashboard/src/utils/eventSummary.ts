@@ -1,0 +1,105 @@
+// 共享事件摘要工具
+//
+// Dashboard 速率面板、Collectors/Agents 实时流均需要把 WebSocketMessage
+// 折算成"一行可读的运维摘要"。把规则集中到一处可避免三处各自维护带来的
+// 行为漂移。摘要规则：
+//   - room.message（WS 统一类型）→ "{message_type} · {user.name/id}: {content 截断}"
+//   - streamer.speech → "发言: {text}"
+//   - tool.result.<name> → "{tool_name} · {status} [+ error tail]"
+//   - rundown.changed → "环节切换/流程单完成"
+//   - planner.* → 决策结论一行：失败/沉默/回应（decision）或裁决意图（verdict）
+//   - game.* → "{message}" + scene；live.* → session/platform 摘要
+//   - core.* → message 或 event 名
+//   - 其余：原样返回事件 type
+//
+// 注意：事件 timestamp 是 Unix 秒（与 Dashboard/LiveObserver 既有用法一致），
+// 调用方如需展示相对时间请自行换算。
+
+import { EVENT, EVENT_FAMILY } from '@/types/events';
+import { truncateText } from '@/utils/format';
+
+/**
+ * 按业务族抽取事件的人类可读摘要。
+ *
+ * @param type 事件 type（WS 广播类型，如 `room.message` / `tool.result.speak`）
+ * @param data 事件 data 载荷（任意可 JSON 反序列化对象）
+ * @returns 单行摘要（已做长度截断；省略号 `…` 收尾）
+ */ export function summarizeEvent(type: string, data: unknown): string {
+  const d = (data ?? {}) as Record<string, unknown>;
+
+  // room.message.* 族折叠广播，消息种类由 payload.message_type 判别。
+  if (type === EVENT.roomMessage) {
+    const messageType = pickString(d.message_type, 12) || 'danmaku';
+    const user = (d.user as { name?: string; id?: string } | undefined) ?? null;
+    const userLabel = user?.name || (user?.id ? `#${user.id}` : '匿名');
+    const content = pickString(d.content, 24);
+    return content ? `${messageType} · ${userLabel}: ${content}` : `${messageType} · ${userLabel}`;
+  }
+
+  if (type === EVENT.streamerSpeech) {
+    const text = pickString(d.text, 32);
+    return text ? `发言: ${text}` : type;
+  }
+
+  if (type.startsWith(EVENT_FAMILY.toolResult)) {
+    const toolName = pickString(d.tool_name, 16) || type.replace(EVENT_FAMILY.toolResult, '');
+    const status = pickString(d.status, 8) || '—';
+    const errTail = pickString(d.error_message, 24);
+    return errTail ? `${toolName} · ${status} · ${errTail}` : `${toolName} · ${status}`;
+  }
+
+  if (type === EVENT.plannerDecision || type === EVENT.plannerVerdict) {
+    // decision 是轮末汇总（失败/沉默/回应三态互斥），verdict 只在决定回应时发。
+    // target 是用户 id 哈希（无名字映射），一行摘要里不展示。
+    if (type === EVENT.plannerDecision) {
+      const err = pickString(d.error, 24);
+      if (err) return `决策失败 · ${err}`;
+      if (d.should_reply === false) {
+        return '本轮不回应';
+      }
+      return `回应: ${pickString(d.topic_summary, 24)}`.trim();
+    }
+    return `裁决: ${pickString(d.topic_summary, 24)}`.trim();
+  }
+
+  if (type === EVENT.rundownChanged) {
+    const seg = pickString(d.segment_title, 18);
+    const index = typeof d.index === 'number' ? d.index : null;
+    const total = typeof d.total === 'number' ? d.total : null;
+    if (index != null && total != null && index >= total) return '流程单完成';
+    return seg ? `切换到 ${seg}` : '切换到（未命名环节）';
+  }
+
+  if (
+    type === EVENT.gameReport ||
+    type === EVENT.gameAttentionRequired ||
+    type === EVENT.gameError ||
+    type === EVENT.gameMilestone ||
+    type === EVENT.gameChatReceived ||
+    type.startsWith(EVENT_FAMILY.gameBody) ||
+    type.startsWith(EVENT_FAMILY.gameChat)
+  ) {
+    const message = pickString(d.message, 32);
+    const scene = pickString(d.scene, 14);
+    return scene ? `${message} @ ${scene}` : message || type;
+  }
+
+  if (type === EVENT.liveStarted || type === EVENT.liveEnded) {
+    const session = pickString(d.live_session_id, 16);
+    const platform = pickString(d.platform, 10);
+    if (platform && session) return `${platform} · ${session}`;
+    return session || platform || type;
+  }
+
+  if (type === EVENT.coreStartup || type === EVENT.coreShutdown || type === EVENT.coreError) {
+    const message = pickString(d.message, 24) || pickString(d.event, 16);
+    return message || type;
+  }
+
+  return type;
+}
+
+function pickString(value: unknown, maxLen = 24): string {
+  if (typeof value !== 'string' || value.length === 0) return '';
+  return truncateText(value, maxLen);
+}

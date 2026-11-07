@@ -1,0 +1,962 @@
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Recognition;
+using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.Core.Recognition.OpenCv;
+using BetterGenshinImpact.Core.Simulator.Extensions;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Common.BgiVision;
+using BetterGenshinImpact.GameTask.Common.Element.Assets;
+using BetterGenshinImpact.GameTask.Common.Job;
+using BetterGenshinImpact.GameTask.GetGridIcons;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Model;
+using BetterGenshinImpact.GameTask.Model.GameUI;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.GameTask.SoloTask;
+using BetterGenshinImpact.Helpers;
+using BetterGenshinImpact.Helpers.Extensions;
+using BetterGenshinImpact.Core.Mask;
+using Microsoft.ClearScript;
+using Microsoft.ClearScript.V8;
+using Microsoft.Extensions.Localization;
+using Microsoft.Extensions.Logging;
+using Microsoft.ML.OnnxRuntime;
+using OpenCvSharp;
+using System;
+using System.Collections.Frozen;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using Vanara.PInvoke;
+using static BetterGenshinImpact.GameTask.Common.TaskControl;
+
+namespace BetterGenshinImpact.GameTask.AutoArtifactSalvage;
+
+/// <summary>
+/// 圣遗物自动分解
+/// </summary>
+[SoloTaskInfo(TaskId, "自动分解圣遗物", Group = "工具", Order = 410)]
+public class AutoArtifactSalvageTask : ISoloTask<AutoArtifactSalvageTaskParam, NoData>
+{
+    /// <summary>
+    /// 独立任务稳定标识。
+    /// </summary>
+    public const string TaskId = "auto_artifact_salvage";
+
+    /// <summary>
+    /// 本次运行使用的运行环境
+    /// </summary>
+    private readonly GameRuntime _runtime;
+
+    private readonly ILogger logger;
+    private IInputChannel input => InputHub.Foreground;
+
+    private CancellationToken ct;
+
+    /// <summary>
+    /// 分解的最大星级，在 RunAsync 开头从参数赋值。
+    /// </summary>
+    private int star;
+
+    /// <summary>
+    /// “快速选择”按钮的本地化匹配串，随参数中的语言初始化。
+    /// </summary>
+    private string quickSelectLocalizedString = string.Empty;
+
+    /// <summary>
+    /// 1—4 星圣遗物选项的本地化匹配串，随参数中的语言初始化。
+    /// </summary>
+    private string[] numOfStarLocalizedString = [];
+
+    /// <summary>
+    /// 圣遗物副词条待激活本地化匹配串，随参数中的语言初始化。
+    /// </summary>
+    private string artifactAffixUnactivatedFlagStr = string.Empty;
+
+    /// <summary>
+    /// 逐个筛选 5 星圣遗物使用的 JavaScript；为空时只做快速分解。
+    /// </summary>
+    private string? javaScript;
+
+    /// <summary>
+    /// 套装筛选条件。
+    /// </summary>
+    private string? artifactSetFilter;
+
+    /// <summary>
+    /// 逐个筛选时最多检查的数量。
+    /// </summary>
+    private int? maxNumToCheck;
+
+    /// <summary>
+    /// 逐个筛选时识别失败的处理策略。
+    /// </summary>
+    private RecognitionFailurePolicy? recognitionFailurePolicy;
+
+    private readonly bool returnToMainUi = true;
+
+    /// <summary>
+    /// 游戏语言，用于解析词条数值，随参数初始化。
+    /// </summary>
+    private CultureInfo? cultureInfo;
+
+    /// <summary>
+    /// 词条类型到本地化名称的映射，随参数中的语言初始化。
+    /// </summary>
+    private FrozenDictionary<ArtifactAffixType, string> artifactAffixStrDic = FrozenDictionary<ArtifactAffixType, string>.Empty;
+
+    /// <summary>
+    /// 创建圣遗物分解任务。业务参数通过 <see cref="RunAsync"/> 或识别方法传入。
+    /// </summary>
+    /// <param name="runtime">本次运行使用的运行环境</param>
+    /// <param name="logger">日志记录器，为空时使用默认日志</param>
+    public AutoArtifactSalvageTask(GameRuntime runtime, ILogger? logger = null)
+    {
+        _runtime = runtime;
+        this.logger = logger ?? App.GetLogger<AutoArtifactSalvageTask>();
+    }
+
+    /// <summary>
+    /// 从参数初始化本次运行的业务字段与本地化字符串（原构造函数中依赖参数的部分）。
+    /// </summary>
+    /// <param name="param">本次运行的业务参数</param>
+    private void InitializeFromParam(AutoArtifactSalvageTaskParam param)
+    {
+        this.star = param.Star;
+        this.javaScript = param.JavaScript;
+        this.artifactSetFilter = param.ArtifactSetFilter;
+        this.maxNumToCheck = param.MaxNumToCheck;
+        this.recognitionFailurePolicy = param.RecognitionFailurePolicy;
+        ApplyLocalization(param);
+    }
+
+    /// <summary>
+    /// 按参数中的游戏语言和本地化器初始化识别用的本地化字符串。
+    /// </summary>
+    /// <param name="param">提供游戏语言与本地化器的参数</param>
+    private void ApplyLocalization(AutoArtifactSalvageTaskParam param)
+    {
+        var stringLocalizer = param.StringLocalizer;
+        this.cultureInfo = param.GameCultureInfo;
+        quickSelectLocalizedString = stringLocalizer.WithCultureGet(cultureInfo, "快速选择");
+        numOfStarLocalizedString =
+        [
+            stringLocalizer.WithCultureGet(cultureInfo, "1星圣遗物"),
+            stringLocalizer.WithCultureGet(cultureInfo, "2星圣遗物"),
+            stringLocalizer.WithCultureGet(cultureInfo, "3星圣遗物"),
+            stringLocalizer.WithCultureGet(cultureInfo, "4星圣遗物")
+        ];
+
+        artifactAffixUnactivatedFlagStr = stringLocalizer.WithCultureGet(cultureInfo, "待激活");
+        artifactAffixStrDic = ArtifactAffix.DefaultStrDic.Select(kvp => new KeyValuePair<ArtifactAffixType, string>(kvp.Key, stringLocalizer.WithCultureGet(cultureInfo, kvp.Value))).ToFrozenDictionary();
+    }
+
+    /// <summary>
+    /// 按 B 键打开背包并切换到目标分类
+    /// </summary>
+    /// <param name="runtime">运行环境</param>
+    /// <param name="gridScreenName">目标背包分类。</param>
+    /// <param name="input">输入模拟器。</param>
+    /// <param name="logger">日志记录器。</param>
+    /// <param name="ct">取消令牌。</param>
+    public static async Task OpenInventory(GameRuntime runtime, GridScreenName gridScreenName, IInputChannel input, ILogger logger, CancellationToken ct)
+    {
+        var (recognitionObjectChecked, recognitionObjectUnchecked) = GetTabRecognitionObjects(gridScreenName, runtime.SystemInfo);
+
+        // B键打开背包
+        input.SimulateAction(GIActions.OpenInventory);
+        await runtime.Delay(1200, ct);
+
+        var openBagSuccess = await NewRetry.WaitForAction(runtime, () =>
+        {
+            using var ra = runtime.CaptureToRectArea();
+
+            // 判断是否在提示对话框（物品过期提示）
+            if (Bv.IsInPromptDialog(ra))
+            {
+                // 如果存在物品过期提示，则点击确认按钮
+                Bv.ClickWhiteConfirmButton(ra, new Rect(0, 0, ra.Width, (int)Math.Round(ra.Height - ra.Height * 0.2)));
+                runtime.Sleep(300, ct);
+                return false;
+            }
+
+            using var artifactBtn = ra.Find(recognitionObjectChecked);
+            if (artifactBtn.IsEmpty())
+            {
+                using var artifactBtn2 = ra.Find(recognitionObjectUnchecked);
+                if (artifactBtn2.IsExist())
+                {
+                    artifactBtn2.Click();
+                    return true;
+                }
+            }
+            else
+            {
+                return true;
+            }
+
+            // 如果还在主界面就尝试再按下B键打开背包
+            if (Bv.IsInMainUi(ra))
+            {
+                Debug.WriteLine("背包打开失败,再次尝试打开背包");
+                input.SimulateAction(GIActions.OpenInventory);
+            }
+
+            return false;
+        }, ct, 5);
+
+        if (!openBagSuccess)
+        {
+            logger.LogError("未找到背包中{name}菜单按钮,打开背包失败", gridScreenName.GetDescription());
+            return;
+        }
+
+
+        await runtime.Delay(800, ct);
+    }
+
+    /// <summary>
+    /// 取背包分类 tab 的选中/未选中元素识别对象。
+    /// </summary>
+    /// <param name="gridScreenName">目标背包分类。</param>
+    /// <param name="systemInfo">运行环境的画面信息，用于按画面尺寸缩放素材。</param>
+    /// <returns>(选中元素, 未选中元素)。</returns>
+    /// <exception cref="NotSupportedException">不支持分类时抛出。</exception>
+    private static (RecognitionObject Checked, RecognitionObject Unchecked) GetTabRecognitionObjects(GridScreenName gridScreenName, ISystemInfo systemInfo)
+    {
+        return gridScreenName switch
+        {
+            GridScreenName.Weapons => (ElementRecognition.Get("BagWeaponChecked", systemInfo), ElementRecognition.Get("BagWeaponUnchecked", systemInfo)),
+            GridScreenName.Artifacts => (ElementRecognition.Get("BagArtifactChecked", systemInfo), ElementRecognition.Get("BagArtifactUnchecked", systemInfo)),
+            GridScreenName.CharacterDevelopmentItems => (ElementRecognition.Get("BagCharacterDevelopmentItemChecked", systemInfo), ElementRecognition.Get("BagCharacterDevelopmentItemUnchecked", systemInfo)),
+            GridScreenName.Food => (ElementRecognition.Get("BagFoodChecked", systemInfo), ElementRecognition.Get("BagFoodUnchecked", systemInfo)),
+            GridScreenName.Materials => (ElementRecognition.Get("BagMaterialChecked", systemInfo), ElementRecognition.Get("BagMaterialUnchecked", systemInfo)),
+            GridScreenName.Gadget => (ElementRecognition.Get("BagGadgetChecked", systemInfo), ElementRecognition.Get("BagGadgetUnchecked", systemInfo)),
+            GridScreenName.Quest => (ElementRecognition.Get("BagQuestChecked", systemInfo), ElementRecognition.Get("BagQuestUnchecked", systemInfo)),
+            GridScreenName.PreciousItems => (ElementRecognition.Get("BagPreciousItemChecked", systemInfo), ElementRecognition.Get("BagPreciousItemUnchecked", systemInfo)),
+            GridScreenName.Furnishings => (ElementRecognition.Get("BagFurnishingChecked", systemInfo), ElementRecognition.Get("BagFurnishingUnchecked", systemInfo)),
+            _ => throw new NotSupportedException($"背包不支持的界面：{gridScreenName.GetDescription()}")
+        };
+    }
+
+    /// <summary>
+    /// 在已打开的背包界面内，切换到目标分类 tab（不返回主界面）。
+    /// 已在目标 tab 则直接返回；否则点击未选中按钮并等待切换完成。
+    /// </summary>
+    /// <param name="runtime">运行环境</param>
+    /// <param name="targetTab">目标背包分类。</param>
+    /// <param name="input">输入模拟器。</param>
+    /// <param name="logger">日志记录器。</param>
+    /// <param name="ct">取消令牌。</param>
+    public static async Task SwitchInventoryTab(GameRuntime runtime, GridScreenName targetTab, IInputChannel input, ILogger logger, CancellationToken ct)
+    {
+        var (checkedObj, uncheckedObj) = GetTabRecognitionObjects(targetTab, runtime.SystemInfo);
+
+        // 已在目标 tab 则直接返回
+        using (var ra0 = runtime.CaptureToRectArea())
+        using (var checkedBtn0 = ra0.Find(checkedObj))
+        {
+            if (checkedBtn0.IsExist())
+            {
+                return;
+            }
+        }
+
+        // 查找并点击未选中按钮
+        bool clicked = false;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            using var ra = runtime.CaptureToRectArea();
+            using var uncheckedBtn = ra.Find(uncheckedObj);
+            if (uncheckedBtn.IsExist())
+            {
+                uncheckedBtn.Click();
+                clicked = true;
+                break;
+            }
+            await runtime.Delay(300, ct);
+        }
+
+        if (!clicked)
+        {
+            logger.LogError("未找到背包中{name}菜单按钮,切换分类失败", targetTab.GetDescription());
+            return;
+        }
+
+        // 等待目标 tab 变为选中状态
+        var switched = await NewRetry.WaitForElementAppear(runtime, checkedObj, retryAction: null, ct, maxAttemptCount: 5, retryInterval: 500);
+        if (!switched)
+        {
+            logger.LogWarning("切换到{name}后未能确认已选中,继续尝试扫描", targetTab.GetDescription());
+        }
+        await runtime.Delay(800, ct);
+    }
+
+    /// <summary>
+    /// 运行圣遗物分解：打开背包分解界面，按星级快速分解；配置了 JavaScript 时再逐个筛选 5 星圣遗物。
+    /// </summary>
+    /// <param name="param">本次运行的业务参数</param>
+    /// <param name="ct">取消令牌</param>
+    /// <returns>未进入分解界面或找不到快速选择相关按钮时返回 Failed(page_not_reached)；其余正常结束返回 Unverified。</returns>
+    public async Task<SoloTaskResult<NoData>> RunAsync(AutoArtifactSalvageTaskParam param, CancellationToken ct)
+    {
+        // 依赖参数的初始化（原构造函数逻辑）
+        InitializeFromParam(param);
+
+        this.ct = ct;
+        if (returnToMainUi)
+        {
+            await new ReturnMainUiTask(_runtime).Start(ct);
+        }
+
+        await OpenInventory(_runtime, GridScreenName.Artifacts, this.input, this.logger, this.ct);
+
+        // 点击分解按钮打开分解界面
+        using var ra2 = _runtime.CaptureToRectArea();
+        using var salvageBtn = ra2.Find(ElementRecognition.Get("BtnArtifactSalvage", ra2));
+        if (salvageBtn.IsExist())
+        {
+            salvageBtn.Click();
+            await _runtime.Delay(1000, ct);
+        }
+        else
+        {
+            logger.LogError("未找到圣遗物分解按钮");
+            return SoloTaskResult.Failed(SoloTaskReasons.PageNotReached, "未找到圣遗物分解按钮");
+        }
+
+        // 快速选择
+        using var ra3 = _runtime.CaptureToRectArea();
+        var ocrList = ra3.FindMulti(RecognitionObject.Ocr(ra3.ToRect().CutLeftBottom(0.25, 0.1)));
+        bool quickSelectBtnFound = false;
+        foreach (var ocr in ocrList)
+        {
+            if (Regex.IsMatch(ocr.Text, quickSelectLocalizedString))
+            {
+                quickSelectBtnFound = true;
+                ocr.Click();
+                await _runtime.Delay(500, ct);
+                break;
+            }
+        }
+        if (!quickSelectBtnFound)
+        {
+            logger.LogError("没有找到可匹配{regex}的按钮，终止分解", quickSelectLocalizedString);
+            return SoloTaskResult.Failed(SoloTaskReasons.PageNotReached, $"没有找到可匹配{quickSelectLocalizedString}的按钮，终止分解");
+        }
+
+        // 确认选择
+        // 5.5 变成反选
+        using var ra4 = _runtime.CaptureToRectArea();
+        if (star < 4)
+        {
+            List<Region> ocrList2 = ra4.FindMulti(RecognitionObject.Ocr(ra4.ToRect().CutLeft(0.20)));
+            for (int i = star; i < 4; i++)
+            {
+                bool numOfStarFound = false;
+                foreach (var ocr in ocrList2)
+                {
+                    if (Regex.IsMatch(ocr.Text, numOfStarLocalizedString[i]))
+                    {
+                        numOfStarFound = true;
+                        ocr.Click();
+                        await _runtime.Delay(500, ct);
+                        break;
+                    }
+                }
+                if (!numOfStarFound)
+                {
+                    logger.LogError("没有找到可匹配{regex}的按钮，终止分解", numOfStarLocalizedString[i]);
+                    return SoloTaskResult.Failed(SoloTaskReasons.PageNotReached, $"没有找到可匹配{numOfStarLocalizedString[i]}的按钮，终止分解");
+                }
+            }
+        }
+
+        using var quickSelectConfirmBtn = ra4.Find(ElementRecognition.Get("BtnWhiteConfirm", ra4));
+        if (quickSelectConfirmBtn.IsExist())
+        {
+            quickSelectConfirmBtn.Click();
+        }
+        await _runtime.Delay(1500, ct);
+
+
+        // 点击分解
+        using var ra5 = _runtime.CaptureToRectArea();
+        var salvageBtnConfirm = ra5.Find(ElementRecognition.Get("BtnArtifactSalvageConfirm", ra5));
+        if (salvageBtnConfirm.IsExist())
+        {
+            salvageBtnConfirm.Click();
+            await _runtime.Delay(1000, ct);
+            // 点击确认
+            using var ra6 = _runtime.CaptureToRectArea();
+            if (Bv.ClickBlackConfirmButton(ra6))
+            {
+                logger.LogInformation("完成{Star}星圣遗物快速分解", star);
+                await _runtime.Delay(400, ct);
+                if (javaScript != null)
+                {
+                    input.Mouse.LeftButtonClick();
+                    await _runtime.Delay(1000, ct);
+                }
+            }
+            else
+            {
+                logger.LogInformation("未找到进行分解按钮，可能发生了卡顿");
+            }
+        }
+        else
+        {
+            logger.LogInformation("未找到圣遗物分解按钮，可能已经没有圣遗物需要快速分解");
+        }
+
+        // 分解5星
+        if (javaScript != null)
+        {
+            if (!string.IsNullOrWhiteSpace(this.artifactSetFilter))
+            {
+                // 其实是点击筛选按钮……快速选择确认的这个按钮正好和筛选按钮位置重合，摆烂直接用了
+                quickSelectConfirmBtn.Click();
+                await _runtime.Delay(400, ct);
+                // 点击所属套装
+                ra5.ClickTo(315, 190);
+                await _runtime.Delay(1000, ct);
+                // 遍历套装Grid勾选套装
+                using IItemIconRecognizer iconRecognizer = ItemIconRecognizerFactory.CreateConfigured();
+                ArtifactSetFilterScreen gridScreen = new ArtifactSetFilterScreen(_runtime, new GridParams(new Rect(40, 100, 1300, 852), 2, 3, 40, 40, 0.024), this.logger, this.ct);
+                string drawKey = "ArtifactSetFilter";
+                var drawShapes = new List<MaskWindowDrawingShape>();
+                gridScreen.OnBeforeScroll += () => { _runtime.MaskWindowDrawingBoard.Clear(drawKey); drawShapes.Clear(); };
+                try
+                {
+                    await foreach ((ImageRegion pageRegion, Rect itemRect) in gridScreen)
+                    {
+                        using ImageRegion itemRegion = pageRegion.DeriveCrop(itemRect);
+                        using Mat img125 = GetGridIconsTask.CropResizeArtifactSetFilterGridIcon(itemRegion, _runtime.SystemInfo);
+                        string? predName = iconRecognizer.Recognize(img125);
+                        if (predName == null)
+                        {
+                            var rect = itemRegion.SelfToMaskWindowDrawingRect();
+                            drawShapes.Add(rect);
+                            drawShapes.Add(new MaskWindowDrawingText("识别失败", new System.Windows.Point(rect.Bounds.X + rect.Bounds.Width / 3, rect.Bounds.Y)));
+                            itemRegion.DrawingBoard.Set(drawKey, drawShapes);
+                        }
+                        else
+                        {
+                            var rect = itemRegion.SelfToMaskWindowDrawingRect(System.Drawing.Pens.Lime);
+                            drawShapes.Add(rect);
+                            drawShapes.Add(new MaskWindowDrawingText(predName, new System.Windows.Point(rect.Bounds.X + rect.Bounds.Width / 3, rect.Bounds.Y)));
+                            itemRegion.DrawingBoard.Set(drawKey, drawShapes);
+                            if (this.artifactSetFilter.Contains(predName))
+                            {
+                                itemRegion.Click();
+                                await _runtime.Delay(100, ct);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    _runtime.MaskWindowDrawingBoard.ClearAll();
+                }
+                // 点击确认筛选
+                using var confirmFilterBtnRegion = _runtime.CaptureToRectArea();
+                Bv.ClickWhiteConfirmButton(confirmFilterBtnRegion);
+                await _runtime.Delay(1500, ct);
+                // 点击确认
+                using var confirmBtnRegion = _runtime.CaptureToRectArea();
+                Bv.ClickWhiteConfirmButton(confirmBtnRegion);
+                await _runtime.Delay(600, ct);
+            }
+
+            // 逐一点选查看面板筛选
+            await Salvage5Star();
+            logger.LogInformation("筛选完毕，请复查并手动分解");
+            return SoloTaskResult.Unverified("筛选完毕，请复查并手动分解");
+        }
+        else
+        {
+            input.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+
+            if (returnToMainUi)
+            {
+                await new ReturnMainUiTask(_runtime).Start(ct);
+            }
+        }
+
+        // 现有流程没有分解结果的确认手段，结果为“已执行，未核验”
+        return SoloTaskResult.Unverified("圣遗物分解流程已结束。");
+    }
+
+    private async Task Salvage5Star()
+    {
+        string javaScript = this.javaScript ?? throw new ArgumentException($"{nameof(this.javaScript)}不能为空");
+        int count = this.maxNumToCheck ?? throw new ArgumentException($"{nameof(this.maxNumToCheck)}不能为空");
+        RecognitionFailurePolicy recognitionFailurePolicy = this.recognitionFailurePolicy ?? throw new ArgumentException($"{nameof(this.recognitionFailurePolicy)}不能为空");
+
+        GridParams gridParams = GridParams.Templates[GridScreenName.ArtifactSalvage];
+        GridScreen gridScreen = new GridScreen(_runtime, gridParams, this.logger, this.ct); // 圣遗物分解Grid有4行9列
+        gridScreen.OnAfterTurnToNewPage += GridScreen.DrawItemsAfterTurnToNewPage;
+        gridScreen.OnBeforeScroll += () => _runtime.MaskWindowDrawingBoard.ClearAll();
+        // 网格区域按运行环境的素材缩放比例换算
+        Rect gridRoi = gridParams.GetRoi(_runtime.SystemInfo.AssetScale);
+        try
+        {
+            await foreach ((ImageRegion pageRegion, Rect itemRect) in gridScreen)
+            {
+                using ImageRegion itemRegion = pageRegion.DeriveCrop(itemRect);
+                Rect gridRect = itemRegion.ToRect();
+                if (GetArtifactStatus(itemRegion.SrcMat) == ArtifactStatus.None)
+                {
+                    itemRegion.Click();
+                    await _runtime.Delay(300, ct);
+
+                    using var ra1 = _runtime.CaptureToRectArea();
+                    using ImageRegion itemRegion1 = ra1.DeriveCrop(gridRect + new Point(gridRoi.X, gridRoi.Y));
+                    if (GetArtifactStatus(itemRegion1.SrcMat) == ArtifactStatus.Selected)
+                    {
+                        using ImageRegion card = ra1.DeriveCrop(new Rect((int)(ra1.Width * 0.70), (int)(ra1.Height * 0.112), (int)(ra1.Width * 0.275), (int)(ra1.Height * 0.50)));
+
+                        ArtifactStat artifact;
+                        try
+                        {
+                            artifact = RecognizeArtifactStat(card.SrcMat, OcrFactory.Paddle, out string allText);
+                        }
+                        catch (Exception e)
+                        {
+                            if (recognitionFailurePolicy == RecognitionFailurePolicy.Skip)
+                            {
+                                logger.LogError("识别失败，跳过当前圣遗物：{msg}", e.Message);
+
+                                itemRegion.Click(); // 反选取消
+                                await _runtime.Delay(100, ct);
+                                continue;
+                            }
+                            else
+                            {
+                                throw;
+                            }
+                        }
+
+                        if (await IsMatchJavaScript(artifact, javaScript))
+                        {
+                            // logger.LogInformation(message: msg);
+                        }
+                        else
+                        {
+                            itemRegion.Click(); // 反选取消
+                            await _runtime.Delay(100, ct);
+                        }
+                    }
+
+                    count--;
+                    if (count <= 0)
+                    {
+                        logger.LogInformation("检查次数已耗尽");
+                        break;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _runtime.MaskWindowDrawingBoard.ClearAll();
+        }
+    }
+
+    /// <summary>
+    /// 是否匹配JavaScript的计算结果
+    /// </summary>
+    /// <param name="artifact">作为JS入参，JS使用“ArtifactStat”获取</param>
+    /// <param name="javaScript"></param>
+    /// <param name="cts">为空则默认创建一个3秒延迟的cts</param>
+    /// <returns>是否匹配。取JS的“Output”作为出参</returns>
+    /// <exception cref="InvalidOperationException"></exception>
+    /// <exception cref="Exception"></exception>
+    public async static Task<bool> IsMatchJavaScript(ArtifactStat artifact, string javaScript, ILogger? logger = null, TimeProvider? timeProvider = null)
+    {
+        logger = logger ?? App.GetLogger<AutoArtifactSalvageTask>();
+        using V8ScriptEngine engine = new V8ScriptEngine(V8ScriptEngineFlags.UseCaseInsensitiveMemberBinding | V8ScriptEngineFlags.DisableGlobalMembers);
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3), timeProvider ?? TimeProvider.System);    // 这里只是用JS写一个自定义判断方法，由于每个圣遗物都会执行一次，这个方法不应执行太久
+        cts.Token.Register(() =>
+        {
+            try
+            {
+                engine.Interrupt();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"中断失败: {ex.Message}");
+            }
+        });
+        try
+        {
+            // 传入输入参数
+            engine.Script.ArtifactStat = artifact;
+
+            // 执行JavaScript代码
+            await Task.Run(() => engine.Execute(javaScript));
+
+            // 检查是否有输出
+            if (!engine.Script.propertyIsEnumerable("Output"))
+            {
+                throw new InvalidOperationException("JavaScript没有设置Output输出");
+            }
+
+            if (engine.Script.Output is not bool)
+            {
+                throw new InvalidOperationException("JavaScript的Output输出不是布尔类型");
+            }
+
+            return (bool)engine.Script.Output;
+        }
+        catch (ScriptInterruptedException)
+        {
+            logger.LogWarning("脚本执行超出3秒限制，请使用正确的JS代码（JavaScript execution timeout!）");
+            throw;
+        }
+        catch (ScriptEngineException ex)
+        {
+            throw new Exception($"JavaScript execution error: {ex.Message}", ex);
+        }
+    }
+
+    public static bool IsMatchRegularExpression(string affixes, string regularExpression, out string msg)
+    {
+        Match match = Regex.Match(affixes, regularExpression);
+        if (match.Success)
+        {
+            if (string.IsNullOrEmpty(match.Value))
+            {
+                msg = "匹配成功！";
+            }
+            else
+            {
+                msg = $"匹配成功：{match.Value}";
+            }
+        }
+        else
+        {
+            msg = "匹配失败！";
+        }
+
+        return match.Success;
+    }
+
+    /// <summary>
+    /// 识别圣遗物属性卡片。供 OCR 对话框、单元测试等不运行任务的场景直接调用。
+    /// 会先按参数中的游戏语言和本地化器初始化识别用的本地化字符串。
+    /// </summary>
+    /// <param name="src">圣遗物属性卡片截图</param>
+    /// <param name="ocrService">OCR 服务</param>
+    /// <param name="param">提供游戏语言与本地化器的参数（只使用语言相关部分）</param>
+    /// <param name="allText">识别到的全部文本</param>
+    /// <returns>结构化的圣遗物属性</returns>
+    public ArtifactStat GetArtifactStat(Mat src, IOcrService ocrService, AutoArtifactSalvageTaskParam param, out string allText)
+    {
+        ApplyLocalization(param);
+        return RecognizeArtifactStat(src, ocrService, out allText);
+    }
+
+    /// <summary>
+    /// 使用已初始化的本地化字符串识别圣遗物属性卡片。调用前必须已执行 <see cref="ApplyLocalization"/>。
+    /// </summary>
+    /// <param name="src">圣遗物属性卡片截图</param>
+    /// <param name="ocrService">OCR 服务</param>
+    /// <param name="allText">识别到的全部文本</param>
+    /// <returns>结构化的圣遗物属性</returns>
+    private ArtifactStat RecognizeArtifactStat(Mat src, IOcrService ocrService, out string allText)
+    {
+        using Mat gray = src.CvtColor(ColorConversionCodes.BGR2GRAY);
+        using Mat hatKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(15, 15)/*需根据实际文本大小调整*/);   // 顶帽运算核
+
+        using Mat nameRoi = gray.SubMat(new Rect(0, 0, src.Width, (int)(src.Height * 0.106)));
+        //Cv2.ImShow("name", nameRoi);
+        using Mat typeRoi = gray.SubMat(new Rect(0, (int)(src.Height * 0.106), src.Width, (int)(src.Height * 0.106)));
+        #region 主词条预处理 去除背景干扰
+        using Mat mainAffixRoi = gray.SubMat(new Rect(0, (int)(src.Height * 0.22), (int)(src.Width * 0.55), (int)(src.Height * 0.30)));
+        using Mat mainAffixRoiBottomHat = mainAffixRoi.MorphologyEx(MorphTypes.TopHat, hatKernel);
+        using Mat mainAffixRoiThreshold = mainAffixRoiBottomHat.Threshold(30, 255, ThresholdTypes.Binary);
+        //Cv2.ImShow("mainAffix", mainAffixRoiThreshold);
+        #endregion
+        #region 副词条预处理 还是不处理效果最好……
+        using Mat levelAndMinorAffixRoi = gray.SubMat(new Rect(0, (int)(src.Height * 0.52), src.Width, (int)(src.Height * 0.48)));
+        //using Mat levelAndMinorAffixRoiThreshold = new Mat(); // otsu确定阈值大概在170
+        //double otsu = Cv2.Threshold(levelAndMinorAffixRoi, levelAndMinorAffixRoiThreshold, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+        //Cv2.ImShow($"levelAndMinorAffixRoi = {otsu}", levelAndMinorAffixRoiThreshold);
+        //Cv2.WaitKey();
+        //using Mat levelAndMinorAffixRoiThreshold = levelAndMinorAffixRoi.Threshold(170, 255, ThresholdTypes.Binary);
+        #endregion
+
+        var nameOcrResult = ocrService.OcrResult(nameRoi);
+        var typeOcrResult = ocrService.OcrResult(typeRoi);
+        var mainAffixOcrResult = ocrService.OcrResult(mainAffixRoiThreshold);
+        string mainAffixText = string.Join("\n", mainAffixOcrResult.Regions.Where(r => r.Score > 0.5).OrderBy(r => r.Rect.Center.Y).ThenBy(r => r.Rect.Center.X).Select(r => r.Text));
+        var mainAffixLines = mainAffixText.Split('\n');
+        var levelAndMinorAffixOcrResult = ocrService.OcrResult(levelAndMinorAffixRoi);
+        (string Text, Rect Rect)[] levelAndMinorAffixResult = levelAndMinorAffixOcrResult.Regions.Where(r => r.Score > 0.5)
+            .Where(r => r.Rect.BoundingRect().Left < levelAndMinorAffixRoi.Width * 0.1) // 一定是贴着左边的，排除套装效果文字也存在类似+15%的情况
+            .OrderBy(r => r.Rect.Center.Y).ThenBy(r => r.Rect.Center.X).Select(r => (r.Text, r.Rect.BoundingRect())).ToArray();
+        var levelAndMinorAffixLines = levelAndMinorAffixResult.Select(r => r.Text).ToArray();
+        allText = string.Join('\n', new[]
+        {
+            nameOcrResult.Text,
+            typeOcrResult.Text,
+            mainAffixText
+        }.Concat(levelAndMinorAffixLines));
+
+        string percentStr = "%";
+
+        // 名称
+        string name = nameOcrResult.Text;
+
+        #region 主词条
+        var defaultMainAffix = this.artifactAffixStrDic.Select(kvp => kvp.Value).Distinct();
+        string mainAffixTypeLine = mainAffixLines.SingleOrDefault(l => defaultMainAffix.Contains(l)) ?? throw new Exception($"未找到主词条对应的行：\n{mainAffixText}");
+        ArtifactAffixType mainAffixType = this.artifactAffixStrDic.First(kvp => kvp.Value == mainAffixTypeLine).Key;
+        string mainAffixValueLine = mainAffixLines.Select(l =>
+        {
+            string pattern = @"^([\d., ]*)(%?)$";
+            pattern = pattern.Replace("%", percentStr);   // 这样一行一行写只是为了IDE能保持正则字符串高亮
+            Match match = Regex.Match(l, pattern);
+            if (match.Success)
+            {
+                if (mainAffixType == ArtifactAffixType.ATK && !String.IsNullOrEmpty(match.Groups[2].Value))
+                {
+                    mainAffixType = ArtifactAffixType.ATKPercent;
+                }
+                if (mainAffixType == ArtifactAffixType.DEF && !String.IsNullOrEmpty(match.Groups[2].Value))
+                {
+                    mainAffixType = ArtifactAffixType.DEFPercent;
+                }
+                if (mainAffixType == ArtifactAffixType.HP && !String.IsNullOrEmpty(match.Groups[2].Value))
+                {
+                    mainAffixType = ArtifactAffixType.HPPercent;
+                }
+                return match.Groups[1].Value;
+            }
+            else
+            {
+                return null;
+            }
+        }).Where(l => l != null).Cast<string>().SingleOrDefault() ?? throw new Exception($"未找到主词条数值对应的行：\n{mainAffixText}");
+        if (!float.TryParse(mainAffixValueLine, NumberStyles.Any, this.cultureInfo, out float value))
+        {
+            throw new Exception($"未识别的主词条数值：{mainAffixValueLine}");
+        }
+        ArtifactAffix mainAffix = new ArtifactAffix(mainAffixType, value);
+        #endregion
+
+        #region 副词条
+        var minorAffixes = new List<ArtifactAffix>();
+        string pattern = @"^([^+:：]+)\+([\d., 。]*)(%?)(.*)$";
+        pattern = pattern.Replace("%", percentStr);
+        foreach (var r in levelAndMinorAffixResult)
+        {
+            Match match = Regex.Match(r.Text, pattern);
+            if (!match.Success)
+            {
+                continue;
+            }
+            ArtifactAffixType artifactAffixType;
+            var dic = this.artifactAffixStrDic;
+            if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.ATK]))
+            {
+                if (String.IsNullOrEmpty(match.Groups[3].Value))
+                {
+                    artifactAffixType = ArtifactAffixType.ATK;
+                }
+                else
+                {
+                    artifactAffixType = ArtifactAffixType.ATKPercent;
+                }
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.DEF]))
+            {
+                if (String.IsNullOrEmpty(match.Groups[3].Value))
+                {
+                    artifactAffixType = ArtifactAffixType.DEF;
+                }
+                else
+                {
+                    artifactAffixType = ArtifactAffixType.DEFPercent;
+                }
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.HP]))
+            {
+                if (String.IsNullOrEmpty(match.Groups[3].Value))
+                {
+                    artifactAffixType = ArtifactAffixType.HP;
+                }
+                else
+                {
+                    artifactAffixType = ArtifactAffixType.HPPercent;
+                }
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.CRITRate]))
+            {
+                artifactAffixType = ArtifactAffixType.CRITRate;
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.CRITDMG]))
+            {
+                artifactAffixType = ArtifactAffixType.CRITDMG;
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.ElementalMastery]))
+            {
+                artifactAffixType = ArtifactAffixType.ElementalMastery;
+            }
+            else if (match.Groups[1].Value.Contains(dic[ArtifactAffixType.EnergyRecharge]))
+            {
+                artifactAffixType = ArtifactAffixType.EnergyRecharge;
+            }
+            else
+            {
+                throw new Exception($"未识别的副词条：{match.Groups[1].Value}");
+            }
+
+            if (!float.TryParse(match.Groups[2].Value.Replace("。", "."), NumberStyles.Any, cultureInfo, out float affixValue))
+            {
+                throw new Exception($"未识别的副词条数值：{match.Groups[2].Value}");
+            }
+
+            bool isUnactivated = false;
+            // 如果能显示判定未激活
+            if (match.Groups[4].Value.Contains(this.artifactAffixUnactivatedFlagStr)) {
+                isUnactivated = true;
+            }
+            // 否则，只有在已经成功识别至少 3 个词条后才执行额外的直方图分析。
+            else if (minorAffixes.Count >= 3)
+            {
+                using var lineRoi = levelAndMinorAffixRoi.SubMat(r.Rect);
+                using var lineHistogram = new Mat();
+                Cv2.CalcHist(
+                    images: [lineRoi],
+                    channels: [0],
+                    mask: null,
+                    hist: lineHistogram,
+                    dims: 1,
+                    histSize: [256],
+                    ranges: [new Rangef(0, 256)]
+                );
+                lineHistogram.GetArray(out float[] histogramFrequencies);
+                // 检查背景和前景像素是否符合未激活的特征。
+                const int backgroundIntensity = 222;
+                const int foregroundIntensity = 152;
+                var backgroundFrequency = histogramFrequencies[backgroundIntensity];
+                var foregroundFrequency = histogramFrequencies[foregroundIntensity];
+                var noiseFrequencyUpperBound = Math.Min(backgroundFrequency, foregroundFrequency);
+                // 检查这两个强度是否比所有其他强度更常见
+                isUnactivated = backgroundFrequency > 0 &&
+                                foregroundFrequency > 0 &&
+                                backgroundFrequency > foregroundFrequency &&
+                                !histogramFrequencies
+                                    .Where((frequency, intensity) =>
+                                        intensity != backgroundIntensity &&
+                                        intensity != foregroundIntensity &&
+                                        frequency > noiseFrequencyUpperBound)
+                                    .Any();
+            }
+            minorAffixes.Add(new ArtifactAffix(artifactAffixType, affixValue, isUnactivated));
+        }
+        #endregion
+
+        #region 等级
+        string levelLine = levelAndMinorAffixLines.Select(l =>
+        {
+            string pattern = @"^\+(\d*)$";
+            Match match = Regex.Match(l, pattern);
+            if (match.Success)
+            {
+                return match.Groups[1].Value;
+            }
+            else
+            {
+                return null;
+            }
+        }).Where(l => l != null).Cast<string>().SingleOrDefault() ?? throw new Exception($"未找到等级对应的行：\n{levelAndMinorAffixLines}");
+        if (!int.TryParse(levelLine, out int level) || level < 0 || level > 20)
+        {
+            throw new Exception($"未识别的等级：{levelLine}");
+        }
+        #endregion
+
+        return new ArtifactStat(name, mainAffix, minorAffixes.ToArray(), level);
+    }
+
+    public static ArtifactStatus GetArtifactStatus(Mat src)
+    {
+        using Mat upperLine = new Mat(src, new Rect(0, 0, src.Width, (int)(src.Height * 0.19)));
+        //using Mat hsvMat = upperLine.CvtColor(ColorConversionCodes.BGR2HSV_FULL);
+        //var pixel_hsv_pink = hsvMat.At<Vec3b>(17, 12);    // 注意是（Y，X）
+        //var pixel_hsv_grren = hsvMat.At<Vec3b>(8, 105);   // 注意是（Y，X）
+
+        // 粉色锁
+        Scalar pinkhsv = OpenCvCommonHelper.CommonHSV2OpenCVHSVFull(new Scalar(9, 0.54, 1.00));
+        var lowPink = new Scalar(pinkhsv.Val0 - 3, pinkhsv.Val1 - 25, pinkhsv.Val2 - 25);
+        var highPink = new Scalar(pinkhsv.Val0 + 3, pinkhsv.Val1 + 25, pinkhsv.Val2);
+        using Mat pinkMask = OpenCvCommonHelper.InRangeHsvFull(upperLine, lowPink, highPink);
+
+        using Mat pinkThreshold = pinkMask.Threshold(0, 255, ThresholdTypes.Binary); //二值化
+
+        Cv2.FindContours(pinkThreshold, out var contours, out _, RetrievalModes.External,
+            ContourApproximationModes.ApproxSimple, null);
+
+        var allPinkContours = contours.Where(c => c.Max(p => p.X) < pinkMask.Width * 0.2) // 都在左侧
+            .SelectMany(c => c); // 拼凑零碎的像素
+        if (allPinkContours.Any())
+        {
+            var bounding = Cv2.BoundingRect(allPinkContours);
+            if (bounding.Width > pinkMask.Width * 0.07 && bounding.Height > pinkMask.Height * 0.3) //不能太小
+            {
+                return ArtifactStatus.Locked;
+            }
+        }
+
+        // 绿色线
+        Scalar greenhsv = OpenCvCommonHelper.CommonHSV2OpenCVHSVFull(new Scalar(80, 0.76, 1.00));
+        var lowGreen = new Scalar(greenhsv.Val0 - 3, greenhsv.Val1 - 10, greenhsv.Val2 - 5);
+        var highGreen = new Scalar(greenhsv.Val0 + 3, greenhsv.Val1 + 10, greenhsv.Val2);
+        using Mat greenMask = OpenCvCommonHelper.InRangeHsvFull(upperLine, lowGreen, highGreen);
+
+        Cv2.Threshold(greenMask, greenMask, 0, 255, ThresholdTypes.Binary); //二值化
+
+        Cv2.FindContours(greenMask, out contours, out _, RetrievalModes.External,
+            ContourApproximationModes.ApproxSimple, null);
+
+        var allGreenContours = contours.SelectMany(c => c); // 拼凑零碎的像素
+        if (allGreenContours.Any())
+        {
+            var bounding = Cv2.BoundingRect(allGreenContours);
+            if (bounding.Width > greenMask.Width * 0.2 && bounding.Height > greenMask.Height * 0.8) //不能太小；至少存在右上角勾号的绿色背景，忽略上底边的绿线（因有缩放动画，每次都要重新框定不利缩减步骤）
+            {
+                return ArtifactStatus.Selected;
+            }
+        }
+
+        return ArtifactStatus.None;
+    }
+
+    /// <summary>
+    /// 圣遗物分解界面Grid元素的状态
+    /// </summary>
+    public enum ArtifactStatus
+    {
+        /// <summary>
+        /// 啥也没有
+        /// </summary>
+        None,
+
+        /// <summary>
+        /// 左上角有粉色锁定标记
+        /// </summary>
+        Locked,
+
+        /// <summary>
+        /// 上下有绿色选择框
+        /// </summary>
+        Selected
+    }
+}

@@ -1,0 +1,20 @@
+{
+  "style": "cute",
+  "speed": 1.0,
+  "seed": 42,
+  "output_dir": "E:\\BetterAGI\\demo\\session\\audio",
+  "texts": [
+    {
+      "index": 1,
+      "text": "大家好，今天来跑一段须弥的探索路线。"
+    },
+    {
+      "index": 2,
+      "text": "哎？这边居然藏着一个宝箱！"
+    },
+    {
+      "index": 3,
+      "text": "拿到了，今天的运气不错嘛。"
+    }
+  ]
+}

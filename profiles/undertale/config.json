@@ -1,0 +1,62 @@
+{
+  "adapter": {
+    "capture": {
+      "method": "printwindow",
+      "native": {
+        "width": 640,
+        "height": 480
+      },
+      "note": "自适配：按游戏 native 原样取像素（640x480），DPI 实测按物理像素直给；默认不放大不缩小、不最大化、不全屏。放大需显式写 min_readable，属按需 opt-in（放大=多烧 token）。"
+    },
+    "match": {
+      "title": "UNDERTALE",
+      "exe": "UNDERTALE.exe",
+      "class": "YYGameMakerYY"
+    },
+    "kill_dialogs": [
+      "#32770"
+    ],
+    "keys": {
+      "up": "up",
+      "down": "down",
+      "left": "left",
+      "right": "right",
+      "confirm": "z",
+      "cancel": "shift",
+      "back": "backspace",
+      "erase": "backspace",
+      "menu": "c",
+      "quit": [
+        "esc"
+      ],
+      "l": "l",
+      "u": "u",
+      "m": "m",
+      "i": "i",
+      "submit": "enter"
+    },
+    "launch": {
+      "exe": "D:\\SteamLibrary\\steamapps\\common\\Undertale\\UNDERTALE.exe",
+      "save_paths": [
+        "C:\\Users\\Tsuba\\AppData\\Local\\UNDERTALE"
+      ]
+    }
+  },
+  "motor": {
+    "required_keys": [
+      "up",
+      "down",
+      "left",
+      "right",
+      "confirm",
+      "cancel",
+      "back",
+      "menu",
+      "erase"
+    ],
+    "system_prompt_version": 37,
+    "system_prompt_fingerprint": "sha256:55e81a248c946aa5",
+    "system_prompt_chars": 3744,
+    "system_prompt_updated_at": "2026-11-06T20:19:56"
+  }
+}

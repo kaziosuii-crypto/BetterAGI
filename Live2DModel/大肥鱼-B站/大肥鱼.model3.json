@@ -1,0 +1,23 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "大肥鱼.moc3",
+		"Textures": [
+			"大肥鱼.8192/texture_00.png"
+		],
+		"Physics": "大肥鱼.physics3.json",
+		"DisplayInfo": "大肥鱼.cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": []
+		},
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": []
+		}
+	]
+}

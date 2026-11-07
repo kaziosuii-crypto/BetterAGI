@@ -1,0 +1,89 @@
+{
+  "game_id": "undertale",
+  "bindings": [
+    {
+      "key": "confirm",
+      "effect": "physical:z",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "back",
+      "effect": "physical:backspace",
+      "confidence": 0.8,
+      "source": "learned"
+    },
+    {
+      "key": "l",
+      "effect": "physical:l",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "u",
+      "effect": "physical:u",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "m",
+      "effect": "physical:m",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "i",
+      "effect": "physical:i",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "up",
+      "effect": "physical:up",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "down",
+      "effect": "physical:down",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "left",
+      "effect": "physical:left",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "right",
+      "effect": "physical:right",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "erase",
+      "effect": "physical:backspace",
+      "confidence": 0.6,
+      "source": "learned"
+    },
+    {
+      "key": "submit",
+      "effect": "physical:enter",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "key": "cancel",
+      "effect": "physical:x",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "menu",
+      "effect": "physical:c",
+      "confidence": 0.9,
+      "source": "learned"
+    }
+  ]
+}

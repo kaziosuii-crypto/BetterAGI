@@ -1,0 +1,90 @@
+{
+  "id": "chapters",
+  "name": "章节导航 Chapters",
+  "version": "1.0.0",
+  "description": "从结构化文案派生章节：speaker 为「章节」或文本以 # 开头的 cue 成为章节起点，没有任何标记时按固定条数自动分章。服务端提供 chapters.build 能力链，叠加层渲染玻璃质感章节导航条。第二个示例扩展，用来证明扩展接口的通用性。",
+  "client": "client.js",
+  "server": "server.mjs",
+  "defaultConfig": {
+    "position": "left",
+    "width": 340,
+    "fontSize": 22,
+    "opacity": 0.9,
+    "maxItems": 6,
+    "autoSplit": 6,
+    "showProgress": true,
+    "accent": "#E8B05A",
+    "offsetY": 300
+  },
+  "configSchema": {
+    "fields": [
+      {
+        "key": "position",
+        "label": "位置",
+        "type": "select",
+        "options": [
+          "left",
+          "right"
+        ]
+      },
+      {
+        "key": "width",
+        "label": "导航条宽度（px）",
+        "type": "number",
+        "min": 200,
+        "max": 640,
+        "step": 10
+      },
+      {
+        "key": "fontSize",
+        "label": "字号（px）",
+        "type": "number",
+        "min": 14,
+        "max": 48,
+        "step": 1
+      },
+      {
+        "key": "opacity",
+        "label": "不透明度",
+        "type": "number",
+        "min": 0.2,
+        "max": 1,
+        "step": 0.05
+      },
+      {
+        "key": "maxItems",
+        "label": "最大显示条数",
+        "type": "number",
+        "min": 1,
+        "max": 12,
+        "step": 1
+      },
+      {
+        "key": "autoSplit",
+        "label": "自动分章步长（条 cue）",
+        "type": "number",
+        "min": 1,
+        "max": 30,
+        "step": 1
+      },
+      {
+        "key": "showProgress",
+        "label": "显示进度细线",
+        "type": "boolean"
+      },
+      {
+        "key": "accent",
+        "label": "强调色（HEX）",
+        "type": "text"
+      },
+      {
+        "key": "offsetY",
+        "label": "纵向位置（px，距顶部）",
+        "type": "number",
+        "min": 120,
+        "max": 560,
+        "step": 10
+      }
+    ]
+  }
+}

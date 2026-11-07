@@ -1,0 +1,68 @@
+[
+  {
+    "mode": "A",
+    "rounds": 40,
+    "wall_ms": 15307.3,
+    "observation_age_ms": {
+      "p50": 360.583,
+      "p95": 573.613,
+      "p99": 717.672
+    },
+    "latency_ms": {
+      "p50": 360.5831228196621,
+      "p95": 573.612917214632,
+      "p99": 717.672199010849
+    },
+    "e2e_ms": {
+      "p50": 360.5831228196621,
+      "p95": 573.612917214632,
+      "p99": 717.672199010849
+    },
+    "loop_summary": {
+      "rounds": 40,
+      "streamed": 0,
+      "scheduled": 0,
+      "receipted": 0,
+      "groups_confirmed": 240,
+      "groups_executed": 0,
+      "underflow": 0,
+      "errors": 0,
+      "interrupted": 0,
+      "observation_age_p50": 360.583,
+      "observation_age_p95": 573.613
+    }
+  },
+  {
+    "mode": "D_B",
+    "rounds": 40,
+    "wall_ms": 12904.0,
+    "observation_age_ms": {
+      "p50": 277.79,
+      "p95": 287.53,
+      "p99": 313.16
+    },
+    "latency_ms": {
+      "p50": 277.79,
+      "p95": 287.53,
+      "p99": 313.16
+    },
+    "e2e_ms": {
+      "p50": 321.2,
+      "p95": 332.68,
+      "p99": 357.47
+    },
+    "loop_summary": {
+      "rounds": 40,
+      "streamed": 40,
+      "scheduled": 40,
+      "receipted": 40,
+      "groups_confirmed": 240,
+      "groups_executed": 240,
+      "underflow": 0,
+      "errors": 0,
+      "interrupted": 0,
+      "observation_age_p50": 277.79,
+      "observation_age_p95": 287.53
+    }
+  }
+]

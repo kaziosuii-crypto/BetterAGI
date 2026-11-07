@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "bettergi": {
+      "command": "python",
+      "args": [
+        "integrations/dsh/mcp_stdio_bridge.py"
+      ],
+      "env": {
+        "BETTERGI_AGENT_TOKEN": "请替换为BetterGI设置页复制的令牌",
+        "BETTERGI_AGENT_BASE_URL": "http://127.0.0.1:30648"
+      }
+    }
+  }
+}

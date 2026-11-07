@@ -1,0 +1,10 @@
+{
+ "test": "partial-execution history is accepted by the real model",
+ "model": "GameScaling-2B-S3 via vLLM 0.33.0 on 127.0.0.1:6006",
+ "partial_history_text": "<think>\npartially executed (network)\n</think>\n\n<|action_start|>-143 -19 0 ; LB ; A ; LB ;  ;  ; <|action_end|>",
+ "trials": 8,
+ "parsed": 8,
+ "finish_reasons": null,
+ "history_len_after": 5,
+ "note": "The partial chunk keeps exactly six ';' slots with three filled; the interruption is carried in the reasoning channel. The next real request parsed 8/8."
+}

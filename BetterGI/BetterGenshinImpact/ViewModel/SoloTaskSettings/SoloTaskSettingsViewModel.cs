@@ -1,0 +1,139 @@
+using BetterGenshinImpact.GameTask.AutoFight.Strategy;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.GameTask.AutoFight;
+using CommunityToolkit.Mvvm.ComponentModel;
+using Newtonsoft.Json.Linq;
+
+namespace BetterGenshinImpact.ViewModel.SoloTaskSettings;
+
+/// <summary>
+/// 独立任务专属设置视图的公共基类：载入当前有效参数快照，应用时只提交真实变化的字段。
+/// 不依赖任何宿主（任务计划节点、独立任务页），宿主负责提供快照并提交变化。
+/// </summary>
+public abstract class SoloTaskSettingsViewModel : ObservableObject
+{
+    /// <summary>专属界面已提供的参数；其余参数由宿主补充为设置卡片，避免专属界面遮蔽可用功能。</summary>
+    public abstract string[] EditedParameterNames { get; }
+
+    /// <summary>载入时的有效参数快照；变化收集与来源变化检测依赖它。</summary>
+    protected JObject Original { get; }
+
+    /// <summary>
+    /// 任一输入（包括每周安排、商品勾选等子行）发生变化时触发；即时生效的宿主据此立即提交，
+    /// 先确认后提交的宿主可以忽略。
+    /// </summary>
+    public event EventHandler? Edited;
+
+    /// <summary>保存当前有效参数快照，具体字段由派生类填充。</summary>
+    /// <param name="original">当前有效参数；内部保存独立副本，调用方后续修改不影响快照。</param>
+    protected SoloTaskSettingsViewModel(JObject original)
+    {
+        Original = (JObject)original.DeepClone();
+        PropertyChanged += (_, _) => Edited?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>把子行的属性变化也转发为 <see cref="Edited"/>，派生类在填充子行后调用一次。</summary>
+    /// <param name="items">可编辑的子行。</param>
+    protected void TrackEdits(IEnumerable<INotifyPropertyChanged> items)
+    {
+        foreach (var item in items)
+            item.PropertyChanged += (_, _) => Edited?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>把输入相对快照的真实变化写入 changes；由宿主的“应用设置”统一校验提交。</summary>
+    /// <param name="changes">接收变化字段的对象，键为参数类的 snake_case 名称。</param>
+    public abstract void CollectChanges(JObject changes);
+
+    /// <summary>按名称返回快照中的原始参数，供来源变化检测。</summary>
+    /// <param name="name">参数名。</param>
+    /// <returns>快照中的值；不存在时为 null。</returns>
+    public JToken? GetOriginalValue(string name) => Original[name];
+
+    /// <summary>读取字符串参数；缺失或空值返回空字符串，与旧一条龙“留空”语义一致。</summary>
+    /// <param name="values">参数对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <returns>字符串值。</returns>
+    protected static string ReadString(JObject values, string name) => values[name] switch
+    {
+        JValue value when value.Value is string text => text,
+        JValue value when value.Value is not null => value.Value.ToString() ?? string.Empty,
+        _ => string.Empty
+    };
+
+    /// <summary>读取布尔参数；缺失或类型不符返回回退值。</summary>
+    /// <param name="values">参数对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <param name="fallback">回退值。</param>
+    /// <returns>布尔值。</returns>
+    protected static bool ReadBool(JObject values, string name, bool fallback = false)
+    {
+        var token = values[name];
+        return token is { Type: JTokenType.Boolean } ? token.Value<bool>() : fallback;
+    }
+
+    /// <summary>读取整数参数；缺失或类型不符返回回退值。</summary>
+    /// <param name="values">参数对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <param name="fallback">回退值。</param>
+    /// <returns>整数值。</returns>
+    protected static int ReadInt(JObject values, string name, int fallback = 0)
+    {
+        var token = values[name];
+        return token is { Type: JTokenType.Integer } ? token.Value<int>() : fallback;
+    }
+
+    /// <summary>字符串输入与快照不同才写入变更。</summary>
+    /// <param name="changes">接收变化的对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <param name="original">快照值。</param>
+    /// <param name="current">当前输入。</param>
+    protected static void WriteString(JObject changes, string name, string original, string current)
+    {
+        if (!string.Equals(original, current, StringComparison.Ordinal)) changes[name] = current;
+    }
+
+    /// <summary>布尔输入与快照不同才写入变更。</summary>
+    /// <param name="changes">接收变化的对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <param name="original">快照值。</param>
+    /// <param name="current">当前输入。</param>
+    protected static void WriteBool(JObject changes, string name, bool original, bool current)
+    {
+        if (original != current) changes[name] = current;
+    }
+
+    /// <summary>整数输入与快照不同才写入变更。</summary>
+    /// <param name="changes">接收变化的对象。</param>
+    /// <param name="name">参数名。</param>
+    /// <param name="original">快照值。</param>
+    /// <param name="current">当前输入。</param>
+    protected static void WriteInt(JObject changes, string name, int original, int current)
+    {
+        if (original != current) changes[name] = current;
+    }
+
+    /// <summary>
+    /// 把参数里的战斗策略名或路径转换为选择器使用的规范值：
+    /// 自动战斗根目录转为“根据队伍自动选择”，子目录转为 auto: 范围；
+    /// 文件按统一规则省略扩展名，存在歧义时保留扩展名，根目录外的路径保持绝对路径。
+    /// </summary>
+    /// <param name="nameOrPath">参数中的策略名或路径；为空时视为自动选择，与任务的解析规则一致。</param>
+    /// <returns>策略规范值。</returns>
+    protected static string ToStrategyName(string? nameOrPath)
+    {
+        // 非绝对路径的策略名和固定项也经过同一规则，避免同名 txt/json 混淆。
+        return CombatStrategyResolver.Parse(nameOrPath).Value;
+    }
+
+    /// <summary>当前值不在选项中时追加到末尾，外部导入的暂不可用选项仍能显示，用户可以主动改选。</summary>
+    /// <param name="choices">基础选项。</param>
+    /// <param name="current">当前值。</param>
+    /// <returns>包含当前值的选项。</returns>
+    protected static string[] WithCurrentChoice(string[] choices, string current)
+        => string.IsNullOrEmpty(current) || choices.Contains(current, StringComparer.Ordinal) ? choices : [.. choices, current];
+}

@@ -1,0 +1,119 @@
+{
+  "game_id": "genshin-impact",
+  "bindings": [
+    {
+      "key": "W",
+      "effect": "向前移动",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "A",
+      "effect": "向左移动",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "S",
+      "effect": "向后移动",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "D",
+      "effect": "向右移动",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "Space",
+      "effect": "跳跃；空中再按展开风之翼滑翔",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "Shift",
+      "effect": "冲刺（持续按住疾跑）",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "F",
+      "effect": "交互：对话、拾取、开启机关/宝箱、进入秘境",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "E",
+      "effect": "释放当前角色的元素战技",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "Q",
+      "effect": "释放当前角色的元素爆发（需能量充满）",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "左键",
+      "effect": "普通攻击（长按为蓄力/重击，视角色而定）",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "右键",
+      "effect": "弓箭角色进入瞄准模式；其他角色无作用",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "1",
+      "effect": "切换到队伍第 1 位角色",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "2",
+      "effect": "切换到队伍第 2 位角色",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "3",
+      "effect": "切换到队伍第 3 位角色",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "4",
+      "effect": "切换到队伍第 4 位角色",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "M",
+      "effect": "打开/关闭地图",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "Esc",
+      "effect": "打开派蒙菜单（背包、任务、队伍等入口）",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "Alt",
+      "effect": "呼出鼠标指针（点选 UI 用）",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "key": "V",
+      "effect": "元素视野（显示可交互物/敌人轮廓）",
+      "confidence": 0.8,
+      "source": "learned"
+    }
+  ]
+}

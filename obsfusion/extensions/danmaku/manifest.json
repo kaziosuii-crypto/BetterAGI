@@ -1,0 +1,109 @@
+{
+  "id": "danmaku",
+  "name": "弹幕映射 Danmaku Mapper",
+  "version": "1.0.0",
+  "description": "按用户 / 正则 / 等级把弹幕分流到画面任意区域，支持滚动、固定、逆向三种呈现。扩展 API 的参考实现。",
+  "client": "client.js",
+  "server": "server.mjs",
+  "defaultConfig": {
+    "lanes": 6,
+    "area": "top",
+    "mode": "scroll",
+    "speed": 8,
+    "fontSize": 34,
+    "opacity": 0.92,
+    "maxOnScreen": 36,
+    "avoidSubtitles": true,
+    "defaultTarget": {
+      "zone": "top",
+      "mode": "scroll",
+      "duration": 8
+    },
+    "routes": [
+      {
+        "name": "主播置顶",
+        "when": {
+          "user": "主播"
+        },
+        "target": {
+          "zone": "top-right",
+          "mode": "fixed",
+          "duration": 6
+        }
+      },
+      {
+        "name": "SC 固定",
+        "when": {
+          "regex": "^SC"
+        },
+        "target": {
+          "zone": "bottom-left",
+          "mode": "fixed",
+          "duration": 8,
+          "color": "#E8B05A"
+        }
+      }
+    ]
+  },
+  "configSchema": {
+    "fields": [
+      {
+        "key": "lanes",
+        "label": "轨道数",
+        "type": "number",
+        "min": 1,
+        "max": 12,
+        "step": 1
+      },
+      {
+        "key": "area",
+        "label": "默认区域",
+        "type": "select",
+        "options": [
+          "top",
+          "bottom",
+          "full"
+        ]
+      },
+      {
+        "key": "mode",
+        "label": "默认模式",
+        "type": "select",
+        "options": [
+          "scroll",
+          "fixed",
+          "reverse"
+        ]
+      },
+      {
+        "key": "speed",
+        "label": "滚动时长（秒）",
+        "type": "number",
+        "min": 2,
+        "max": 30,
+        "step": 0.5
+      },
+      {
+        "key": "fontSize",
+        "label": "字号（px）",
+        "type": "number",
+        "min": 18,
+        "max": 72,
+        "step": 1
+      },
+      {
+        "key": "opacity",
+        "label": "不透明度",
+        "type": "number",
+        "min": 0.2,
+        "max": 1,
+        "step": 0.05
+      },
+      {
+        "key": "avoidSubtitles",
+        "label": "避开字幕区",
+        "type": "boolean"
+      }
+    ]
+  }
+}

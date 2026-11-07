@@ -1,0 +1,319 @@
+"""
+弹幕小部件服务。
+
+订阅 ``room.message.*`` 五种语义域事件（弹幕/礼物/SC/上舰/进场）并广播给前端
+WebSocket 客户端。本服务的订阅面收敛在 ``room.message.*``；字幕显示由
+字幕基础设施 ``SubtitleService`` 通过 ``DashboardBackend`` 驱动——本服务
+暴露 ``show_subtitle`` / ``clear_subtitle`` 公开方法供 Backend 调用。
+"""
+
+from collections import deque
+from typing import TYPE_CHECKING, Any, Callable, Deque, List, Optional
+
+from src.modules.dashboard.widget.models import (
+    MessageType,
+    DanmakuWidgetConfig,
+    DanmakuWidgetMessage,
+    SubtitleWidgetConfig,
+    SubtitleWidgetMessage,
+)
+from src.modules.events.names import CoreEvents
+from src.modules.events.payloads import RoomMessagePayload
+from src.modules.logging import get_logger
+from src.modules.utils.time_utils import now_ms
+from src.modules.types.currency import to_cny
+
+if TYPE_CHECKING:
+    from src.modules.events.event_bus import EventBus
+
+
+class DanmakuWidgetService:
+    """
+    弹幕小部件服务
+
+    订阅输入阶段的消息事件，转换为 DanmakuWidgetMessage 并广播到前端。
+    用于 Warudo 等虚拟形象软件的网页道具场景。
+    """
+
+    def __init__(
+        self,
+        event_bus: "EventBus",
+        config: Optional[DanmakuWidgetConfig] = None,
+        subtitle_config: Optional[SubtitleWidgetConfig] = None,
+    ) -> None:
+        self.event_bus = event_bus
+        self.config = config or DanmakuWidgetConfig()
+        self.subtitle_config = subtitle_config or SubtitleWidgetConfig()
+        self.logger = get_logger("DanmakuWidgetService")
+
+        self.messages: Deque[DanmakuWidgetMessage] = deque(maxlen=self.config.max_messages)
+        self.subtitle_messages: Deque[SubtitleWidgetMessage] = deque(maxlen=self.subtitle_config.max_messages)
+
+        self._danmaku_callback: Optional[Callable[[dict], Any]] = None
+        self._subtitle_callback: Optional[Callable[[dict], Any]] = None
+
+        self._is_running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    def set_danmaku_callback(self, callback: Callable[[dict], Any]) -> None:
+        self._danmaku_callback = callback
+
+    def set_subtitle_callback(self, callback: Callable[[dict], Any]) -> None:
+        self._subtitle_callback = callback
+
+    async def start(self) -> None:
+        if self._is_running:
+            self.logger.warning("DanmakuWidgetService 已经在运行中")
+            return
+
+        for event_name in (
+            CoreEvents.ROOM_MESSAGE_DANMAKU,
+            CoreEvents.ROOM_MESSAGE_GIFT,
+            CoreEvents.ROOM_MESSAGE_SUPER_CHAT,
+            CoreEvents.ROOM_MESSAGE_GUARD,
+            CoreEvents.ROOM_MESSAGE_ENTER,
+        ):
+            self.event_bus.on(
+                event_name,
+                self._on_input_message,
+                model_class=RoomMessagePayload,
+            )
+
+        self._is_running = True
+        self.logger.info(f"DanmakuWidgetService 已启动 (max_messages={self.config.max_messages})")
+
+    async def stop(self) -> None:
+        if not self._is_running:
+            return
+
+        for event_name in (
+            CoreEvents.ROOM_MESSAGE_DANMAKU,
+            CoreEvents.ROOM_MESSAGE_GIFT,
+            CoreEvents.ROOM_MESSAGE_SUPER_CHAT,
+            CoreEvents.ROOM_MESSAGE_GUARD,
+            CoreEvents.ROOM_MESSAGE_ENTER,
+        ):
+            self.event_bus.off(event_name, self._on_input_message)
+
+        self._is_running = False
+        self.logger.info("DanmakuWidgetService 已停止")
+
+    async def _on_input_message(
+        self,
+        event_name: str,
+        payload: RoomMessagePayload,
+        source: str,
+    ) -> None:
+        try:
+            text = payload.content
+            self.logger.debug(f"收到弹幕: {text[:50]}, user={payload.user.name if payload.user else ''}")
+            widget_msg = self._convert_payload_to_widget(payload)
+            if widget_msg is None:
+                return
+
+            if not self._should_display(widget_msg):
+                return
+
+            self.messages.append(widget_msg)
+
+            await self._broadcast_new_message(widget_msg)
+
+        except Exception as e:
+            self.logger.exception(f"处理输入消息失败: {e}")
+
+    async def show_subtitle(self, text: str, duration_ms: Optional[int] = None) -> None:
+        """显示一条字幕（字幕基础设施 Backend 的调用入口）。
+
+        构造 ``SubtitleWidgetMessage`` 并追加到字幕队列，然后通过
+        ``_subtitle_callback`` 推送给前端 WebSocket 客户端
+        （``/ws/subtitle``）。由 ``DashboardBackend.show`` 在
+        ``SubtitleService.show`` 广播路径上调用。
+
+        Args:
+            text: 字幕文本内容。
+            duration_ms: 自动隐藏时长（毫秒）；``None`` 时回退到
+                ``subtitle_config.auto_hide_after_ms``。合法范围由
+                ``SubtitleWidgetMessage`` Pydantic Schema 校验。
+        """
+        if not self.subtitle_config.enabled:
+            return
+
+        effective_duration_ms = duration_ms if duration_ms is not None else self.subtitle_config.auto_hide_after_ms
+        subtitle_msg = SubtitleWidgetMessage(
+            text=text,
+            duration_ms=effective_duration_ms,
+        )
+        self.subtitle_messages.append(subtitle_msg)
+
+        data = {
+            "type": "subtitle",
+            "text": text,
+            "duration_ms": subtitle_msg.duration_ms,
+            "font_size": self.subtitle_config.font_size,
+            "font_color": self.subtitle_config.font_color,
+            "background_color": self.subtitle_config.background_color,
+            "border_color": self.subtitle_config.border_color,
+            "position": self.subtitle_config.position,
+        }
+
+        if self._subtitle_callback:
+            try:
+                await self._subtitle_callback(data)
+            except Exception as e:
+                self.logger.exception(f"广播字幕到subtitle端失败: {e}")
+
+    async def clear_subtitle(self) -> None:
+        """清空当前字幕显示（字幕基础设施 Backend 的调用入口）。
+
+        清空本地字幕队列并广播一条空文本消息（前端按 ``text == ""``
+        识别为清空信号，``duration_ms == 0`` 抑制自动隐藏计时）。由
+        ``DashboardBackend.clear`` 在 ``SubtitleService.clear`` 广播
+        路径上调用。
+        """
+        if not self.subtitle_config.enabled:
+            self.subtitle_messages.clear()
+            return
+
+        self.subtitle_messages.clear()
+
+        data = {
+            "type": "subtitle",
+            "text": "",
+            "duration_ms": 0,
+            "font_size": self.subtitle_config.font_size,
+            "font_color": self.subtitle_config.font_color,
+            "background_color": self.subtitle_config.background_color,
+            "border_color": self.subtitle_config.border_color,
+            "position": self.subtitle_config.position,
+        }
+
+        if self._subtitle_callback:
+            try:
+                await self._subtitle_callback(data)
+            except Exception as e:
+                self.logger.exception(f"广播清空字幕到subtitle端失败: {e}")
+
+    def _convert_payload_to_widget(
+        self,
+        payload: RoomMessagePayload,
+    ) -> Optional[DanmakuWidgetMessage]:
+        """RoomMessagePayload 直转（v2 主路径，结构化字段）。"""
+        try:
+            user_name = payload.user.name if payload.user else "匿名用户"
+            user_id = payload.user.id if payload.user else ""
+            timestamp = payload.timestamp_ms if payload.timestamp_ms else now_ms()
+            importance = 0.5
+            platform = "unknown"
+            # 场次主键（int）转字符串承载（DanmakuWidgetMessage.room_id 为 str；0=未归属 → None）
+            room_id = str(payload.live_session_id) if payload.live_session_id else None
+
+            if payload.message_type == "gift":
+                return DanmakuWidgetMessage(
+                    user_name=user_name,
+                    user_id=user_id,
+                    content=payload.content or "",
+                    message_type=MessageType.GIFT,
+                    timestamp_ms=timestamp,
+                    importance=importance,
+                    gift_name=payload.gift.name if payload.gift else None,
+                    gift_count=payload.gift.count if payload.gift else None,
+                    platform=platform,
+                    room_id=room_id,
+                    simulated=payload.simulated,
+                )
+
+            if payload.message_type == "super_chat":
+                return DanmakuWidgetMessage(
+                    user_name=user_name,
+                    user_id=user_id,
+                    content=payload.content or "",
+                    message_type=MessageType.SUPER_CHAT,
+                    timestamp_ms=timestamp,
+                    importance=importance,
+                    sc_price=to_cny(payload.sc.total_price, payload.sc.currency) if payload.sc else None,
+                    sc_message=payload.content or None,
+                    platform=platform,
+                    room_id=room_id,
+                    simulated=payload.simulated,
+                )
+
+            if payload.message_type == "guard":
+                return DanmakuWidgetMessage(
+                    user_name=user_name,
+                    user_id=user_id,
+                    content=payload.content or "",
+                    message_type=MessageType.GUARD,
+                    timestamp_ms=timestamp,
+                    importance=importance,
+                    guard_level=payload.guard.guard_level if payload.guard else None,
+                    platform=platform,
+                    room_id=room_id,
+                    simulated=payload.simulated,
+                )
+
+            if payload.message_type == "enter":
+                return DanmakuWidgetMessage(
+                    user_name=user_name,
+                    user_id=user_id,
+                    content=payload.content or "",
+                    message_type=MessageType.ENTER,
+                    timestamp_ms=timestamp,
+                    importance=importance,
+                    platform=platform,
+                    room_id=room_id,
+                    simulated=payload.simulated,
+                )
+
+            return DanmakuWidgetMessage(
+                user_name=user_name,
+                user_id=user_id,
+                content=payload.content or "",
+                message_type=MessageType.TEXT,
+                timestamp_ms=timestamp,
+                importance=importance,
+                platform=platform,
+                room_id=room_id,
+                simulated=payload.simulated,
+            )
+
+        except Exception as e:
+            self.logger.exception(f"转换 RoomMessagePayload 失败: {e}")
+            return None
+
+    def _should_display(self, msg: DanmakuWidgetMessage) -> bool:
+        if msg.importance < self.config.min_importance:
+            return False
+
+        if msg.message_type == MessageType.TEXT and not self.config.show_danmaku:
+            return False
+        if msg.message_type == MessageType.GIFT and not self.config.show_gift:
+            return False
+        if msg.message_type == MessageType.SUPER_CHAT and not self.config.show_super_chat:
+            return False
+        if msg.message_type == MessageType.GUARD and not self.config.show_guard:
+            return False
+        if msg.message_type == MessageType.ENTER and not self.config.show_enter:
+            return False
+        if msg.message_type == MessageType.REPLY and not self.config.show_reply:
+            return False
+
+        return True
+
+    async def _broadcast_new_message(self, msg: DanmakuWidgetMessage) -> None:
+        data = {
+            "type": "new_message",
+            "message": msg.model_dump(mode="json"),
+        }
+
+        if self._danmaku_callback:
+            try:
+                await self._danmaku_callback(data)
+            except Exception as e:
+                self.logger.exception(f"广播消息到danmaku端失败: {e}")
+
+    def get_recent_messages(self, count: int = 15) -> List[dict]:
+        messages = list(self.messages)[-count:]
+        return [msg.model_dump(mode="json") for msg in messages]

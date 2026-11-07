@@ -1,0 +1,3 @@
+# PersistentPlayer observer runtime dependencies.
+aiohttp>=3.9
+Pillow>=9.1

@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "shadow": true,
+  "bettergiWs": "ws://127.0.0.1:30648/ws/v1/agent/live",
+  "sessionId": "vtuber",
+  "interval": 12,
+  "reconnectDelay": 3,
+  "maxFrameAgeMs": 5000,
+  "stateSaveIntervalMs": 30000,
+  "contextBuilder": "v2",
+  "_note": "profile/state/memory 默认位于 PLAYER_HOME（默认 E:/BetterAGI/player）；contextBuilder 可用 legacy 回退 Phase 1 拼接。"
+}

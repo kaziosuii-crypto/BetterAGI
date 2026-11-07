@@ -1,0 +1,478 @@
+"""MinecraftAgent 局部工具（minecraft_report / minecraft_todo /
+minecraft_notebook / minecraft_wait / minecraft_get_work_log / minecraft_glance）
+
+工具归属约定（text_adv 同构）：
+- 局部工具（minecraft_todo / minecraft_notebook）= Agent 自己 LLM 用，驱动 ReAct 循环
+  ——全量读写文档，无 id
+- 对外工作文档读取（minecraft_get_work_log）= 主播经 ToolRegistry 调，只读——叙事素材通道
+- 主播看一眼（minecraft_glance）= 主播经 ToolRegistry 调，只读——身体现状与周边的精简叙事视图，
+  代替原始观察（原始观察的几何与证据是给游戏 Agent 规划用的）
+- 跨 Agent 派活走框架委派原语（framework_delegate；原 minecraft_send_prompt
+  已退役，职能并入 Agent 的接收委派入口）——主播是玩家 Agent 的用户：
+  派发/调整任务、回答问题、补充要求；系统不代写 todo（目标分解是 LLM 用
+  minecraft_todo 自己做的事）
+- 局部上报（minecraft_report）= 玩家 Agent LLM 用：向主播交付总结（delivery）/
+  升级决策（escalation）——玩家→主播唯一发声出口
+- provider="minecraft"（来源溯源：提供者=游戏 Agent 名全称，禁缩写）
+
+对外全名由 ``ToolSpec.full_name`` 派生（``minecraft_<工具名>``，provider 即模块名），
+工具名里不手写前缀。
+
+全量读写设计（对齐内部 todo 工具 todowrite / edit 模式）：
+- read：返回当前文档全文
+- write：提交新文档全文（覆盖），无 id、无增删改查逐条 API
+- LLM 拿 read 全文 → 改 → write 覆盖 = 批量修改
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, ClassVar, Dict, Iterable, Optional
+
+from src.modules.logging import get_logger
+from src.modules.mcp.provider import McpToolProvider
+from src.modules.skills import SKILL_TOOL_NAME, build_skill_spec
+from src.modules.tools.models import (
+    ToolExecutionResult,
+    ToolInvocation,
+    ToolSpec,
+)
+from src.modules.tools.provider import BaseToolProvider
+
+from .maicraft import GOAL, MaicraftReply, goal_id_of_ledger, goal_run_of, ledger_status_of
+from .state import MinecraftAgentState
+
+logger = get_logger("MinecraftTools")
+
+# 提供者标识统一来源（ToolSpec.provider / 追溯用），避免字面量重复
+PROVIDER_NAME = "minecraft"
+
+# 工具面使用说明（给主播的玩法）：Minecraft 是委派型游戏——主播交代目标，游戏里的
+# 身体自己拆解动手、做完或卡住再上报；主播只拿两件只读工具看现场与工作文档。
+STREAMER_GUIDE = (
+    "Minecraft 是委派型游戏：交代一个目标（framework_delegate）就是安排主播在游戏里开始做一件事，"
+    "游戏里的身体自己拆解、动手，做完或卡住再以游戏记录上报；中途要改要求用 framework_prompt。"
+    "想看一眼现场（身体状态、背包、身边的生物与设施）用 minecraft_glance；"
+    "想看待办、笔记和近期上报用 minecraft_get_work_log。"
+    "方向键、选项这类逐步操作在这款游戏里不存在，所有游戏内行动都走委派。"
+)
+
+# 上报回调形态：kind/content/scene 入参 → 拒绝原因（None=受理）。
+# 拒绝语义（交付门禁）由 Agent 侧判定——工具层只透传结果。
+ReportCallback = Callable[[str, str, str], Awaitable[Optional[str]]]
+
+
+# ---------------------------------------------------------------------------
+# ToolSpec 工厂
+# ---------------------------------------------------------------------------
+
+
+def build_todo_spec() -> ToolSpec:
+    """``minecraft_todo`` 工具规格——待办文档（全量读写，驱动 ReAct 循环）"""
+    return ToolSpec(
+        name="todo",
+        description=(
+            "待办文档（全量读写，无 id）。管理 Minecraft 玩家自己的目标与进度："
+            "read 返回当前 todo 全文；write 提交新全文（覆盖）。"
+            "任务的分解与推进由你自己决定：把收到的上级指令分解为任务，"
+            "逐项推进并标记 done。刚读写过且没有变化时复用已有全文，只在缺少当前内容时 read。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "write"],
+                    "description": "read=返回全文；write=全量覆盖",
+                },
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "任务内容"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "done"],
+                                "description": "任务状态",
+                            },
+                        },
+                        "required": ["content"],
+                    },
+                    "description": "write 时的新 todo 全文（覆盖旧文档）",
+                },
+            },
+            "required": ["action"],
+        },
+        kind="sync",
+        provider=PROVIDER_NAME,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        },
+    )
+
+
+def build_notebook_spec() -> ToolSpec:
+    """``minecraft_notebook`` 工具规格——工作笔记（跨批次保留的内存态，LLM 自主沉淀）"""
+    return ToolSpec(
+        name="notebook",
+        description=(
+            "工作笔记文档（全量读写，无 id）。你的跨批次工作记忆（进程内保留，重启即清）："
+            "记录值得跨轮次保留的关键信息（矿石位置/基地坐标/已完成事项/教训），"
+            "对话历史会被压缩、笔记不会——重要发现写这里，每轮可根据需要读回参考。"
+            "只写短条目，不复述历史经过、不抄回执原文。"
+            "read 返回全文；write 提交新全文（覆盖）。按需使用，不每轮强制。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "write"],
+                    "description": "read=返回全文；write=全量覆盖",
+                },
+                "content": {"type": "string", "description": "write 时的新笔记全文"},
+            },
+            "required": ["action"],
+        },
+        kind="sync",
+        provider=PROVIDER_NAME,
+        output_schema={"type": "object", "properties": {"content": {"type": "string"}}},
+    )
+
+
+def build_report_spec() -> ToolSpec:
+    """``minecraft_report`` 工具规格——上报通道（玩家→主播，交付/升级）"""
+    return ToolSpec(
+        name="report",
+        description=(
+            "向主播上报（玩家→主播唯一发声出口）。两种："
+            "kind=delivery 交付总结——本次目标要的结果真的达成时必发一次（中途不发）；"
+            "拿别的东西顶替、只做了一部分都不算交付。"
+            "kind=escalation 升级决策——至少试过两种实质不同的办法仍不行，或缺关键信息/需授权时发；"
+            "content 写清试过什么、各自为什么不行、下一步打算和需要主播定什么。"
+            "绝大多数困难自己解决（换路线/换策略/先做前置），不打扰主播。发完 escalation 后停止行动，静默等待主播回复。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["delivery", "escalation"],
+                    "description": "delivery=交付总结；escalation=升级决策（发后停止等待）",
+                },
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "主播要念给观众听的几句话，用第一人称：我做成了什么、没做成什么、卡在哪、需要定什么；不写“主播让我”“收到委派”“任务号”这类分工说法。"
+                        "坐标、观察编号、证据清单和操作流水不写进来，需要留存的记进 notebook"
+                    ),
+                },
+                "scene": {"type": "string", "description": "可选场景补充（坐标/区块等上下文）"},
+            },
+            "required": ["kind", "content"],
+        },
+        kind="sync",
+        provider=PROVIDER_NAME,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "reported": {"type": "boolean"},
+                "kind": {"type": "string"},
+            },
+        },
+    )
+
+
+def build_get_work_log_spec() -> ToolSpec:
+    """``minecraft_get_work_log`` 工具规格——工作文档读服务（状态通道，主播只读调用）"""
+    return ToolSpec(
+        name="get_work_log",
+        description=(
+            "只读查询 Minecraft 玩家的工作文档："
+            "todo（待办与进度）/ notebook（工作笔记）/ "
+            "recent_reports（近期上报：交付与升级记录）。"
+            "面向直播叙事——主播不需要自己记录游戏细节，按需查询即可。"
+            "本工具不查异步任务记录表；查任务进度用 framework_task_status。"
+        ),
+        parameters_schema={"type": "object", "properties": {}, "required": []},
+        kind="sync",
+        provider=PROVIDER_NAME,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "todo": {"type": "array"},
+                "notebook": {"type": "string"},
+                "recent_reports": {"type": "array"},
+            },
+        },
+    )
+
+
+def build_glance_spec() -> ToolSpec:
+    """``minecraft_glance`` 工具规格——主播看一眼游戏（只读，精简叙事视图）"""
+    return ToolSpec(
+        name="glance",
+        description=(
+            "看一眼游戏里的自己：身体状态（维度/位置/血量/饥饿/手上拿的/护甲/效果）、背包物品与数量、"
+            "时段天气、身边的生物与设施、远处的生物（按种类报只数，敌对的在前），"
+            "以及身体手头的工作（待办、正在跑的游戏内目标）。"
+            "只读、即时，面向直播叙事；更细的勘查、判断或任何操作都交给委派，不要自己琢磨方块坐标。"
+        ),
+        parameters_schema={"type": "object", "properties": {}, "required": []},
+        kind="sync",
+        provider=PROVIDER_NAME,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "body": {"type": "object"},
+                "inventory": {"type": "array"},
+                "entities": {"type": "array"},
+                "distant_entities": {"type": "array"},
+                "facilities": {"type": "array"},
+                "work": {"type": "object"},
+            },
+        },
+    )
+
+
+def build_wait_spec() -> ToolSpec:
+    """``minecraft_wait`` 工具规格——让出本轮，等后台目标的真实进展"""
+    return ToolSpec(
+        name="wait",
+        provider=PROVIDER_NAME,
+        kind="sync",
+        description=(
+            "身体正在执行后台目标、而你既没有可推进也没有可提前准备的事时，单独调用本工具让出本轮。"
+            "宿主盯着事件流：目标做完、失败、提问、被暂停，或主播发来新指令时，原任务带着最新结果继续。"
+            "不要用 maicraft_goal 反复查同一个目标来等结果。目标在等你回答问题或已被暂停时先处理它们，等不来结果。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "minLength": 1, "description": "说明在等哪个目标的什么结果"},
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider（注册到 ToolRegistry）
+# ---------------------------------------------------------------------------
+
+
+class MaicraftMcpProvider(McpToolProvider):
+    """MaiCraft 私有 MCP Provider：补目标任务的查询适配器，激活任务跟踪循环的周期兜底。
+
+    通用 MCP 查询适配器按"server 侧有任务查询工具"的形态约定（``task_query_tool``
+    + ``task_status_map``）声明；MaiCraft v1 没有那种工具，任务快照经
+    ``goal(get)`` 读、账本编号要先还原成目标编号——形态对不上，所以在绑定处
+    用子类就地适配：``goal_lookup`` 由 Agent 注入（即宿主自己的 MaiCraft 读取通道）。
+    """
+
+    def __init__(
+        self, *, goal_lookup: Callable[[str, Dict[str, Any]], Awaitable[MaicraftReply]], **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self._goal_lookup = goal_lookup
+
+    async def query_task(self, task_id: str) -> Optional[dict]:
+        """按账本编号查目标快照：``maicraft-goal-N`` 还原成目标编号后调 ``goal(get)``。
+
+        连接失败、目标查不到或回复读不懂一律返回 ``None``（跟踪循环按无新事实
+        处理，不据此改账）。
+        """
+        goal_id = goal_id_of_ledger(task_id)
+        if goal_id is None:
+            return None
+        reply = await self._goal_lookup(GOAL, {"operation": "get", "goal_id": goal_id})
+        if not reply.ok:
+            return None
+        run = goal_run_of(reply.data)
+        if run is None:
+            return None
+        return {"status": ledger_status_of(run), "snapshot": run.data, "summary": run.summary}
+
+
+@dataclass(slots=True)
+class MinecraftToolProvider(BaseToolProvider):
+    """MinecraftAgent 局部工具 Provider
+
+    持有 :class:`MinecraftAgentState`，把"文档式工具"映射为状态读写；
+    ``report_callback`` 由 Agent 注入——minecraft_report 上报经它发射事件并做
+    交付门禁校验（返回拒绝原因字符串；None=受理）。
+    """
+
+    # 工具分类（provider=提供者名、category=分组、tools.toml 段=配置地址，三者正交）：
+    # 本体工具随游戏 Agent 归 game 分组（工具页按此聚卡）
+    category: ClassVar[str] = "game"
+
+    state: MinecraftAgentState
+    report_callback: Optional[ReportCallback] = None
+    # 等待只改变本玩家的调度状态，真正盯后台目标的是宿主的事件跟踪。
+    wait_callback: Optional[Callable[[], Dict[str, Any]]] = None
+    # 主播看一眼：由 Agent 读观察并精简成叙事视图（未注入时不提供该工具）
+    glance_reader: Optional[Callable[[], Awaitable[Dict[str, Any]]]] = None
+    # 按名读技能正文：由 Agent 按自己的受众名筛本地策略，远端玩法技能按地址去 MaiCraft 读（未注入技能库时不提供该工具）；
+    # 远端技能要经 MCP 的 resources/read 取正文，所以读取器是异步的。
+    skill_reader: Optional[Callable[[str], Awaitable[Dict[str, Any]]]] = None
+
+    @property
+    def name(self) -> str:
+        return PROVIDER_NAME
+
+    def list_tools(self) -> Iterable[ToolSpec]:
+        specs = [
+            build_todo_spec(),
+            build_notebook_spec(),
+            build_get_work_log_spec(),
+            build_report_spec(),
+        ]
+        if self.wait_callback is not None:
+            specs.append(build_wait_spec())
+        if self.glance_reader is not None:
+            specs.append(build_glance_spec())
+        if self.skill_reader is not None:
+            specs.append(build_skill_spec(PROVIDER_NAME))
+        return specs
+
+    def guide_for(self, agent_name: str) -> str:
+        """玩法说明只给别的 Agent（主播）：自己的工具协议写在自己的系统提示词里。"""
+        return "" if agent_name == PROVIDER_NAME else STREAMER_GUIDE
+
+    async def invoke(self, invocation: ToolInvocation) -> ToolExecutionResult:
+        started_ms = int(time.time() * 1000)
+        tool_name = invocation.tool_name
+        args = dict(invocation.arguments or {})
+
+        # 调用方使用的就是派生全名（minecraft_todo 等），按 spec 全名等值对照分发
+        local_specs = self.list_tools()
+        matched = next((s for s in local_specs if s.full_name == tool_name), None)
+        if matched is None:
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                error_message=(
+                    f"未知工具: '{tool_name}'（MinecraftProvider 只提供 todo/notebook/get_work_log/report）"
+                ),
+                duration_ms=int(time.time() * 1000) - started_ms,
+            )
+
+        try:
+            if matched.name == "todo":
+                result = await self._invoke_todo(args)
+            elif matched.name == "notebook":
+                result = await self._invoke_notebook(args)
+            elif matched.name == "get_work_log":
+                result = await self._invoke_get_work_log(args)
+            elif matched.name == "report":
+                result = await self._invoke_report(args)
+            elif matched.name == "wait" and self.wait_callback is not None:
+                result = self.wait_callback()
+            elif matched.name == "glance" and self.glance_reader is not None:
+                result = await self.glance_reader()
+            elif matched.name == SKILL_TOOL_NAME and self.skill_reader is not None:
+                result = await self.skill_reader(str(args.get("name", "")))
+            else:
+                return ToolExecutionResult(
+                    tool_name=tool_name,
+                    success=False,
+                    error_message=f"未知工具: '{tool_name}'",
+                    duration_ms=int(time.time() * 1000) - started_ms,
+                )
+        except ValueError as exc:
+            # 参数写错时由玩家纠正，不能把自己的工具熔断摘除。
+            logger.warning(f"Minecraft 工具 '{tool_name}' 请求被拒绝: {exc}", exc=True)
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                error_message=f"{type(exc).__name__}: {exc}",
+                failure_kind="business",
+                duration_ms=int(time.time() * 1000) - started_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - 工具边界兜底
+            logger.exception(f"Minecraft 工具 '{tool_name}' 执行失败: {exc}")
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                error_message=f"{type(exc).__name__}: {exc}",
+                duration_ms=int(time.time() * 1000) - started_ms,
+            )
+
+        return ToolExecutionResult(
+            tool_name=tool_name,
+            success=True,
+            structured_content=result,
+            duration_ms=int(time.time() * 1000) - started_ms,
+        )
+
+    async def _invoke_todo(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(args.get("action", ""))
+        if action == "read":
+            return {"tool": "todo", **self.state.todo_doc()}
+        if action == "write":
+            todos = args.get("todos")
+            if not isinstance(todos, list):
+                return {"success": False, "error": "write 需要 todos 列表"}
+            self.state.set_todos(todos)
+            return {"success": True, "todos": self.state.todo_doc()["todos"]}
+        return {"success": False, "error": f"未知 action: {action!r}"}
+
+    async def _invoke_notebook(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(args.get("action", ""))
+        if action == "read":
+            return {"tool": "notebook", **self.state.notebook_doc()}
+        if action == "write":
+            content = str(args.get("content", ""))
+            self.state.set_notebook(content)
+            return {"success": True, "content": self.state.notebook}
+        return {"success": False, "error": f"未知 action: {action!r}"}
+
+    async def _invoke_get_work_log(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"tool": "get_work_log", **self.state.to_dict()}
+
+    async def _invoke_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        kind = str(args.get("kind", ""))
+        if kind not in ("delivery", "escalation"):
+            return {"success": False, "error": "kind 必须是 delivery 或 escalation"}
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"success": False, "error": "report 需要 content 字符串"}
+        scene = str(args.get("scene", ""))
+        if self.report_callback is not None:
+            rejection = await self.report_callback(kind, content, scene)
+            if rejection:
+                return {"success": False, "error": rejection, "kind": kind}
+        else:
+            # 降级仅记录（无 Agent 注入时上报不发射事件，供脱离 Agent 单测使用）
+            logger.warning("minecraft_report 无 report_callback：上报未发射事件")
+        return {"success": True, "reported": True, "kind": kind}
+
+
+__all__ = [
+    "MinecraftToolProvider",
+    "MaicraftMcpProvider",
+    "build_todo_spec",
+    "build_notebook_spec",
+    "build_get_work_log_spec",
+    "build_glance_spec",
+    "build_report_spec",
+    "build_wait_spec",
+    "PROVIDER_NAME",
+    "ReportCallback",
+]

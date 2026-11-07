@@ -1,0 +1,347 @@
+"""
+日志流广播器 - 将日志记录广播到 WebSocket
+"""
+
+import asyncio
+import json
+import sys
+import time as time_mod
+import traceback
+import weakref
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+from loguru import logger as loguru_logger
+
+from src.modules.utils.time_utils import now_ms
+
+if TYPE_CHECKING:
+    from src.modules.dashboard.websocket.handler import WebSocketHandler
+
+
+class LogStreamer:
+    """日志流广播器 - 捕获日志并广播到 WebSocket"""
+
+    # 日志持久化默认参数
+    DEFAULT_PERSIST_DIR = "logs/webui"
+    # 旧落盘目录（历史版本值）：启动搬移到 DEFAULT_PERSIST_DIR，日志类数据
+    # 统一归 logs/ 心智（data/ 只放业务事实），非业务数据不放 data/
+    LEGACY_PERSIST_DIR = "data/logs"
+
+    def __init__(
+        self,
+        ws_handler: Optional["WebSocketHandler"] = None,
+        min_level: str = "INFO",
+        max_logs: int = 500,
+        persist: bool = False,
+        persist_dir: str = DEFAULT_PERSIST_DIR,
+        persist_min_level: str = "INFO",
+        persist_retention_days: int = 0,
+    ) -> None:
+        """
+        Args:
+            ws_handler: WebSocket 处理器实例（可选，可延迟设置）
+            min_level: 最低日志级别
+            max_logs: 最大缓存的日志条数
+            persist: 是否启用 JSONL 文件持久化
+            persist_dir: 持久化目录（相对项目根）
+            persist_min_level: 落盘最低级别（内存缓冲仍按 min_level；
+                DEBUG 级全量落盘增长过快，默认只落 INFO 及以上）
+            persist_retention_days: 落盘文件保留天数，启动时清理更早的文件；
+                0 = 永不清理（默认，落盘日志长期保留，用户手动管理空间）
+        """
+        self.ws_handler = ws_handler
+        self.min_level = min_level
+        self.max_logs = max_logs
+        self.persist = persist
+        self.persist_min_level = persist_min_level.upper()
+        self.persist_retention_days = max(0, persist_retention_days)
+        self._handler_id: Optional[int] = None
+        self._is_running = False
+        self._log_buffer: list[dict[str, Any]] = []  # 历史日志缓冲区
+        self._buffer_lock = asyncio.Lock()
+
+        # 持久化路径
+        self._persist_dir: Optional[Path] = None
+        self._current_date: Optional[str] = None
+        self._current_file_path: Optional[Path] = None
+        _LIVE_STREAMERS.add(self)
+        if self.persist:
+            project_root = Path(__file__).resolve().parents[3]
+            self._migrate_legacy_persist_dir(project_root)
+            self._persist_dir = (project_root / persist_dir).resolve()
+            self._persist_dir.mkdir(parents=True, exist_ok=True)
+            self._cleanup_expired_persist_files()
+            self._load_from_disk()
+            # persist 单例防线：同进程并存多个 persist 实例时，每条日志会被
+            # 各实例的 sink 各写一遍（重复行的直接来源），创建即告警定位
+            live_persist = sum(1 for s in _LIVE_STREAMERS if s.persist)
+            if live_persist > 1:
+                loguru_logger.bind(module="LogStreamer").warning(
+                    f"同进程已存在 {live_persist - 1} 个存活 persist LogStreamer 实例，多实例并存会导致日志落盘重复行"
+                )
+
+    # ------------------------------------------------------------------ #
+    # 内部:磁盘恢复与持久化                                              #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _date_string(timestamp: float) -> str:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _migrate_legacy_persist_dir(project_root: Path) -> None:
+        """旧落盘目录一次性搬移（``data/logs`` → ``logs/webui``），幂等。
+
+        旧目录不存在或为空即跳过；目标已存在时逐文件搬移不覆盖（同天文件
+        以旧目录内容为准补入，重复行由下游日志页容忍）。
+        """
+        legacy = project_root / LogStreamer.LEGACY_PERSIST_DIR
+        target = project_root / LogStreamer.DEFAULT_PERSIST_DIR
+        if not legacy.is_dir():
+            return
+        target.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        try:
+            for file_path in legacy.glob("*.jsonl"):
+                destination = target / file_path.name
+                if not destination.exists():
+                    file_path.replace(destination)
+                    moved += 1
+            # 空了才删旧目录（残留文件保留原地，不静默丢数据）
+            if not any(legacy.iterdir()):
+                legacy.rmdir()
+                loguru_logger.bind(module="LogStreamer").info(
+                    f"旧日志持久化目录已搬移: {LogStreamer.LEGACY_PERSIST_DIR} -> {LogStreamer.DEFAULT_PERSIST_DIR}"
+                )
+        except OSError as exc:
+            loguru_logger.bind(module="LogStreamer").warning(f"旧日志目录搬移失败（保留原地继续）: {exc}")
+        if moved:
+            loguru_logger.bind(module="LogStreamer").info(f"已搬移 {moved} 个日志落盘文件到 {target}")
+
+    def _cleanup_expired_persist_files(self) -> None:
+        """启动时清理超过保留期的落盘文件（按文件名日期判定，解析失败按 mtime）。"""
+        if self._persist_dir is None or self.persist_retention_days <= 0:
+            return
+        cutoff = datetime.now() - timedelta(days=self.persist_retention_days)
+        removed = 0
+        for file_path in self._persist_dir.glob("*.jsonl"):
+            try:
+                try:
+                    file_date = datetime.strptime(file_path.stem, "%Y-%m-%d")
+                except ValueError:
+                    file_date = datetime.fromtimestamp(file_path.stat().st_mtime)
+                if file_date < cutoff:
+                    file_path.unlink()
+                    removed += 1
+            except OSError as exc:
+                loguru_logger.bind(module="LogStreamer").warning(f"清理过期日志文件失败 ({file_path}): {exc}")
+        if removed:
+            loguru_logger.bind(module="LogStreamer").info(
+                f"已清理 {removed} 个超过 {self.persist_retention_days} 天的日志落盘文件"
+            )
+
+    def _load_from_disk(self) -> None:
+        """启动时从当日 JSONL 文件恢复日志到内存缓冲。"""
+        if self._persist_dir is None:
+            return
+        today = self._date_string(time_mod.time())
+        file_path = self._persist_dir / f"{today}.jsonl"
+        if not file_path.exists():
+            return
+        try:
+            count = 0
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        self._log_buffer.append(entry)
+                        count += 1
+                    except json.JSONDecodeError:
+                        continue
+            # 限制缓冲不超过 max_logs
+            if len(self._log_buffer) > self.max_logs:
+                self._log_buffer = self._log_buffer[-self.max_logs :]
+            # 显式 .bind(module="LogStreamer")：避免日志格式字符串 {extra[module]} 触发 KeyError
+            loguru_logger.bind(module="LogStreamer").info(f"从磁盘恢复 {count} 条历史日志 ({file_path})")
+        except Exception as exc:
+            loguru_logger.bind(module="LogStreamer").warning(f"从磁盘恢复日志失败 ({file_path}): {exc!r}")
+
+    def _append_to_file(self, entry: dict[str, Any]) -> None:
+        """同步将单条日志追加到当日 JSONL 文件。"""
+        if not self.persist or self._persist_dir is None:
+            return
+        try:
+            now = time_mod.time()
+            date_str = self._date_string(now)
+            if date_str != self._current_date or self._current_file_path is None:
+                self._current_date = date_str
+                self._current_file_path = self._persist_dir / f"{date_str}.jsonl"
+            with open(self._current_file_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            loguru_logger.bind(module="LogStreamer").warning(f"写入日志持久化文件失败: {exc!r}")
+
+    # ------------------------------------------------------------------ #
+    # 公开 API                                                            #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def persist_dir(self) -> Optional[Path]:
+        """落盘目录（未启用落盘时 None）——日志历史查询面据此降级。"""
+        return self._persist_dir
+
+    def set_ws_handler(self, ws_handler: "WebSocketHandler") -> None:
+        """设置 WebSocket 处理器（用于延迟设置）"""
+        self.ws_handler = ws_handler
+
+    async def start(self) -> None:
+        """启动日志流"""
+        if self._is_running:
+            return
+        self._is_running = True
+        self._install_sink()
+
+    async def stop(self) -> None:
+        """停止日志流"""
+        if not self._is_running:
+            return
+        self._is_running = False
+        self._remove_sink()
+        _LIVE_STREAMERS.discard(self)
+
+    def _install_sink(self) -> None:
+        """挂载 loguru sink 并记录 handler_id；已挂载的旧 sink 先摘除（幂等，供重建复用）。"""
+        if self._handler_id is not None:
+            self._remove_sink()
+        self._handler_id = loguru_logger.add(
+            self._sink,
+            level=self.min_level,
+            format="{message}",  # 我们自己处理格式
+            filter=self._filter,
+        )
+
+    def _remove_sink(self) -> None:
+        """摘除已挂载的 sink。
+
+        handler 可能已被外部摘除（如 configure_from_config 的全局 remove()），
+        此时 loguru 抛 ValueError，静默归位即可——目标状态（sink 不在）已达成。
+        """
+        if self._handler_id is None:
+            return
+        try:
+            loguru_logger.remove(self._handler_id)
+        except ValueError:
+            pass
+        self._handler_id = None
+
+    def _filter(self, record: dict) -> bool:
+        """过滤日志记录"""
+        # 过滤掉自己的日志，避免递归
+        module = record["extra"].get("module", "")
+        if "LogStreamer" in module or "websocket" in module.lower():
+            return False
+        return True
+
+    async def _add_to_buffer(self, log_entry: dict[str, Any]) -> None:
+        """将日志添加到缓冲区；落盘按 persist_min_level 过滤（缓冲保留全量）。"""
+        if self.persist and self._level_rank(log_entry.get("level", "")) >= self._level_rank(self.persist_min_level):
+            self._append_to_file(log_entry)
+        async with self._buffer_lock:
+            self._log_buffer.append(log_entry)
+            if len(self._log_buffer) > self.max_logs:
+                self._log_buffer.pop(0)
+
+    @staticmethod
+    def _level_rank(level: str) -> int:
+        """日志级别名 → 序数值（loguru 级别名大小写不敏感比较）。"""
+        order = {"TRACE": 0, "DEBUG": 10, "INFO": 20, "SUCCESS": 25, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+        return order.get(level.upper(), 20)
+
+    async def get_recent_logs(self, count: int = 500) -> list[dict[str, Any]]:
+        """获取最近的日志"""
+        async with self._buffer_lock:
+            return self._log_buffer[-count:].copy()
+
+    async def broadcast_history(self, client_id: str) -> int:
+        """向指定客户端推送历史日志"""
+        history = await self.get_recent_logs()
+        if not history:
+            return 0
+
+        # 导入在这里避免循环依赖
+        from src.modules.dashboard.schemas.event import WebSocketMessage
+
+        count = 0
+        for log_entry in history:
+            message = WebSocketMessage(
+                kind="log",
+                type="log.entry",
+                timestamp_ms=now_ms(),
+                data=log_entry,
+            )
+            try:
+                await self.ws_handler.send_to_client(client_id, message)
+                count += 1
+            except Exception as e:
+                loguru_logger.bind(module="LogStreamer").debug(f"WS broadcast to client {client_id} failed: {e!r}")
+        return count
+
+    def _sink(self, message: Any) -> None:
+        """loguru sink - 处理日志记录"""
+        try:
+            record = message.record
+            log_entry = {
+                "timestamp": record["time"].isoformat(),
+                "level": record["level"].name,
+                "module": record["extra"].get("module", "unknown"),
+                "message": record["message"],
+            }
+            # exc=True 在无活动异常时会留下 (None, None, None) 占位，type 非空才真正带堆栈
+            exc = record["exception"]
+            if exc is not None and exc.type is not None:
+                log_entry["exception"] = "".join(traceback.format_exception(exc.type, exc.value, exc.traceback)).rstrip(
+                    "\n"
+                )
+            # 添加到缓冲区
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._add_to_buffer(log_entry))
+            except RuntimeError:
+                # 没有运行中的事件循环，忽略
+                pass
+            # 广播到 WebSocket 客户端（仅当 ws_handler 已设置时）；kind="log"
+            # 标记日志通道，前端事件缓冲不消费
+            if self.ws_handler is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.ws_handler.broadcast("log.entry", log_entry, kind="log"))
+                except RuntimeError:
+                    # 没有运行中的事件循环，忽略
+                    pass
+        except Exception as e:
+            sys.stderr.write(f"[log_streamer] sink error: {e!r}\n")
+
+
+# 存活 LogStreamer 弱引用注册表：实例 stop 或被回收后自动清出。
+# 承担两件事——persist 实例的单例防线（构造期告警），以及全局日志重配置
+# 摘掉 sink 后的存活实例重建（rebind_live_streamers）。
+_LIVE_STREAMERS: "weakref.WeakSet[LogStreamer]" = weakref.WeakSet()
+
+
+def rebind_live_streamers() -> int:
+    """为所有仍标记运行中的 LogStreamer 重建 sink，返回重建数。
+
+    configure_from_config() 的全局 remove() 会把本模块挂载的 sink 一并摘掉，
+    实例却仍处于运行态（孤儿化）。全局重配置完成后调用本函数恢复日志流。
+    """
+    count = 0
+    for streamer in list(_LIVE_STREAMERS):
+        if streamer._is_running:
+            streamer._install_sink()
+            count += 1
+    return count

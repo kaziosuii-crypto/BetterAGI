@@ -1,0 +1,104 @@
+"""MinecraftAgent 内存状态（Agent 内部自由）
+
+状态归属：todo（待办）/ notebook（工作笔记）/ reports（近期上报）
+全部内存存储，不持久化（Agent 生命周期内有效；跨场次恢复后续按需添加）。
+
+不建模游戏世界数据（health/food/坐标等）——那是 maicraft 执行层的事；
+maicraft 返回原样给 LLM 读，本状态只承载 Agent 自己的"指令 + 待办 + 记录"。
+任务原始指令、执行阶段与步数由 MinecraftAgent 随逻辑任务保留，不属于这些可编辑工作文档。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, NamedTuple
+
+# 近期上报保留条数（主播状态查询够用）
+MAX_REPORTS = 10
+
+
+class MinecraftInstruction(NamedTuple):
+    """玩家指令保留原二元组协议，系统通知不能冒充新指令来恢复已挂起的任务。"""
+
+    task_id: str
+    content: str
+
+
+class WakeEvenIdle(NamedTuple):
+    """闲着也要叫醒模型的通知：交付或挂起后普通通知不开批，这种照样开批。
+
+    两种事用它：计时到点（模型自己用 timer 要的"过 N 秒叫我"）、Mod 自己挂出的决策（死亡恢复：
+    没人回答，角色就一直停在死亡屏幕）。两种都只能由游戏 Agent 自己接，闲着不开批就永远没人管。
+    排队时不定怎么处理，轮到读它的那一刻才看任务状态：进行中就是一条普通通知；已交付就由它开一个新任务
+    （计时的备注、要回答的决策就是这次要做的事）；挂起着就接着原任务做。排队时就定的话，
+    排进来那一刻任务还在跑、读到之前刚好交付，这条叫醒会一直留在队列里没人读。
+    """
+
+    task_id: str
+    content: str
+
+
+@dataclass(slots=True)
+class TodoItem:
+    """一条待办（全量文档元素）"""
+
+    content: str
+    status: str = "pending"  # pending | in_progress | done
+
+
+@dataclass(slots=True)
+class MinecraftAgentState:
+    """MinecraftAgent 内存状态
+
+    Attributes:
+        todos: 待办列表（minecraft_todo 全量文档）
+        notebook: 工作笔记全文（minecraft_notebook 全量文档）
+        reports: 近期上报（emit game.report 时同步；最多 MAX_REPORTS 条）
+    """
+
+    todos: List[TodoItem] = field(default_factory=list)
+    notebook: str = ""
+    reports: List[Dict[str, str]] = field(default_factory=list)
+
+    # ---- todo 文档操作 ----
+
+    def set_todos(self, todos: List[Dict[str, Any]]) -> None:
+        """全量覆盖待办（minecraft_todo write；无 id，文档式）。"""
+        self.todos = [
+            TodoItem(content=str(t.get("content", "")), status=str(t.get("status", "pending"))) for t in todos
+        ]
+
+    def todo_doc(self) -> Dict[str, Any]:
+        """导出待办文档（minecraft_todo read）。"""
+        return {"todos": [{"content": t.content, "status": t.status} for t in self.todos]}
+
+    # ---- notebook 文档操作 ----
+
+    def set_notebook(self, content: str) -> None:
+        """全量覆盖工作笔记（minecraft_notebook write）。"""
+        self.notebook = content
+
+    def notebook_doc(self) -> Dict[str, Any]:
+        """导出工作笔记文档（minecraft_notebook read）。"""
+        return {"content": self.notebook}
+
+    # ---- 上报 ----
+
+    def add_report(self, kind: str, content: str, scene: str = "") -> None:
+        """新增上报（emit game.report 时同步；保留最近 MAX_REPORTS 条）。"""
+        self.reports.append({"kind": kind, "content": content, "scene": scene})
+        if len(self.reports) > MAX_REPORTS:
+            self.reports = self.reports[-MAX_REPORTS:]
+
+    # ---- 状态导出（minecraft_get_work_log）----
+
+    def to_dict(self) -> Dict[str, Any]:
+        """导出完整状态快照（minecraft_get_work_log：todo/notebook/reports 三元组）。"""
+        return {
+            "todo": self.todo_doc()["todos"],
+            "notebook": self.notebook,
+            "recent_reports": [dict(r) for r in self.reports],
+        }
+
+
+__all__ = ["MinecraftAgentState", "TodoItem", "MAX_REPORTS"]

@@ -1,0 +1,22 @@
+{
+  "name": "obsfusion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ObsFusion - structured text x video x TTS overlay plugin for OBS",
+  "bin": {
+    "obsfusion": "bin/obsfusion.mjs"
+  },
+  "scripts": {
+    "start": "node bin/obsfusion.mjs serve",
+    "dev": "node bin/obsfusion.mjs serve --port 8787",
+    "demo": "node bin/obsfusion.mjs demo",
+    "test": "node --test",
+    "doctor": "node bin/obsfusion.mjs doctor",
+    "obs:install": "node bin/obsfusion.mjs obs:install",
+    "check": "node --check server/index.mjs && node --check bin/obsfusion.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

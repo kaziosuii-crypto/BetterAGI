@@ -1,0 +1,512 @@
+"""
+LLM 管理 API
+
+提供 LLM 用量统计、用量趋势图表和请求历史的查询接口。
+"""
+
+import asyncio
+import json
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from src.modules.dashboard.dependencies import get_dashboard_server
+from src.modules.dashboard.schemas.llm import (
+    LLMContextBreakdownResponse,
+    LLMHistoryListResponse,
+    LLMHistoryStatisticsModelStats,
+    LLMHistoryStatisticsResponse,
+    LLMRequestHistoryListItem,
+    LLMRequestHistoryResponse,
+    LLMRequestStatsBatchRequest,
+    LLMRequestStatsBatchResponse,
+    LLMRequestStatsItem,
+    LLMUsageStatsResponse,
+    LLMUsageSummaryResponse,
+    LLMUsageTrendsResponse,
+    TokenUsageSchema,
+)
+from src.modules.dashboard.services.llm_stats import build_usage_trends, cache_hit_rate
+from src.modules.diagnostics.readers import (
+    read_latest_breakdowns,
+    read_llm_request_payload,
+    read_request_breakdown,
+)
+from src.modules.llm.quota import ProviderQuota
+from src.modules.llm.request_history_manager import count_image_parts
+
+if TYPE_CHECKING:
+    from src.modules.dashboard.server import DashboardServer
+
+router = APIRouter()
+
+# 类型别名，用于依赖注入
+ServerDep = Annotated["DashboardServer", Depends(get_dashboard_server)]
+
+
+@router.get("/usage", response_model=Dict[str, LLMUsageStatsResponse])
+async def get_all_models_usage(server: ServerDep) -> Dict[str, LLMUsageStatsResponse]:
+    """获取所有模型的用量统计（SQLite ``llm_usage`` 聚合）。
+
+    库空（冷启动）返回空对象而非报错；旧 JSON 账本历史不迁移，切换后从零计账。
+    """
+    llm_repo = server.llm_repo
+    if llm_repo is None:
+        return {}
+
+    rows = await llm_repo.llm_usage_by_model()
+    # 最近一次调用的输入 token：单独一条子查询拿到每模型最新一条记录的
+    # prompt_tokens（不等同于 SUM 聚合，是水位分子）
+    latest_prompt_tokens: Dict[str, int] = await llm_repo.llm_usage_latest_prompt_tokens()
+    # 上下文窗口：装配期由 LLMManager 按 model_identifier 建索引；未注入
+    # / 未配置时一律取 0，前端据此隐藏水位（不显示 0%）
+    context_windows: Dict[str, int] = {}
+    llm_manager = getattr(server, "llm_manager", None)
+    if llm_manager is not None and hasattr(llm_manager, "get_model_context_windows"):
+        context_windows = llm_manager.get_model_context_windows()
+
+    result: Dict[str, LLMUsageStatsResponse] = {}
+    for row in rows:
+        model_name = row.get("model_name") or "unknown"
+        hit = int(row.get("cache_hit_tokens", 0))
+        miss = int(row.get("cache_miss_tokens", 0))
+        latest_prompt = latest_prompt_tokens.get(model_name)
+        result[model_name] = LLMUsageStatsResponse(
+            model_name=model_name,
+            total_prompt_tokens=int(row.get("total_prompt_tokens", 0)),
+            total_completion_tokens=int(row.get("total_completion_tokens", 0)),
+            total_tokens=int(row.get("total_tokens", 0)),
+            total_calls=int(row.get("total_calls", 0)),
+            total_cost=float(row.get("total_cost", 0.0)),
+            cache_hit_tokens=hit,
+            cache_miss_tokens=miss,
+            cache_hit_rate=cache_hit_rate(hit, miss),
+            first_call_time=row.get("first_call_time"),
+            last_call_time=row.get("last_call_time"),
+            last_updated=row.get("last_updated"),
+            context_window=int(context_windows.get(model_name, 0)),
+            last_call_prompt_tokens=latest_prompt,
+        )
+
+    return result
+
+
+def _assemble_breakdown_response(
+    breakdown: Dict[str, Any],
+    *,
+    model_name: str,
+    row: Dict[str, Any],
+    context_windows: Dict[str, int],
+) -> LLMContextBreakdownResponse:
+    """把落库的 breakdown JSON + 仓储行组装成响应模型（两处端点共用）。"""
+    window = int(context_windows.get(model_name, 0))
+    used = int(breakdown.get("api_prompt_tokens", 0) or 0)
+    return LLMContextBreakdownResponse(
+        model_name=model_name,
+        profile_name=str(breakdown.get("profile_name") or row.get("profile_name") or ""),
+        request_id=str(breakdown.get("request_id") or row.get("request_id") or ""),
+        timestamp_ms=row.get("timestamp_ms"),
+        context_window=window,
+        api_prompt_tokens=used,
+        calibrated=bool(breakdown.get("calibrated", False)),
+        sections=breakdown.get("sections") or [],
+        free_tokens=max(0, window - used) if window > 0 else None,
+    )
+
+
+def _context_windows_of(server: "DashboardServer") -> Dict[str, int]:
+    """取 LLMManager 装配期的每模型窗口索引（未注入/未配置一律空）。"""
+    llm_manager = getattr(server, "llm_manager", None)
+    if llm_manager is not None and hasattr(llm_manager, "get_model_context_windows"):
+        return llm_manager.get_model_context_windows()
+    return {}
+
+
+@router.get("/context-breakdown", response_model=Dict[str, LLMContextBreakdownResponse])
+async def get_context_breakdown(server: ServerDep) -> Dict[str, LLMContextBreakdownResponse]:
+    """每模型最近一次调用的上下文分段占用（"上下文水位"悬停明细数据源）。
+
+    数据取每模型最新水位快照（``logs/llm_context/latest.json``，引擎成功
+    路径覆写），窗口上限取 LLMManager 装配索引；快照空时返回空对象
+    （分段占用只产生于引擎成功路径，快照缺条目 = 该模型尚无水位可看）。
+    ``breakdown`` 解析失败的条目跳过（不伪造分段）。
+    """
+    context_windows = _context_windows_of(server)
+    result: Dict[str, LLMContextBreakdownResponse] = {}
+
+    snapshot_models = read_latest_breakdowns()
+    for model_name, breakdown in snapshot_models.items():
+        row = {
+            "timestamp_ms": breakdown.get("timestamp_ms"),
+            "profile_name": breakdown.get("profile_name"),
+            "request_id": breakdown.get("request_id"),
+        }
+        result[model_name] = _assemble_breakdown_response(
+            breakdown, model_name=model_name, row=row, context_windows=context_windows
+        )
+    return result
+
+
+@router.get(
+    "/context-breakdown/{request_id}",
+    response_model=Optional[LLMContextBreakdownResponse],
+)
+async def get_context_breakdown_by_request(request_id: str, server: ServerDep) -> Optional[LLMContextBreakdownResponse]:
+    """按请求 ID 取单次调用的上下文分段占用（时间线决策卡水位胶囊悬停明细）。
+
+    分段占用存诊断文件（按库行 ``timestamp_ms`` 定位回查）；文件未命中
+    （估算不可用的行）或行不存在一律返回 null（前端按空态渲染，不报错）；
+    窗口上限同口径取 LLMManager 装配索引。
+    """
+    llm_repo = server.llm_repo
+    if llm_repo is None:
+        return None
+
+    row = await llm_repo.get_llm_request_by_id(request_id)
+    if row is None:
+        return None
+
+    # 文件回查线性扫描小时文件，挪线程池避免冻结事件循环（悬停触发，低频）
+    breakdown = await asyncio.to_thread(read_request_breakdown, request_id, int(row.get("timestamp_ms") or 0))
+    if not isinstance(breakdown, dict):
+        return None
+    model_name = str(row.get("model_name") or "")
+    return _assemble_breakdown_response(
+        breakdown, model_name=model_name, row=row, context_windows=_context_windows_of(server)
+    )
+
+
+@router.get("/quota", response_model=Optional[ProviderQuota])
+async def get_provider_quota(
+    server: ServerDep,
+    model_name: Annotated[str, Query(min_length=1, description="API 模型标识（与用量统计的 model_name 同口径）")],
+) -> Optional[ProviderQuota]:
+    """模型所属 provider 的平台额度（上下文面板 Usage 区数据源）。
+
+    模型标识走查询参数而非路径段：OpenRouter 等平台的标识含斜杠。平台不支持、
+    未配置 Key、查询失败或未注入 LLMManager 时一律返回 null，前端隐藏 Usage 区。
+    """
+    service = server.provider_quota
+    if service is None:
+        return None
+    return await service.get_quota_for_model(model_name)
+
+
+@router.get("/usage/trends", response_model=LLMUsageTrendsResponse)
+async def get_usage_trends(
+    server: ServerDep,
+    days: Annotated[int, Query(ge=1, le=365, description="回看天数")] = 30,
+) -> LLMUsageTrendsResponse:
+    """获取近 N 天逐日用量趋势（图表数据源）。
+
+    日期对齐、缺失日期补零与聚合在 ``services.llm_stats.build_usage_trends``。
+    """
+    return await build_usage_trends(server.llm_repo, days)
+
+
+@router.get("/usage/summary", response_model=LLMUsageSummaryResponse)
+async def get_usage_summary(server: ServerDep) -> LLMUsageSummaryResponse:
+    """获取总费用摘要（SQLite ``llm_usage`` 聚合；库空返回全零）。"""
+    llm_repo = server.llm_repo
+    if llm_repo is None:
+        return LLMUsageSummaryResponse()
+
+    summary = await llm_repo.llm_usage_summary()
+    hit = int(summary.get("cache_hit_tokens", 0))
+    miss = int(summary.get("cache_miss_tokens", 0))
+    return LLMUsageSummaryResponse(
+        total_cost=float(summary.get("total_cost", 0.0)),
+        total_prompt_tokens=int(summary.get("total_prompt_tokens", 0)),
+        total_completion_tokens=int(summary.get("total_completion_tokens", 0)),
+        total_tokens=int(summary.get("total_tokens", 0)),
+        total_calls=int(summary.get("total_calls", 0)),
+        cache_hit_tokens=hit,
+        cache_miss_tokens=miss,
+        cache_hit_rate=cache_hit_rate(hit, miss),
+        model_count=int(summary.get("model_count", 0)),
+    )
+
+
+@router.get("/history", response_model=LLMHistoryListResponse)
+async def get_history(
+    server: ServerDep,
+    page: Annotated[int, Query(ge=1, description="页码")] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100, description="每页数量")] = 50,
+    model_name: Annotated[Optional[str], Query(description="模型名称筛选")] = None,
+    profile_name: Annotated[Optional[str], Query(description="用途筛选")] = None,
+    start_time: Annotated[Optional[int], Query(description="开始时间（毫秒时间戳）")] = None,
+    end_time: Annotated[Optional[int], Query(description="结束时间（毫秒时间戳）")] = None,
+    success_only: Annotated[Optional[bool], Query(description="只返回成功的请求")] = None,
+) -> LLMHistoryListResponse:
+    """获取请求历史列表"""
+    history_manager = server.request_history_manager
+    result = await history_manager.get_history(
+        profile_name=profile_name,
+        model_name=model_name,
+        start_time=start_time,
+        end_time=end_time,
+        success_only=success_only,
+        page=page,
+        page_size=page_size,
+    )
+
+    items: List[LLMRequestHistoryListItem] = []
+    for record in result.get("records", []):
+        items.append(_build_list_item(record))
+
+    return LLMHistoryListResponse(
+        items=items,
+        total=result.get("total", 0),
+        page=result.get("page", 1),
+        page_size=result.get("page_size", 50),
+        total_pages=result.get("total_pages", 0),
+    )
+
+
+@router.get("/history/models", response_model=List[str])
+async def get_available_models(server: ServerDep) -> List[str]:
+    """获取历史记录中出现过的模型名（去重升序；供筛选下拉全量候选项）"""
+    history_manager = server.request_history_manager
+    return await history_manager.get_available_models()
+
+
+@router.get("/history/statistics", response_model=LLMHistoryStatisticsResponse)
+async def get_statistics(
+    server: ServerDep,
+    start_time: Annotated[Optional[int], Query(description="开始时间（毫秒时间戳）")] = None,
+    end_time: Annotated[Optional[int], Query(description="结束时间（毫秒时间戳）")] = None,
+) -> LLMHistoryStatisticsResponse:
+    """获取历史统计信息"""
+    history_manager = server.request_history_manager
+    stats = await history_manager.get_statistics(start_time=start_time, end_time=end_time)
+
+    # 转换 model_stats
+    model_stats: Dict[str, LLMHistoryStatisticsModelStats] = {}
+    for model_name, model_data in stats.get("model_stats", {}).items():
+        model_hit = model_data.get("cache_hit_tokens", 0)
+        model_miss = model_data.get("cache_miss_tokens", 0)
+        model_stats[model_name] = LLMHistoryStatisticsModelStats(
+            count=model_data.get("count", 0),
+            total_tokens=model_data.get("total_tokens", 0),
+            total_cost=model_data.get("total_cost", 0.0),
+            cache_hit_tokens=model_hit,
+            cache_miss_tokens=model_miss,
+            cache_hit_rate=cache_hit_rate(model_hit, model_miss),
+        )
+
+    return LLMHistoryStatisticsResponse(
+        total_requests=stats.get("total_requests", 0),
+        successful_requests=stats.get("successful_requests", 0),
+        failed_requests=stats.get("failed_requests", 0),
+        success_rate=stats.get("success_rate", 0.0),
+        total_prompt_tokens=stats.get("total_prompt_tokens", 0),
+        total_completion_tokens=stats.get("total_completion_tokens", 0),
+        total_tokens=stats.get("total_tokens", 0),
+        total_cost=stats.get("total_cost", 0.0),
+        cache_hit_tokens=stats.get("cache_hit_tokens", 0),
+        cache_miss_tokens=stats.get("cache_miss_tokens", 0),
+        cache_hit_rate=cache_hit_rate(stats.get("cache_hit_tokens", 0), stats.get("cache_miss_tokens", 0)),
+        avg_latency_ms=stats.get("avg_latency_ms", 0.0),
+        model_stats=model_stats,
+        client_stats=stats.get("client_stats", {}),
+        time_range=stats.get("time_range"),
+    )
+
+
+@router.get("/history/{request_id}", response_model=Optional[LLMRequestHistoryResponse])
+async def get_request_by_id(request_id: str, server: ServerDep) -> Optional[LLMRequestHistoryResponse]:
+    """获取单个请求详情"""
+    history_manager = server.request_history_manager
+    record = await history_manager.get_request_by_id(request_id)
+
+    if not record:
+        return None
+
+    # 正文回查线性扫描小时文件（峰值 18.7MB/文件），同步跑在事件循环里会
+    # 冻结整个 WebUI；挪线程池（浏览器逐卡展开时触发，低频）
+    merged = await asyncio.to_thread(_merge_payload_from_file, record)
+    return _convert_record_to_response(merged)
+
+
+@router.post("/history/stats", response_model=LLMRequestStatsBatchResponse)
+async def get_request_stats_batch(
+    request: LLMRequestStatsBatchRequest, server: ServerDep
+) -> LLMRequestStatsBatchResponse:
+    """按 id 批量取请求统计（仅库查询统计列，不含正文大字段）。
+
+    时间线统计胶囊合批懒取专用：一次回看首屏有数百张带请求指针的卡，
+    逐卡 GET /history/{id} 会回传整段请求正文并触发读侧诊断文件回查
+    （统计胶囊只消费 usage/model 几个数），合批轻端点把 N 个重请求收敛
+    为 1 个轻请求。
+    """
+    history_manager = server.request_history_manager
+    stats = await history_manager.get_request_stats_by_ids(request.request_ids)
+    return LLMRequestStatsBatchResponse(
+        stats={request_id: LLMRequestStatsItem(**item) for request_id, item in stats.items()}
+    )
+
+
+def _merge_payload_from_file(record: Dict[str, Any]) -> Dict[str, Any]:
+    """正文出库后按 request_id 回查诊断文件补齐详情记录。
+
+    新行库列正文一律 NULL（正文在 ``logs/llm_requests/`` 诊断文件），按库行
+    ``timestamp_ms`` 推导小时文件回查；存量旧行正文仍在库列（判空不触发），
+    文件未命中时原样返回（前端拿到无正文的统计行）。无库模式（内存缓存）
+    记录自带全量正文，同样不触发。
+    """
+    if record.get("request_params") or record.get("reasoning_content") or record.get("tool_calls"):
+        return record
+    payload = read_llm_request_payload(str(record.get("request_id") or ""), int(record.get("timestamp") or 0))
+    if payload is None:
+        return record
+    merged = dict(record)
+    merged["request_params"] = payload.get("request_params") or {}
+    merged["reasoning_content"] = payload.get("reasoning_content")
+    merged["tool_calls"] = payload.get("tool_calls") or []
+    merged["usage_raw_json"] = payload.get("usage_raw_json")
+    return merged
+
+
+def _convert_usage(usage_data: Any) -> Optional[TokenUsageSchema]:
+    """记录内的 usage 字典转 TokenUsage，缺省字段补 0"""
+    if not usage_data:
+        return None
+    return TokenUsageSchema(
+        prompt_tokens=usage_data.get("prompt_tokens", 0),
+        completion_tokens=usage_data.get("completion_tokens", 0),
+        total_tokens=usage_data.get("total_tokens", 0),
+    )
+
+
+def _extract_reasoning_tokens(usage_data: Any) -> Optional[int]:
+    """从已解析的 usage 字典中取 reasoning_tokens；上游未上报则 None。"""
+    if not isinstance(usage_data, dict):
+        return None
+    value = usage_data.get("reasoning_tokens")
+    return int(value) if value is not None else None
+
+
+def _preview(text: Any) -> str:
+    """完整提供列表文本，避免列表接口丢失请求或响应尾部。"""
+    if not isinstance(text, str):
+        return ""
+    return text.strip()
+
+
+def _tool_calls_preview(tool_calls: Any) -> str:
+    """工具调用型响应的列表预览：首个调用的「[调用 函数名] 参数摘要」。
+
+    Planner/Replyer 的响应以 tool_calls 承载（response_content 为空），
+    只看 response_content 会整列显示为空。
+    """
+    if not isinstance(tool_calls, list):
+        return ""
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        func = call.get("function")
+        if not isinstance(func, dict):
+            continue
+        name = str(func.get("name") or "").strip()
+        args = func.get("arguments")
+        if isinstance(args, str):
+            args_text = args
+        elif args is None:
+            args_text = ""
+        else:
+            try:
+                args_text = json.dumps(args, ensure_ascii=False)
+            except TypeError:
+                args_text = str(args)
+        combined = f"[调用 {name}] {args_text}".strip()
+        if combined != "[调用]" and combined:
+            return _preview(combined)
+    return ""
+
+
+def _message_text(message: Any) -> str:
+    """中立契约消息（{role, parts, ...}）的正文文本：拼接 parts 片段，图像片段以占位符呈现"""
+    if not isinstance(message, dict) or not isinstance(message.get("parts"), list):
+        return ""
+    lines: List[str] = []
+    for piece in message["parts"]:
+        if isinstance(piece, str):
+            lines.append(piece)
+        elif isinstance(piece, dict):
+            if isinstance(piece.get("text"), str):
+                lines.append(piece["text"])
+            elif piece.get("type") == "image":
+                lines.append("[图片内容已省略]")
+    return "\n".join(lines)
+
+
+def _build_list_item(record: Dict[str, Any]) -> LLMRequestHistoryListItem:
+    """列表行保留所选消息和首个工具调用的完整文本；详情接口提供完整请求。
+
+    ``preview_text`` 列（v14 写侧摘要）优先；存量旧行无摘要，回退从
+    request_params 解析——messages 里最后一条有正文的消息即列表展示的
+    Prompt 预览。
+    """
+    prompt_preview = str(record.get("preview_text") or "")
+    if not prompt_preview:
+        params = record.get("request_params")
+        messages = params.get("messages") if isinstance(params, dict) else None
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                text = _message_text(message).strip()
+                if text:
+                    prompt_preview = _preview(text)
+                    break
+
+    response_preview = _preview(record.get("response_content"))
+    if not response_preview:
+        response_preview = _tool_calls_preview(record.get("tool_calls"))
+    return LLMRequestHistoryListItem(
+        request_id=record.get("request_id", ""),
+        timestamp_ms=record.get("timestamp", 0),
+        profile_name=record.get("profile_name", ""),
+        model_name=record.get("model_name", ""),
+        prompt_preview=prompt_preview,
+        response_preview=response_preview,
+        usage=_convert_usage(record.get("usage")),
+        cost=record.get("cost", 0.0),
+        success=record.get("success", True),
+        error=record.get("error"),
+        latency_ms=record.get("latency_ms", 0),
+        cache_hit_tokens=int(record.get("cache_hit_tokens") or 0),
+        cache_miss_tokens=int(record.get("cache_miss_tokens") or 0),
+        reasoning_tokens=_extract_reasoning_tokens(record.get("usage")),
+        usage_raw_json=record.get("usage_raw_json"),
+        image_count=_extract_image_count(record),
+    )
+
+
+def _extract_image_count(record: Dict[str, Any]) -> int:
+    """注入截图数：优先取写侧落库列；无库模式（内存缓存行自带正文）现场计数。"""
+    stored = int(record.get("image_count") or 0)
+    if stored:
+        return stored
+    return count_image_parts(record.get("request_params"))
+
+
+def _convert_record_to_response(record: Dict[str, Any]) -> LLMRequestHistoryResponse:
+    """将请求记录字典转换为响应模型"""
+    return LLMRequestHistoryResponse(
+        request_id=record.get("request_id", ""),
+        timestamp_ms=record.get("timestamp", 0),
+        profile_name=record.get("profile_name", ""),
+        model_name=record.get("model_name", ""),
+        request_params=record.get("request_params", {}),
+        response_content=record.get("response_content"),
+        reasoning_content=record.get("reasoning_content"),
+        tool_calls=record.get("tool_calls"),
+        usage=_convert_usage(record.get("usage")),
+        cost=record.get("cost", 0.0),
+        success=record.get("success", True),
+        error=record.get("error"),
+        latency_ms=record.get("latency_ms", 0),
+        cache_hit_tokens=int(record.get("cache_hit_tokens") or 0),
+        cache_miss_tokens=int(record.get("cache_miss_tokens") or 0),
+        reasoning_tokens=_extract_reasoning_tokens(record.get("usage")),
+        usage_raw_json=record.get("usage_raw_json"),
+    )

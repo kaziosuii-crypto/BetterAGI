@@ -1,0 +1,764 @@
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.Core.Recognition;
+using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.Core.Recognition.ONNX;
+using BetterGenshinImpact.Core.Recognition.OpenCv;
+using BetterGenshinImpact.GameTask.AutoFight.Assets;
+using BetterGenshinImpact.GameTask.AutoFight.Config;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Model;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.Helpers;
+using BetterGenshinImpact.Service;
+using Compunet.YoloSharp;
+using Compunet.YoloSharp.Data;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using OpenCvSharp;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using static BetterGenshinImpact.GameTask.Common.TaskControl;
+
+namespace BetterGenshinImpact.GameTask.AutoFight.Model;
+
+/// <summary>
+/// 战斗场景
+/// </summary>
+public class CombatScenes : IDisposable
+{
+    /// <summary>
+    /// 当前配队
+    /// </summary>
+    private Avatar[] Avatars { set; get; } = [];
+
+    public int AvatarCount => Avatars.Length;
+
+    /// <summary>
+    /// 最近一次识别出的出战角色编号，从1开始，-1表示未识别
+    /// </summary>
+    public int LastActiveAvatarIndex { get; set; } = -1;
+
+    private int _lastTrySwitchTargetIndex = -1;
+
+    internal bool UpdateTrySwitchTarget(int targetIndex)
+    {
+        var targetChanged = _lastTrySwitchTargetIndex != targetIndex;
+        _lastTrySwitchTargetIndex = targetIndex;
+        return targetChanged;
+    }
+
+    public MultiGameStatus? CurrentMultiGameStatus { set; get; }
+
+    private readonly BgiYoloPredictor _predictor;
+    private readonly bool _ownsPredictor;
+
+    private readonly AutoFightAssets _autoFightAssets;
+
+    private readonly ILogger _logger;
+
+    /// <summary>
+    /// 识别队伍、截图、切换角色所用的运行环境
+    /// </summary>
+    private readonly GameRuntime _runtime;
+
+    /// <summary>
+    /// 配置根，未显式传入自动战斗配置时从这里取
+    /// </summary>
+    private readonly AllConfig _config;
+
+    /// <summary>
+    /// 运行环境的画面信息（即 <see cref="GameRuntime.SystemInfo"/>）
+    /// </summary>
+    private readonly ISystemInfo _systemInfo;
+
+    /// <summary>
+    /// 本战斗场景所在的运行环境，供持有场景的条件求值、战斗指令等取用同一个运行环境
+    /// </summary>
+    public GameRuntime Runtime => _runtime;
+
+    /// <summary>
+    /// 创建战斗场景
+    /// </summary>
+    /// <param name="runtime">识别队伍、截图、切换角色所用的运行环境</param>
+    /// <param name="config">配置根</param>
+    /// <param name="predictor">角色侧面头像分类器，不传时内部创建并负责释放</param>
+    /// <param name="autoFightAssets">自动战斗素材，不传时按运行环境的画面尺寸获取</param>
+    /// <param name="logger">日志，不传时使用任务公共日志</param>
+    public CombatScenes(GameRuntime runtime, AllConfig config, BgiYoloPredictor? predictor = null, AutoFightAssets? autoFightAssets = null, ILogger? logger = null)
+    {
+        _runtime = runtime;
+        _config = config;
+        if (predictor == null)
+        {
+            _predictor = App.ServiceProvider.GetRequiredService<BgiOnnxFactory>().CreateYoloPredictor(BgiOnnxModel.BgiAvatarSide);
+            _ownsPredictor = true;
+        }
+        else
+        {
+            _predictor = predictor;
+            _ownsPredictor = false;
+        }
+        _systemInfo = runtime.SystemInfo;
+        var captureRect = _systemInfo.ScaleMax1080PCaptureRect;
+        _autoFightAssets = autoFightAssets ?? AutoFightAssets.Get(captureRect.Width, captureRect.Height);    // todo BaseAssets重构后直接由systemInfo构建，省去传入？
+        if (logger == null)
+        {
+            _logger = TaskControl.Logger;
+        }
+        else
+        {
+            _logger = logger;
+        }
+    }
+
+    public int ExpectedTeamAvatarNum { get; private set; } = 4;
+
+    /// <summary>
+    /// 获取一个只读的Avatars
+    /// </summary>
+    /// <returns>Avatars</returns>
+    public ReadOnlyCollection<Avatar> GetAvatars()
+    {
+        return Avatars.AsReadOnly();
+    }
+
+
+    /// <summary>
+    /// 通过YOLO分类器识别队伍内角色
+    /// </summary>
+    /// <param name="imageRegion">完整游戏画面的捕获截图</param>
+    public CombatScenes InitializeTeam(ImageRegion imageRegion, AutoFightConfig? autoFightConfig = null)
+    {
+        if (autoFightConfig == null)
+        {
+            autoFightConfig = _config.AutoFightConfig;
+        }
+
+        AssertUtils.CheckGameResolution(_runtime);
+        // 优先取配置
+        if (!string.IsNullOrEmpty(autoFightConfig.TeamNames))
+        {
+            InitializeTeamFromConfig(autoFightConfig.TeamNames, autoFightConfig);
+            return this;
+        }
+
+
+        // 判断联机状态
+        CurrentMultiGameStatus = PartyAvatarSideIndexHelper.DetectedMultiGameStatus(imageRegion, _autoFightAssets, _logger);
+        // 队伍角色编号和侧面头像位置
+        var (avatarIndexRectList, avatarSideIconRectList) = PartyAvatarSideIndexHelper.GetAllIndexRects(imageRegion, CurrentMultiGameStatus, _logger, _systemInfo);
+        ExpectedTeamAvatarNum = avatarIndexRectList.Count;
+
+        // 识别队伍
+        var names = new string[avatarSideIconRectList.Count];
+        var displayNames = new string[avatarSideIconRectList.Count];
+        try
+        {
+            for (var i = 0; i < avatarSideIconRectList.Count; i++)
+            {
+                using var ra = imageRegion.DeriveCrop(avatarSideIconRectList[i]);
+                try
+                {
+                    var pair = ClassifyAvatarCnName(ra.CacheImage, i + 1);
+                    names[i] = pair.Item1;
+                    if (!string.IsNullOrEmpty(pair.Item2))
+                    {
+                        var costumeName = pair.Item2;
+                        if (_autoFightAssets.AvatarCostumeMap.TryGetValue(costumeName, out string? name))
+                        {
+                            costumeName = name;
+                        }
+
+                        displayNames[i] = $"{pair.Item1}({costumeName})";
+                    }
+                    else
+                    {
+                        displayNames[i] = pair.Item1;
+                    }
+                }
+                catch (Exception e)
+                {
+                    _logger.LogWarning(e.Message);
+                    // 失败则使用 OCR 兜底
+                    var s = _systemInfo.AssetScale;
+                    var indexRect = avatarIndexRectList[i];
+                    using var ra2 = imageRegion.DeriveCrop(new Rect(indexRect.X - (int)(240 * s), indexRect.Y - indexRect.Height, (int)(240 * s), indexRect.Height * 3));
+                    var rName = ra2.Find(RecognitionObject.OcrThis);
+                    var name = StringUtils.ExtractChinese(rName.Text);
+                    if (IsGenshinAvatarName(name))
+                    {
+                        names[i] = name;
+                        displayNames[i] = name;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("OCR识别第{Index}位角色，结果{Text}，视为未知角色", i + 1, rName.Text);
+                        names[i] = "未知角色";
+                        displayNames[i] = "未知角色";
+                    }
+                }
+
+            }
+
+            _logger.LogInformation("识别到的队伍角色:{Text}", string.Join(",", displayNames));
+            Avatars = BuildAvatars([.. names], null, avatarIndexRectList, autoFightConfig);
+        }
+        catch (Exception e) // todo 此处catch把错误吞了不便排查
+        {
+            _logger.LogWarning(e.Message);
+        }
+
+        return this;
+    }
+
+    /// <summary>
+    /// 静默模式下的队伍识别（用于后台挂件）
+    /// </summary>
+    public CombatScenes InitializeTeamSilent(ImageRegion imageRegion, AutoFightConfig? autoFightConfig = null)
+    {
+        try
+        {
+            if (autoFightConfig == null)
+            {
+                autoFightConfig = _config.AutoFightConfig;
+            }
+
+            // 优先取配置
+            if (!string.IsNullOrEmpty(autoFightConfig.TeamNames))
+            {
+                InitializeTeamFromConfig(autoFightConfig.TeamNames, autoFightConfig);
+                return this;
+            }
+
+            // 使用 NullLogger 彻底屏蔽底层工具类的日志输出
+            var nullLogger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
+            CurrentMultiGameStatus = PartyAvatarSideIndexHelper.DetectedMultiGameStatus(imageRegion, _autoFightAssets, nullLogger);
+            var (avatarIndexRectList, avatarSideIconRectList) = PartyAvatarSideIndexHelper.GetAllIndexRects(imageRegion, CurrentMultiGameStatus, nullLogger, _systemInfo);
+            ExpectedTeamAvatarNum = avatarIndexRectList.Count;
+            
+            var names = new string[avatarSideIconRectList.Count];
+            for (var i = 0; i < avatarSideIconRectList.Count; i++)
+            {
+                using var ra = imageRegion.DeriveCrop(avatarSideIconRectList[i]);
+                var pair = ClassifyAvatarCnName(ra.CacheImage, i + 1);
+                names[i] = pair.Item1;
+            }
+            Avatars = BuildAvatars([.. names], null, avatarIndexRectList, autoFightConfig);
+        }
+        catch
+        {
+            // 静默模式下完全不抛出、不记录异常
+        }
+        return this;
+    }
+
+
+    /// <summary>
+    /// 这个个方法主要用于在切人判断有误的情况下，且能够找到预期数量的角色编号框。此时只有两种情况
+    /// 1. A草露进度条导致角色编号框偏移，B退队后偏移不变，C独立地图传送后偏移还原
+    /// 2. 地图边缘环境，导致角色编号框切人判断失效
+    /// 此方法必须在判定一定存在 ExpectedTeamAvatarNum 数量的 IndexRectList 的情况下才能使用
+    /// </summary>
+    /// <param name="imageRegion"></param>
+    /// <returns>false:存在 IndexRectList 的情况下使用此方法，返回false的时候很有可能处于地图边缘环境下</returns>
+    public bool RefreshTeamAvatarIndexRectList(ImageRegion imageRegion)
+    {
+        // 只用新方法判断
+        try
+        {
+            var (avatarIndexRectList, _) = PartyAvatarSideIndexHelper.GetAllIndexRectsNew(imageRegion, CurrentMultiGameStatus!, _logger, _systemInfo);
+            if (avatarIndexRectList.Count != ExpectedTeamAvatarNum)
+            {
+                _logger.LogWarning("重新识别到的队伍角色数量与之前不一致，之前{Old}个，现在{New}个", ExpectedTeamAvatarNum, avatarIndexRectList.Count);
+                return false;
+            }
+
+            for (var i = 0; i < ExpectedTeamAvatarNum; i++)
+            {
+                Avatars[i].IndexRect = avatarIndexRectList[i];
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "使用新方法获取角色编号位置失败");
+            _logger.LogWarning("[重新识别角色编号位置]使用新方法获取角色编号位置失败，原因：" + ex.Message);
+            return false;
+        }
+    }
+
+    // public static List<Rect> FindAvatarIndexRectList(ImageRegion imageRegion)
+    // {
+    //     var i1 = imageRegion.Find(ElementAssets.Instance.Index1);
+    //     var i2 = imageRegion.Find(ElementAssets.Instance.Index2);
+    //     var i3 = imageRegion.Find(ElementAssets.Instance.Index3);
+    //     var i4 = imageRegion.Find(ElementAssets.Instance.Index4);
+    //     var curr = imageRegion.Find(ElementAssets.Instance.CurrentAvatarThreshold);
+    //     // Debug.WriteLine($"i1:{i1.X},{i1.Y},{i1.Width},{i1.Height}; i2:{i2.X},{i2.Y},{i2.Width},{i2.Height}; i3:{i3.X},{i3.Y},{i3.Width},{i3.Height}; i4:{i4.X},{i4.Y},{i4.Width},{i4.Height}; curr:{curr.X},{curr.Y},{curr.Width},{curr.Height}");
+    //     return null;
+    // }
+
+
+    public (string, string) ClassifyAvatarCnName(Image<Rgb24> img, int index)
+    {
+        var className = ClassifyAvatarName(img, index);
+
+        var nameEn = className;
+        var costumeName = "";
+        var i = className.IndexOf("Costume", StringComparison.Ordinal);
+        if (i > 0)
+        {
+            nameEn = className[..i];
+            costumeName = className[(i + 7)..];
+        }
+
+        var avatar = DefaultAutoFightConfig.CombatAvatarNameEnMap[nameEn];
+        return (avatar.Name, costumeName);
+    }
+
+    public string ClassifyAvatarName(Image<Rgb24> img, int index)
+    {
+        SpeedTimer speedTimer = new();
+        speedTimer.Record("角色侧面头像图像转换");
+        var result = _predictor.Predictor.Classify(img);
+        speedTimer.Record("角色侧面头像分类识别");
+        Debug.WriteLine($"角色侧面头像识别结果：{result}");
+        speedTimer.DebugPrint();
+        var topClass = result.GetTopClass();
+        if (topClass.Name.Name.StartsWith("Qin") || topClass.Name.Name.Contains("Costume"))
+        {
+            // 降低琴和衣装角色的识别率要求
+            if (topClass.Confidence < 0.51)
+            {
+                img.SaveAsPng(Global.Absolute($@"log\avatar_side_classify_error.png"));
+                throw new Exception(
+                    $"无法识别第{index}位角色，置信度{topClass.Confidence:F1}，结果：{topClass.Name.Name}。请重新阅读 BetterGI 文档中的《快速上手》！");
+            }
+        }
+        else
+        {
+            if (topClass.Confidence < 0.7)
+            {
+                img.SaveAsPng(Global.Absolute($@"log\avatar_side_classify_error.png"));
+                throw new Exception(
+                    $"无法识别第{index}位角色，置信度{topClass.Confidence:F1}，结果：{topClass.Name.Name}。请重新阅读 BetterGI 文档中的《快速上手》！");
+            }
+        }
+
+        return topClass.Name.Name;
+    }
+
+    private void InitializeTeamFromConfig(string teamNames, AutoFightConfig autoFightConfig)
+    {
+        var names = teamNames.Split(["，", ","], StringSplitOptions.TrimEntries);
+        if (names.Length != 4)
+        {
+            throw new Exception($"强制指定队伍角色数量不正确，必须是4个，当前{names.Length}个");
+        }
+
+        // 别名转换为标准名称
+        for (var i = 0; i < names.Length; i++)
+        {
+            names[i] = DefaultAutoFightConfig.AvatarAliasToStandardName(names[i]);
+        }
+
+        _logger.LogInformation("强制指定队伍角色:{Text}", string.Join(",", names));
+        autoFightConfig.TeamNames = string.Join(",", names);
+        Avatars = BuildAvatars([.. names], autoFightConfig: autoFightConfig);
+    }
+
+    public bool CheckTeamInitialized()
+    {
+        if (Avatars.Length != ExpectedTeamAvatarNum)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+
+    private Avatar[] BuildAvatars(List<string> names, List<Rect>? nameRects = null, List<Rect>? avatarIndexRectList = null, AutoFightConfig? autoFightConfig = null)
+    {
+        if (autoFightConfig == null)
+        {
+            autoFightConfig = _config.AutoFightConfig;
+        }
+        var cdConfig = autoFightConfig.ActionSchedulerByCd;
+        if (avatarIndexRectList == null && ExpectedTeamAvatarNum == 4)
+        {
+            avatarIndexRectList = [.. _autoFightAssets.AvatarIndexRectList];
+        }
+
+        if (avatarIndexRectList == null)
+        {
+            throw new Exception("联机状态下，此方法必须传入队伍角色编号位置信息");
+        }
+
+        var namesCount = names.Count;
+        var avatars = new Avatar[namesCount];
+        for (var i = 0; i < namesCount; i++)
+        {
+            var nameRect = nameRects?[i] ?? default;
+            // 根据手动写的出招表来优化CD
+            var cd = Avatar.ParseActionSchedulerByCd(names[i], cdConfig);
+            avatars[i] = new Avatar(_runtime, _config, this, names[i], i + 1, nameRect, cd ?? -1)
+            {
+                IndexRect = avatarIndexRectList[i]
+            };
+        }
+
+        return avatars;
+    }
+
+    /// <summary>
+    /// 更新角色手动设置的CD
+    /// </summary>
+    /// <param name="cdConfig">配置字符串</param>
+    /// <returns>返回配置中有效的角色名</returns>
+    public List<string> UpdateActionSchedulerByCd(string cdConfig)
+    {
+        List<string> names = [];
+        foreach (var t in Avatars)
+        {
+            var mCd = Avatar.ParseActionSchedulerByCd(t.Name, cdConfig);
+            t.ManualSkillCd = mCd ?? -1;
+            if (mCd is null) continue;
+            names.Add(t.Name);
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// 以给定的队伍成员实例化战斗场景，供跨任务携带 Avatar 实例时接管复用（如自动连招建树会话）
+    /// 会先重新识别当前游戏内队伍并校验与给定成员一致（与顺序无关），不一致或识别失败抛异常；
+    /// 校验通过后用给定成员替换识别结果中的队伍（修正其 CombatScenes 反向引用与运行环境），并同步编号框位置
+    /// </summary>
+    /// <param name="runtime">本次运行使用的运行环境，接管的成员改为绑定到它</param>
+    /// <param name="config">配置根</param>
+    /// <param name="avatars">要接管的队伍成员</param>
+    public static CombatScenes FromAvatars(GameRuntime runtime, AllConfig config, Avatar[] avatars)
+    {
+        // 复用识别重试逻辑获取当前队伍场景，识别出的成员被替换丢弃，场景本身作为接管载体
+        var scenes = GetCombatScenesWithRetry(runtime, config);
+        var currentNames = scenes.GetAvatars().Select(a => a.Name).ToList();
+        var takenNames = avatars.Select(a => a.Name).ToList();
+        var missing = takenNames.Except(currentNames).ToList();
+        var extra = currentNames.Except(takenNames).ToList();
+        if (missing.Count > 0 || extra.Count > 0)
+        {
+            scenes.Dispose();
+            throw new Exception(
+                $"给定队伍成员与当前游戏内队伍不一致（给定：{string.Join("、", takenNames)}；当前：{string.Join("、", currentNames)}）");
+        }
+
+        // 编号框位置取自本次识别，接管的建树实例可能已过期
+        var indexRects = scenes.GetAvatars().ToDictionary(a => a.Name, a => a.IndexRect);
+        scenes.Avatars = avatars;
+        foreach (var avatar in avatars)
+        {
+            // 修正 Avatar 持有的场景反向引用，避免运行期间访问到已丢弃的建树场景；
+            // 运行环境同时改为本次运行的，建树会话的成员可能是在另一个运行环境里识别的
+            avatar.AttachTo(scenes, runtime);
+            avatar.IndexRect = indexRects[avatar.Name];
+            // 复位跨 run 残留的就绪缓存（Avatar 实例随会话携带，旧缓存对新战斗不再可信）
+            avatar.IsBurstReady = false;
+        }
+
+        return scenes;
+    }
+
+    /// <summary>
+    /// 截屏识别队伍角色并初始化战斗场景，失败重试（最多 5 次，间隔 1 秒），全部失败抛异常
+    /// </summary>
+    /// <param name="runtime">截图与识别所用的运行环境</param>
+    /// <param name="config">配置根</param>
+    public static CombatScenes GetCombatScenesWithRetry(GameRuntime runtime, AllConfig config)
+    {
+        const int maxRetries = 5;
+        const int retryDelayMs = 1000;
+        var allConfig = config;
+
+        for (var attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            using var imageRegion = runtime.CaptureToRectArea();
+            var combatScenes = new CombatScenes(runtime, allConfig).InitializeTeam(imageRegion);
+            if (combatScenes.CheckTeamInitialized())
+            {
+                return combatScenes;
+            }
+
+            if (attempt < maxRetries)
+            {
+                Thread.Sleep(retryDelayMs);
+            }
+        }
+
+        throw new Exception("识别队伍角色失败（已重试 5 次）");
+    }
+
+    public void BeforeTask(CancellationToken ct)
+    {
+        for (var i = 0; i < AvatarCount; i++)
+        {
+            Avatars[i].Ct = ct;
+        }
+    }
+
+    public void AfterTask()
+    {
+        // 释放所有按键
+        InputHub.ReleaseAll();
+
+        var mwk = SelectAvatar("玛薇卡");
+        if (mwk != null)
+        {
+            foreach (var avatar in Avatars)
+            {
+                if (avatar.Name != "玛薇卡")
+                {
+                    avatar.Switch();
+                }
+            }
+        }
+    }
+
+    public Avatar? SelectAvatar(string name)
+    {
+        return Avatars.FirstOrDefault(avatar => avatar.Name.Equals(name));
+    }
+
+    /// <summary>
+    /// 使用编号切换角色
+    /// </summary>
+    /// <param name="avatarIndex">从1开始</param>
+    /// <returns></returns>
+    public Avatar SelectAvatar(int avatarIndex)
+    {
+        if (avatarIndex < 1 || avatarIndex > AvatarCount)
+        {
+            _logger.LogError("切换角色编号错误，当前角色数量{Count}，编号{Index}", AvatarCount, avatarIndex);
+            throw new Exception("不存在的角色编号");
+        }
+
+        return Avatars[avatarIndex - 1];
+    }
+
+    /// <summary>
+    /// 获取当前出战角色名
+    /// 不考虑重新刷新编号框位置
+    /// 不推荐使用
+    /// </summary>
+    /// <param name="force"></param>
+    /// <param name="region"></param>
+    /// <param name="ct"></param>
+    /// <returns></returns>
+    public string? CurrentAvatar(bool force = false, ImageRegion? region = null,
+        CancellationToken ct = default)
+    {
+        if (!force && LastActiveAvatarIndex > 0)
+        {
+            return Avatars[LastActiveAvatarIndex - 1].Name;
+        }
+
+        using var imageRegion = region ?? _runtime.CaptureToRectArea();
+
+        var rectArray = Avatars.Select(t => t.IndexRect).ToArray();
+        int index = PartyAvatarSideIndexHelper.GetAvatarIndexIsActiveWithContext(imageRegion, rectArray, new AvatarActiveCheckContext());
+
+        if (index > 0)
+        {
+            LastActiveAvatarIndex = index;
+            return Avatars[LastActiveAvatarIndex - 1].Name;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 推荐使用
+    /// 失败后自动刷新编号框位置
+    /// </summary>
+    /// <param name="imageRegion"></param>l
+    /// <param name="context"></param>
+    /// <returns></returns>
+    public int GetActiveAvatarIndex(ImageRegion imageRegion, AvatarActiveCheckContext context)
+    {
+        var rectArray = Avatars.Select(t => t.IndexRect).ToArray();
+        int index = PartyAvatarSideIndexHelper.GetAvatarIndexIsActiveWithContext(imageRegion, rectArray, context);
+
+        if (index > 0)
+        {
+            LastActiveAvatarIndex = index;
+            return index;
+        }
+        else
+        {
+            // 多次识别失败则尝试刷新角色编号位置
+            // 应对草露问题
+            if (context.TotalCheckFailedCount % 3 == 0 && context.TotalCheckFailedCount > 0 && context.TotalCheckFailedCount < 10)
+            {
+                // 失败多次，识别是否存在满足预期的编号框
+                if (PartyAvatarSideIndexHelper.CountIndexRect(imageRegion) == Avatars.Length)
+                {
+                    bool res = RefreshTeamAvatarIndexRectList(imageRegion);
+                    _logger.LogWarning("多次识别出战角色失败，尝试刷新角色编号位置，刷新结果:{Result}", res ? "成功" : "失败");
+                    imageRegion.SrcMat.SaveImage(Global.Absolute("log\\refresh_avatar_index_rect.png"));
+                    if (res)
+                    {
+                        context.TotalCheckFailedCount = 0;
+                    }
+                }
+            }
+        }
+
+
+        return -1;
+    }
+
+
+    #region OCR识别队伍（已弃用）
+
+    /// <summary>
+    /// 通过OCR识别队伍内角色
+    /// </summary>
+    /// <param name="content">完整游戏画面的捕获截图</param>
+    [Obsolete]
+    public CombatScenes InitializeTeamOldOcr(CaptureContent content)
+    {
+        // 优先取配置
+        if (!string.IsNullOrEmpty(_config.AutoFightConfig.TeamNames))
+        {
+            InitializeTeamFromConfig(_config.AutoFightConfig.TeamNames, _config.AutoFightConfig);
+            return this;
+        }
+
+        // 剪裁出队伍区域
+        var teamRa = content.CaptureRectArea.DeriveCrop(_autoFightAssets.TeamRectNoIndex);
+        // 过滤出白色
+        var hsvFilterMat =
+            OpenCvCommonHelper.InRangeHsv(teamRa.SrcMat, new Scalar(0, 0, 210), new Scalar(255, 30, 255));
+
+        // 识别队伍内角色
+        var result = OcrFactory.Paddle.OcrResult(hsvFilterMat);
+        ParseTeamOcrResult(result, teamRa);
+        return this;
+    }
+
+    [Obsolete]
+    private void ParseTeamOcrResult(OcrResult result, ImageRegion rectArea)
+    {
+        List<string> names = [];
+        List<Rect> nameRects = [];
+        foreach (var item in result.Regions)
+        {
+            var name = StringUtils.ExtractChinese(item.Text);
+            name = ErrorOcrCorrection(name);
+            if (IsGenshinAvatarName(name))
+            {
+                names.Add(name);
+                nameRects.Add(item.Rect.BoundingRect());
+            }
+        }
+
+        if (names.Count != 4)
+        {
+            _logger.LogWarning("识别到的队伍角色数量不正确，当前识别结果:{Text}", string.Join(",", names));
+        }
+
+        if (names.Count == 3)
+        {
+            // 流浪者特殊处理
+            // 4人以上的队伍，不支持流浪者的识别
+            var wanderer = rectArea.Find(RecognitionAssets.Get("AutoFight", "WandererIcon", rectArea));
+            if (wanderer.IsEmpty())
+            {
+                wanderer = rectArea.Find(RecognitionAssets.Get("AutoFight", "WandererIconNoActive", rectArea));
+            }
+
+            if (wanderer.IsEmpty())
+            {
+                // 补充识别流浪者
+                _logger.LogWarning("二次尝试识别失败，当前识别结果:{Text}", string.Join(",", names));
+            }
+            else
+            {
+                names.Clear();
+                foreach (var item in result.Regions)
+                {
+                    var name = StringUtils.ExtractChinese(item.Text);
+                    name = ErrorOcrCorrection(name);
+                    if (IsGenshinAvatarName(name))
+                    {
+                        names.Add(name);
+                        nameRects.Add(item.Rect.BoundingRect());
+                    }
+
+                    var rect = item.Rect.BoundingRect();
+                    if (rect.Y > wanderer.Y && wanderer.Y + wanderer.Height > rect.Y + rect.Height &&
+                        !names.Contains("流浪者"))
+                    {
+                        names.Add("流浪者");
+                        nameRects.Add(item.Rect.BoundingRect());
+                    }
+                }
+
+                if (names.Count != 4)
+                {
+                    _logger.LogWarning("图像识别到流浪者，但识别队内位置信息失败");
+                }
+            }
+        }
+
+        _logger.LogInformation("识别到的队伍角色:{Text}", string.Join(",", names));
+        Avatars = BuildAvatars(names, nameRects);
+    }
+
+    private bool IsGenshinAvatarName(string name)
+    {
+        if (DefaultAutoFightConfig.CombatAvatarNames.Contains(name))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 对OCR识别结果进行纠错
+    /// TODO 还剩下单字名称（魈、琴）无法识别到的问题
+    /// </summary>
+    /// <param name="name"></param>
+    /// <returns></returns>
+    [Obsolete]
+    public string ErrorOcrCorrection(string name)
+    {
+        if (name.Contains("纳西"))
+        {
+            return "纳西妲";
+        }
+
+        return name;
+    }
+
+    #endregion OCR识别队伍（已弃用）
+
+    public void Dispose()
+    {
+        if (_ownsPredictor)
+        {
+            _predictor.Dispose();
+        }
+    }
+}

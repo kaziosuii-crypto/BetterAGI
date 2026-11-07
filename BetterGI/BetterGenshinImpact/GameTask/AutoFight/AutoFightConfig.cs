@@ -1,0 +1,245 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using System;
+
+namespace BetterGenshinImpact.GameTask.AutoFight;
+
+
+
+
+
+/// <summary>
+/// 自动战斗配置
+/// </summary>
+[Serializable]
+public partial class AutoFightConfig : ObservableObject
+{
+    [ObservableProperty] private string _strategyName = "根据队伍自动选择";
+
+    /// <summary>
+    /// 英文逗号分割 强制指定队伍角色
+    /// </summary>
+    [ObservableProperty] private string _teamNames = "";
+
+    /// <summary>
+    /// 检测战斗结束
+    /// </summary>
+    [ObservableProperty]
+    private bool _fightFinishDetectEnabled = true;
+    /// <summary>
+    /// 根据技能CD优化出招人员
+    /// 根据填入人或人和cd，来决定当此人元素战技cd未结束时，跳过此人出招，来优化战斗流程，可填入人名或人名数字（用逗号分隔），
+    /// 多种用分号分隔，例如:白术;钟离,12;，如果人名，则用内置cd检查，如果是人名和数字，则把数字当做出招cd(秒)。
+    /// </summary>
+    [ObservableProperty] private string _actionSchedulerByCd = "";
+    /// <summary>
+    /// 只拾取精英掉落
+    /// Closed ：关闭功能
+    /// AllowAutoPickupForNonElite: 非精英允许自动拾取：战斗过程中掉落脚下的可以自动拾取，但不会执行万叶拾取和拾取配置逻辑。
+    /// DisableAutoPickupForNonElite: 非精英关闭拾取：战斗过程中掉落到脚下的也不会自动拾取。
+    /// </summary>
+    [ObservableProperty] private string _onlyPickEliteDropsMode = "Closed";
+    [Serializable]
+    public partial class FightFinishDetectConfig : ObservableObject
+    {
+        /// <summary>
+        /// 快速检查战斗结束（默认关闭）：完成一轮动作后，如果满足条件，则触发一次战斗结束检查。
+        /// </summary>
+        [ObservableProperty]
+        private bool _fastCheckEnabled = false;
+        
+        /// <summary>
+        /// 旋转寻找敌人位置
+        /// </summary>
+        [ObservableProperty]
+        private bool _rotateFindEnemyEnabled = false;
+        
+        /// <summary>
+        /// 快速检查战斗结束的参数，填写数字（秒）时距离上次检查超过该时间则触发检查，填写人名时对应角色动作后触发检查。多项时使用分号分隔，格式如5或5;白术;
+        /// </summary>
+        [ObservableProperty]
+        private string _fastCheckParams = "";
+        
+        /// <summary>
+        /// 切人后再执行战斗结束检查：将触发战斗结束检查的时机调整为切人后，无需等待上一个动作后摇。目前仅 JSON 策略下生效。
+        /// </summary>
+        [ObservableProperty]
+        private bool _checkAfterSwitchAvatar = false;
+        
+        /// <summary>
+        /// 触发战斗结束检查时，先等待该延时以确保角色动作后摇结束。也可为角色单独指定延时，格式如0.4或0.4;钟离,1.5
+        /// </summary>
+        [ObservableProperty]
+        private string _checkEndDelay = "0.4;钟离,1.4;";
+
+        /// <summary>
+        /// 按下切换队伍后去检查屏幕色块的延时，默认为0.45秒。若出现无法结束战斗可以适当提高这个值，比如0.75。但不要太大，确保这个延时不会真的把队伍配置界面切出来。
+        /// </summary>
+        [ObservableProperty]
+        private string _beforeDetectDelay = "0.4";
+        
+        /// <summary>
+        /// 旋转寻找敌人位置的旋转因子，默认为12（范围1-13），越大越快。
+        /// </summary>
+        [ObservableProperty]
+        private int _rotaryFactor = 12;
+        
+        /// <summary>
+        /// 是否是第一次检查和面敌。
+        /// </summary>
+        [ObservableProperty]
+        private bool _isFirstCheck = false;
+        
+        /// <summary>
+        /// 是有元素爆发前检查战斗结束
+        /// </summary>
+        [ObservableProperty]
+        private bool _checkBeforeBurst = false;
+
+        /// <summary>
+        /// 敌人可见时跳过战斗结束检查：检测到敌人血条时跳过战斗结束检查。与旋转寻找敌人位置互斥。
+        /// </summary>
+        [ObservableProperty]
+        private bool _skipFightEndCheckWhenEnemyVisible = false;
+
+        /// <summary>
+        /// 开战后一段时间阻断战斗结束检查（秒）：默认0不阻断；大于0时，开战后该时间内的战斗结束检查直接视为战斗未结束。
+        /// </summary>
+        [ObservableProperty]
+        private double _blockCheckBeforeBattleSeconds = 0;
+
+        /// <summary>
+        /// 派蒙辅助检测：按L后当派蒙头像可见时提前跳出战斗结束检测
+        /// </summary>
+        [ObservableProperty]
+        private bool _paimonEndCheckEnabled = false;
+
+        /// <summary>
+        /// 派蒙辅助检测延时（秒），默认为0.2秒
+        /// </summary>
+        [ObservableProperty]
+        private double _paimonEndCheckDelay = 0.2;
+
+        /// <summary>
+        /// 与"敌人可见时跳过战斗结束检查"互斥：开启旋转寻找敌人时关闭跳过检查，
+        /// 避免跳过分支不清零旋转计数导致战斗被误判结束。
+        /// </summary>
+        partial void OnRotateFindEnemyEnabledChanged(bool value)
+        {
+            if (value) SkipFightEndCheckWhenEnemyVisible = false;
+        }
+
+        /// <summary>
+        /// 与"旋转寻找敌人位置"互斥：开启跳过战斗结束检查时关闭旋转寻找敌人。
+        /// </summary>
+        partial void OnSkipFightEndCheckWhenEnemyVisibleChanged(bool value)
+        {
+            if (value) RotateFindEnemyEnabled = false;
+        }
+    }
+    /// <summary>
+    /// 战斗结束相关配置
+    /// </summary>   
+    [ObservableProperty]
+    private FightFinishDetectConfig _finishDetectConfig = new();
+    
+    /// <summary>
+    /// 战斗结束后光柱扫描掉落物
+    /// </summary>
+    [ObservableProperty]
+    private bool _pickDropsAfterFightEnabled = true;
+
+    /// <summary>
+    /// 战斗结束后光柱扫描掉落物的持续秒数
+    /// </summary>
+    [ObservableProperty]
+    private int _pickDropsAfterFightSeconds = 15;
+
+    /// <summary>
+    /// 拾取战斗人次阈值,当战斗人次小于一定次数，就结束战斗情况下，不触发拾取掉落物和万叶拾取后拾取，只有不小于2时才生效。
+    /// </summary>
+    [ObservableProperty]
+    private int? _battleThresholdForLoot;
+
+    /// <summary>
+    /// 战斗结束后，如果存在枫原万叶，则使用该角色捡材料
+    /// </summary>
+    [ObservableProperty]
+    private bool _kazuhaPickupEnabled = true;
+    
+    [ObservableProperty]
+    private bool _qinDoublePickUp = false;
+    
+    [ObservableProperty]
+    private string _guardianAvatar = string.Empty;
+    
+    [ObservableProperty]
+    private bool _guardianCombatSkip = false;
+    
+    [ObservableProperty]
+    private bool _guardianAvatarHold = false;
+    
+    [ObservableProperty]
+    private bool _burstEnabled = false;
+    
+    /// <summary>
+    /// 战斗结束后，如果不存在万叶，则切换至存在万叶的队伍（基于开启万叶拾取情况下）
+    /// </summary>
+    [ObservableProperty]
+    private string _kazuhaPartyName = "";
+    
+    [ObservableProperty]
+    private bool _swimmingEnabled = true;
+
+    /// <summary>
+    /// 基于经验值判断是否执行战后拾取（检测到精英怪经验值图标时才拾取）
+    /// </summary>
+    [ObservableProperty]
+    private bool _expBasedPickupEnabled = false;
+
+    /// <summary>
+    /// 战斗超时，单位秒
+    /// </summary>
+    [ObservableProperty]
+    private int _timeout = 120;
+
+    /// <summary>
+    /// 战斗中持续索敌：战斗过程中情况允许时持续尝试面朝敌人
+    /// </summary>
+    [ObservableProperty]
+    private bool _enableCombatTargeting = false;
+
+    /// <summary>
+    /// 脱锁等待时间（秒）：敌人不可见时等待一定时间后开始旋转索敌
+    /// </summary>
+    [ObservableProperty]
+    private double _lockLostWaitTime = 0.5;
+
+    /// <summary>
+    /// 索敌识别间隔（毫秒）
+    /// </summary>
+    [ObservableProperty]
+    private int _targetingDetectionInterval = 50;
+
+    /// <summary>
+    /// 伤害数字识别模式
+    /// </summary>
+    [ObservableProperty]
+    private DamageNumberRecognitionMode _damageNumberRecognitionMode = DamageNumberRecognitionMode.Color;
+
+    /// <summary>
+    /// 绘制识别结果位置：在遮罩窗口上显示血条、伤害数字等识别结果的边框
+    /// </summary>
+    [ObservableProperty]
+    private bool _drawRecognitionResults = true;
+
+}
+
+/// <summary>
+/// 伤害数字识别模式
+/// </summary>
+public enum DamageNumberRecognitionMode
+{
+    Disabled,
+    Ocr,
+    Color
+}

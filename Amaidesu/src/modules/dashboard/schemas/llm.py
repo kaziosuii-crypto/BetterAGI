@@ -1,0 +1,240 @@
+"""
+LLM 管理 Schema
+
+定义 LLM 用量统计和请求历史相关的数据模型。
+"""
+
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class TokenUsageSchema(BaseModel):
+    """Token 使用量"""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class LLMUsageStatsResponse(BaseModel):
+    """单个模型的用量统计响应"""
+
+    model_name: str
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_calls: int = 0
+    total_cost: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    # 缓存命中率（hit / (hit+miss)，0-1）；None 表示上游从未上报缓存用量
+    cache_hit_rate: Optional[float] = None
+    first_call_time: Optional[int] = None
+    last_call_time: Optional[int] = None
+    last_updated: Optional[int] = None
+    # 上下文窗口 token 总量（来自 [[llm_models]]）；0 = 未配置，前端隐藏水位
+    context_window: int = 0
+    # 最近一次调用的输入 token（上下文水位分子）；无记录时 None
+    last_call_prompt_tokens: Optional[int] = None
+
+
+class LLMContextSectionItemResponse(BaseModel):
+    """上下文分段内明细行（一条工具 / 一组同角色消息 / 一项技能）"""
+
+    name: str
+    tokens: int = 0
+
+
+class LLMContextSectionResponse(BaseModel):
+    """一个上下文分段（messages / mcp_tools / system_tools / skills / system 之一；旧记录可能是 tools）"""
+
+    key: str
+    tokens: int = 0
+    raw_tokens: int = 0
+    count: int = 0
+    items: List[LLMContextSectionItemResponse] = []
+
+
+class LLMContextBreakdownResponse(BaseModel):
+    """单个模型最近一次调用的上下文分段占用（"上下文水位"悬停明细数据源）"""
+
+    model_name: str
+    profile_name: str = ""
+    request_id: str = ""
+    timestamp_ms: Optional[int] = None
+    # 模型上下文窗口 token 总量；0 = 未配置（前端隐藏水位与剩余）
+    context_window: int = 0
+    # API 回报的输入 token 精确总数（分段展示的校准基准）
+    api_prompt_tokens: int = 0
+    calibrated: bool = False
+    sections: List[LLMContextSectionResponse] = []
+    # 窗口剩余（max(0, context_window - api_prompt_tokens)）；未配置窗口时 None
+    free_tokens: Optional[int] = None
+
+
+class LLMUsageSummaryResponse(BaseModel):
+    """所有模型的总费用摘要响应"""
+
+    total_cost: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_calls: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    # 缓存命中率（hit / (hit+miss)，0-1）；None 表示上游从未上报缓存用量
+    cache_hit_rate: Optional[float] = None
+    model_count: int = 0
+
+
+class LLMRequestHistoryResponse(BaseModel):
+    """单个 LLM 请求历史记录响应"""
+
+    request_id: str
+    timestamp_ms: int
+    # LLM 用途 profile 名（planner/replyer/vision/minecraft/simulator/...）；
+    # 与 LLMProviderConfig.client_type（客户端实现标识）概念不同
+    profile_name: str
+    model_name: str
+    request_params: Dict[str, Any] = {}
+    response_content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    usage: Optional[TokenUsageSchema] = None
+    cost: float = 0.0
+    success: bool = True
+    error: Optional[str] = None
+    latency_ms: int = 0
+    # 上游上报的缓存 token 明细；二者均为 0 表示上游未上报（≠零命中）
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    # 思考 token 数（OpenAI completion_tokens_details.reasoning_tokens）；None = 上游未上报
+    reasoning_tokens: Optional[int] = None
+    # 上游原始 usage 字典（JSON 字符串）；解析失败链路兜底，详情展开 JSON 查看
+    usage_raw_json: Optional[str] = None
+
+
+class LLMRequestHistoryListItem(BaseModel):
+    """历史列表行摘要；完整参数与响应正文经详情接口按行获取"""
+
+    request_id: str
+    timestamp_ms: int
+    profile_name: str
+    model_name: str
+    prompt_preview: str = ""
+    response_preview: str = ""
+    usage: Optional[TokenUsageSchema] = None
+    cost: float = 0.0
+    success: bool = True
+    error: Optional[str] = None
+    latency_ms: int = 0
+    # 上游上报的缓存 token 明细；二者均为 0 表示上游未上报（≠零命中）
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    reasoning_tokens: Optional[int] = None
+    usage_raw_json: Optional[str] = None
+    # 本次请求注入的截图数（写侧从消息图像片段统计）；0 不渲染徽标
+    image_count: int = 0
+
+
+class LLMHistoryListResponse(BaseModel):
+    """LLM 请求历史列表响应"""
+
+    items: List[LLMRequestHistoryListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class LLMHistoryStatisticsModelStats(BaseModel):
+    """按模型的统计"""
+
+    count: int = 0
+    total_tokens: int = 0
+    total_cost: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    # 缓存命中率（0-1）；None 表示窗口内上游从未上报缓存用量
+    cache_hit_rate: Optional[float] = None
+
+
+class LLMHistoryStatisticsResponse(BaseModel):
+    """LLM 请求历史统计响应"""
+
+    # cache 两列：上游未上报缓存用量时入库记 0，因此 0 可能代表"未上报"而非真实零命中
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    success_rate: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_cost: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    # 缓存命中率（0-1）；None 表示窗口内上游从未上报缓存用量
+    cache_hit_rate: Optional[float] = None
+    avg_latency_ms: float = 0.0
+    model_stats: Dict[str, LLMHistoryStatisticsModelStats] = {}
+    client_stats: Dict[str, int] = {}
+    time_range: Optional[Dict[str, Optional[int]]] = None
+
+
+class LLMUsageTrendPoint(BaseModel):
+    """单日用量聚合点（补零对齐后的连续时间轴）"""
+
+    date: str
+    timestamp_ms: int
+    total_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cost: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    cache_hit_rate: Optional[float] = None
+
+
+class LLMUsageTrendModelPoint(BaseModel):
+    """单日单模型用量聚合点（仅有数据的日子）"""
+
+    date: str
+    model_name: str
+    total_calls: int = 0
+    total_tokens: int = 0
+    cost: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    cache_hit_rate: Optional[float] = None
+
+
+class LLMUsageTrendsResponse(BaseModel):
+    """用量趋势响应（近 N 天逐日聚合）"""
+
+    days: int
+    points: List[LLMUsageTrendPoint] = []
+    model_points: List[LLMUsageTrendModelPoint] = []
+
+
+class LLMRequestStatsItem(BaseModel):
+    """单条请求的统计列（不含正文大字段，统计胶囊合批懒取专用）"""
+
+    model_name: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+
+
+class LLMRequestStatsBatchRequest(BaseModel):
+    """按 id 批量取请求统计的请求体（一次回看首屏可达数百个请求指针）"""
+
+    request_ids: List[str] = Field(..., min_length=1, max_length=500)
+
+
+class LLMRequestStatsBatchResponse(BaseModel):
+    """批量统计响应：id → 统计；未命中的 id 不在映射中"""
+
+    stats: Dict[str, LLMRequestStatsItem] = Field(default_factory=dict)

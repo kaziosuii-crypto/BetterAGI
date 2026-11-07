@@ -1,0 +1,21 @@
+{
+  "name": "laplace-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local LAPLACE Chat event relay: ingests bridge events, normalises them, and fans out to other services (WebSocket / SSE / webhook / HTTP).",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js --source mock",
+    "mock": "node src/index.js --source mock",
+    "demo": "node scripts/demo-client.mjs",
+    "test": "node --test --test-timeout=20000"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,24 @@
+<!-- sticky v1 | game: undertale | save: default | updated_at: 2026-11-06T19:52:12 | by: slow -->
+
+## key_binding
+up -> up
+down -> down
+left -> left
+right -> right
+z -> z
+x -> x
+c -> c
+shift -> shift
+back -> backspace
+
+## game_rules
+- [FACT] Dialogue boxes advance with Z, one page per press; wait until the text finishes scrolling before pressing again.
+- [FACT] The name-entry screen is a letter grid plus one bottom row of three buttons: Quit / Backspace / Done. Pressing Down from the grid lands on that button row, Right moves along it, and Z on Done submits the current name.
+- [FACT] After the name is submitted the main menu shows two items, Start Game and Settings. Arrow keys move the heart cursor, Z confirms.
+- [FACT] The opening narration (black screen, white text) advances with Z.
+Walk with the four arrow keys; they only work when a character stands in a room.
+Press z to advance dialogue text and to confirm menu choices.
+Press x to cancel or go back inside menus.
+Press c in a room to open the overworld menu (ITEM, STAT), press c again to close it.
+Waiting forever on dialogue does nothing; z is required.
+The flower patch room at the start has no dialogue box until you walk to the next area.

@@ -1,0 +1,16 @@
+{
+  "wsUrl": "ws://127.0.0.1:30648/ws/v1/agent/live",
+  "token": "REPLACE_ME",
+  "avatarImage": "",
+  "displayName": "小荧",
+  "accentColors": {
+    "reaction": "#ff6b9d",
+    "plan": "#4fc3f7",
+    "emotion": "#ffd166",
+    "lore": "#b388ff",
+    "chat": "#7cf5c0",
+    "result": "#ffa94d",
+    "guidance": "#9bd7ff"
+  },
+  "maxCommentaryLines": 8
+}

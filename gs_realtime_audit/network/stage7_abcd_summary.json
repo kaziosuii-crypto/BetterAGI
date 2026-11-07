@@ -1,0 +1,91 @@
+{
+ "generated_from": [
+  "loop_A.jsonl",
+  "loop_B_A.jsonl",
+  "loop_D_B.jsonl"
+ ],
+ "server": "AutoDL RTX 4090, GameScaling-2B-S3, vLLM 0.33.0, 127.0.0.1:6006",
+ "rounds_per_mode": 40,
+ "A_sync_official": {
+  "observation_age_ms": {
+   "n": 40,
+   "p50": 360.6,
+   "p95": 573.6,
+   "p99": 717.7,
+   "min": 260.2,
+   "max": 717.7
+  },
+  "e2e_ms": {
+   "n": 40,
+   "p50": 360.6,
+   "p95": 573.6,
+   "p99": 717.7,
+   "min": 260.2,
+   "max": 717.7
+  },
+  "executed_groups": 0,
+  "flags": "all off"
+ },
+ "B_stream_mouseA": {
+  "observation_age_ms": {
+   "n": 40,
+   "p50": 298.8,
+   "p95": 309.2,
+   "p99": 344.1,
+   "min": 193.8,
+   "max": 344.1
+  },
+  "action_ttft_ms": {
+   "n": 40,
+   "p50": 298.8,
+   "p95": 309.2,
+   "p99": 344.1,
+   "min": 193.8,
+   "max": 344.1
+  },
+  "e2e_ms": {
+   "n": 40,
+   "p50": 336.5,
+   "p95": 347.4,
+   "p99": 378.5,
+   "min": 252.5,
+   "max": 378.5
+  },
+  "executed_groups": 240,
+  "underflow": 0,
+  "flags": "streaming+executor+receipt, mouse A"
+ },
+ "D_stream_mouseB": {
+  "observation_age_ms": {
+   "n": 40,
+   "p50": 277.8,
+   "p95": 287.5,
+   "p99": 313.2,
+   "min": 159.9,
+   "max": 313.2
+  },
+  "action_ttft_ms": {
+   "n": 40,
+   "p50": 277.8,
+   "p95": 287.5,
+   "p99": 313.2,
+   "min": 159.9,
+   "max": 313.2
+  },
+  "e2e_ms": {
+   "n": 40,
+   "p50": 321.2,
+   "p95": 332.7,
+   "p99": 357.5,
+   "min": 198,
+   "max": 357.5
+  },
+  "executed_groups": 240,
+  "underflow": 0,
+  "flags": "streaming+executor+receipt, mouse B"
+ },
+ "observation_age_delta_ms": {
+  "p50": 61.8,
+  "p95": 264.4
+ }
+}

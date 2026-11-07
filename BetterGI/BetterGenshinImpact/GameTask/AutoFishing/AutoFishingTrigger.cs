@@ -1,0 +1,426 @@
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Recognition;
+using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.Core.Simulator;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Runtime;
+using CsTrees;
+using CsTrees.Blackboard;
+using CsTrees.Composites;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Localization;
+using Microsoft.Extensions.Logging;
+using OpenCvSharp;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Point = OpenCvSharp.Point;
+
+namespace BetterGenshinImpact.GameTask.AutoFishing
+{
+    public class AutoFishingTrigger : ITaskTrigger
+    {
+        /// <summary>行为树一旦运行，跨截图会话保留无法确认输入释放的状态。</summary>
+        internal static readonly AutoFishingIsolationGuard IsolationGuard = new();
+
+        private readonly ILogger<AutoFishingTrigger> _logger = App.GetLogger<AutoFishingTrigger>();
+        private IInputChannel input => InputHub.Foreground;
+
+        public string Name => "自动钓鱼";
+        public bool IsEnabledByConfig => _config.AutoFishingConfig.Enabled;
+        public int Priority => 15;
+
+        /// <summary>
+        /// 本次截图会话绑定的运行环境，行为树的截图与等待只使用它
+        /// </summary>
+        private readonly GameRuntime _runtime;
+
+        /// <summary>
+        /// 配置根，由创建方传入
+        /// </summary>
+        private readonly AllConfig _config;
+
+        /// <summary>
+        /// 创建半自动钓鱼触发器
+        /// </summary>
+        /// <param name="runtime">本次截图会话绑定的运行环境</param>
+        /// <param name="config">配置根</param>
+        public AutoFishingTrigger(GameRuntime runtime, AllConfig config)
+        {
+            _runtime = runtime;
+            _config = config;
+        }
+
+        /// <summary>
+        /// 钓鱼是要独占模式的
+        /// 在钓鱼的时候，不应该有其他任务在执行
+        /// 在触发器发现正在钓鱼的时候，启用独占模式
+        /// </summary>
+        public bool IsExclusive { get; set; }
+
+        private CsTrees.Blackboard.Blackboard blackboard = null!;
+
+        /// <summary>
+        /// 辣条（误）。每次启用时按当前配置重建
+        /// </summary>
+        private Behaviour BehaviourTreeLaTiao { get; set; } = null!;
+
+        /// <summary>
+        /// 启用时按当前配置建行为树，钓鱼配置的改动在下一次启用时生效
+        /// </summary>
+        public void OnEnabled(object? options)
+        {
+            IsExclusive = false;
+            _prevExecute = DateTime.MinValue;
+            BuildBehaviourTree();
+        }
+
+        public void OnDisabled()
+        {
+            IsExclusive = false;
+        }
+
+        private void BuildBehaviourTree()
+        {
+            AutoFishingTaskParam autoFishingTaskParam =
+                AutoFishingTaskParam.BuildFromConfig(_config.AutoFishingConfig);
+            IOcrService ocrService = OcrFactory.Paddle;
+
+            this.blackboard = new CsTrees.Blackboard.Blackboard();
+
+            BehaviourTreeLaTiao = new AutoFishingBuilder()
+                .WithBlackboard(blackboard)
+                    .Sequence("出现退出钓鱼按钮就开始钓鱼", memory: false)
+                        .TakeScreenshot("截图", _runtime, _logger)
+                        .Parallel("root", policy: new ParallelPolicy.SuccessOnOne())
+                            .LeafWithBlackboard(bb => new CheckFishingUserInterfaceBehaviour("检查是否在钓鱼界面", this, bb!))
+                            .FailureIsSuccess("拉条循环")
+                                .Sequence("拉条", memory: true)
+                                    .CheckFishBite("自动提竿", _logger, ocrService, cultureInfo: autoFishingTaskParam.GameCultureInfo, stringLocalizer: autoFishingTaskParam.StringLocalizer)
+                                    .RaiseHook("提竿", _logger, input)
+                                    .GetFishBoxArea("等待拉条出现", _logger, false)
+                                    .Fishing("钓鱼拉条", _logger, false, input)
+                                .End()
+                            .End()
+                        .End()
+                    .End()
+                .End()
+                .Build();
+        }
+
+        private DateTime _prevExecute = DateTime.MinValue;
+
+        public void OnCapture(CaptureContent content)
+        {
+            if ((DateTime.Now - _prevExecute).TotalMilliseconds <= 67)
+            {
+                return;
+            }
+
+            _prevExecute = DateTime.Now;
+
+            // 进入独占的判定
+            if (!IsExclusive)
+            {
+                // 进入独占模式判断
+                CheckFishingUserInterface(content.CaptureRectArea, this);
+            }
+            else
+            {
+                // 异步行为树可能跨帧持有输入，不能以停用或截图重启推断已松开。
+                IsolationGuard.MarkActivity();
+                BehaviourTreeLaTiao.TickOnce();
+            }
+        }
+
+        // /// <summary>
+        // /// 在“开始钓鱼”按钮上方安排一个我们的“开始自动钓鱼”按钮
+        // /// 点击按钮进入独占模式
+        // /// </summary>
+        // /// <param name="content"></param>
+        // /// <returns></returns>
+        // [Obsolete]
+        // private void DisplayButtonOnStartFishPageForExclusive(CaptureContent content)
+        // {
+        //     VisionContext.Instance().DrawContent.RemoveRect("StartFishingButton");
+        //     var info = TaskContext.Instance().SystemInfo;
+        //     var srcMat = content.CaptureRectArea.SrcMat;
+        //     var rightBottomMat = CropHelper.CutRightBottom(srcMat, srcMat.Width / 2, srcMat.Height / 2);
+        //     var list = CommonRecognition.FindGameButton(rightBottomMat);
+        //     if (list.Count > 0)
+        //     {
+        //         foreach (var rect in list)
+        //         {
+        //             var ro = new RecognitionObject()
+        //             {
+        //                 Name = "StartFishingText",
+        //                 RecognitionType = RecognitionTypes.OcrMatch,
+        //                 RegionOfInterest = new Rect(srcMat.Width / 2, srcMat.Height / 2, srcMat.Width - srcMat.Width / 2,
+        //                     srcMat.Height - srcMat.Height / 2),
+        //                 AllContainMatchText = new List<string>
+        //                 {
+        //                     "开始", "钓鱼"
+        //                 },
+        //                 DrawOnWindow = false
+        //             };
+        //             var ocrRaRes = content.CaptureRectArea.Find(ro);
+        //             if (ocrRaRes.IsEmpty())
+        //             {
+        //                 WeakReferenceMessenger.Default.Send(new PropertyChangedMessage<object>(this, "RemoveButton", new object(), "开始自动钓鱼"));
+        //             }
+        //             else
+        //             {
+        //                 VisionContext.Instance().DrawContent.PutRect("StartFishingButton", rect.ToWindowsRectangleOffset(srcMat.Width / 2, srcMat.Height / 2).ToRectDrawable());
+        //
+        //                 var btnPosition = new Rect(rect.X + srcMat.Width / 2, rect.Y + srcMat.Height / 2 - rect.Height - 10, rect.Width, rect.Height);
+        //                 var maskButton = new MaskButton("开始自动钓鱼", btnPosition, () =>
+        //                 {
+        //                     VisionContext.Instance().DrawContent.RemoveRect("StartFishingButton");
+        //                     _logger.LogInformation("→ {Text}", "自动钓鱼，启动！");
+        //                     // 点击下面的按钮
+        //                     var rc = info.CaptureAreaRect;
+        //                     Simulation.SendInputEx
+        //                         .Mouse
+        //                         .MoveMouseTo(
+        //                             (rc.X + srcMat.Width * 1d / 2 + rect.X + rect.Width * 1d / 2) * 65535 / info.DesktopRectArea.Width,
+        //                             (rc.Y + srcMat.Height * 1d / 2 + rect.Y + rect.Height * 1d / 2) * 65535 / info.DesktopRectArea.Height)
+        //                         .LeftButtonClick();
+        //                     WeakReferenceMessenger.Default.Send(new PropertyChangedMessage<object>(this, "RemoveButton", new object(), "开始自动钓鱼"));
+        //                     // 启动要延时一会等待钓鱼界面切换
+        //                     Sleep(1000);
+        //                     IsExclusive = true;
+        //                     _switchBaitContinuouslyFrameNum = 0;
+        //                     _waitBiteContinuouslyFrameNum = 0;
+        //                     _noFishActionContinuouslyFrameNum = 0;
+        //                     _isThrowRod = false;
+        //                 });
+        //                 WeakReferenceMessenger.Default.Send(new PropertyChangedMessage<object>(this, "AddButton", new object(), maskButton));
+        //             }
+        //         }
+        //     }
+        //     else
+        //     {
+        //         WeakReferenceMessenger.Default.Send(new PropertyChangedMessage<object>(this, "RemoveButton", new object(), "开始自动钓鱼"));
+        //     }
+        // }
+
+        //private bool OcrStartFishingForExclusive(CaptureContent content)
+        //{
+        //    var srcMat = content.CaptureRectArea.SrcMat;
+        //    var rightBottomMat = CutHelper.CutRightBottom(srcMat, srcMat.Width / 2, srcMat.Height / 2);
+        //    var text = _ocrService.Ocr(rightBottomMat.ToBitmap());
+        //    if (!string.IsNullOrEmpty(text) && StringUtils.RemoveAllSpace(text).Contains("开始") && StringUtils.RemoveAllSpace(text).Contains("钓鱼"))
+        //    {
+        //        return true;
+        //    }
+        //    return false;
+        //}
+
+        /// <summary>
+        /// 钓鱼有3种场景
+        /// 1. 未抛竿 BaitButtonRo存在 && WaitBiteButtonRo不存在
+        /// 2. 抛竿后未拉条 WaitBiteButtonRo存在 && BaitButtonRo不存在
+        /// 3. 上钩拉条
+        ///
+        /// 新AI钓鱼
+        /// 前提：必须要正面面对鱼塘，没有识别到鱼的时候不会自动抛竿
+        /// 1. 观察周围环境，判断鱼塘位置，视角对上鱼塘位置中心
+        /// 2. 根据第一步的观察结果，提前选择鱼饵
+        /// </summary>
+        [Obsolete]
+        private (int, int) MoveMouseToFish(Rect rect1, Rect rect2)
+        {
+            int minDistance;
+
+            //首先计算两个矩形中心点
+            Point c1, c2;
+            c1.X = rect1.X + (rect1.Width / 2);
+            c1.Y = rect1.Y + (rect1.Height / 2);
+            c2.X = rect2.X + (rect2.Width / 2);
+            c2.Y = rect2.Y + (rect2.Height / 2);
+
+            // 分别计算两矩形中心点在X轴和Y轴方向的距离
+            var dx = Math.Abs(c2.X - c1.X);
+            var dy = Math.Abs(c2.Y - c1.Y);
+
+            //两矩形不相交，在X轴方向有部分重合的两个矩形
+            if (dx < (rect1.Width + rect2.Width) / 2 && dy >= (rect1.Height + rect2.Height) / 2)
+            {
+                minDistance = dy - ((rect1.Height + rect2.Height) / 2);
+
+                var moveY = 5;
+                if (minDistance >= 100)
+                {
+                    moveY = 50;
+                }
+
+                if (c1.Y > c2.Y)
+                {
+                    moveY = -moveY;
+                }
+
+                //_logger.LogInformation("移动鼠标 {X} {Y}", 0, moveY);
+                InputHub.Foreground.Mouse.MoveMouseBy(0, moveY);
+                return (0, minDistance);
+            }
+
+            //两矩形不相交，在Y轴方向有部分重合的两个矩形
+            else if (dx >= (rect1.Width + rect2.Width) / 2 && (dy < (rect1.Height + rect2.Height) / 2))
+            {
+                minDistance = dx - ((rect1.Width + rect2.Width) / 2);
+                var moveX = 10;
+                if (minDistance >= 100)
+                {
+                    moveX = 50;
+                }
+
+                if (c1.X > c2.X)
+                {
+                    moveX = -moveX;
+                }
+
+                //_logger.LogInformation("移动鼠标 {X} {Y}", moveX, 0);
+                InputHub.Foreground.Mouse.MoveMouseBy(moveX, 0);
+                return (minDistance, 0);
+            }
+
+            //两矩形不相交，在X轴和Y轴方向无重合的两个矩形
+            else if ((dx >= ((rect1.Width + rect2.Width) / 2)) && (dy >= ((rect1.Height + rect2.Height) / 2)))
+            {
+                var dpX = dx - ((rect1.Width + rect2.Width) / 2);
+                var dpY = dy - ((rect1.Height + rect2.Height) / 2);
+                //minDistance = (int)Math.Sqrt(dpX * dpX + dpY * dpY);
+                var moveX = 10;
+                if (dpX >= 100)
+                {
+                    moveX = 50;
+                }
+
+                var moveY = 5;
+                if (dpY >= 100)
+                {
+                    moveY = 50;
+                }
+
+                if (c1.Y > c2.Y)
+                {
+                    moveY = -moveY;
+                }
+
+                if (c1.X > c2.X)
+                {
+                    moveX = -moveX;
+                }
+
+                //_logger.LogInformation("移动鼠标 {X} {Y}", moveX, moveY);
+                InputHub.Foreground.Mouse.MoveMouseBy(moveX, moveY);
+                return (dpX, dpY);
+            }
+
+            //两矩形相交
+            else
+            {
+                //_logger.LogInformation("无需移动鼠标");
+                minDistance = -1;
+                return (0, 0);
+            }
+        }
+
+        public void Sleep(int millisecondsTimeout)
+        {
+            _runtime.Sleep(millisecondsTimeout);
+        }
+
+        /// <summary>
+        /// 检查是否在钓鱼界面
+        /// 方法是找右下角的退出钓鱼按钮
+        /// 进入钓鱼界面时该触发器进入独占模式
+        /// </summary>
+        /// <param name="imageRegion"></param>
+        internal static Status CheckFishingUserInterface(ImageRegion imageRegion, AutoFishingTrigger autoFishingTrigger)
+        {
+            var prevIsExclusive = autoFishingTrigger.IsExclusive;
+            autoFishingTrigger.IsExclusive = !imageRegion.Find(RecognitionAssets.Get("AutoFishing", "ExitFishingButton", imageRegion)).IsEmpty();
+            if (autoFishingTrigger.IsExclusive)
+            {
+                if (!prevIsExclusive)
+                {
+                    autoFishingTrigger._logger.LogInformation("→ {Text}", "半自动钓鱼，启动！");
+                    // _logger.LogInformation("当前自动选饵抛竿状态[{Enabled}]", TaskContext.Instance().Config.AutoFishingConfig.AutoThrowRodEnabled.ToChinese());
+                }
+
+                return Status.Running;
+            }
+            else
+            {
+                if (prevIsExclusive)
+                {
+                    autoFishingTrigger._logger.LogInformation("← {Text}", "退出钓鱼界面");
+                }
+
+                return Status.Failure;
+            }
+        }
+
+        ///// <summary>
+        ///// 清理画布
+        ///// </summary>
+        //public void ClearDraw()
+        //{
+        //    VisionContext.Instance().DrawContent.PutOrRemoveRectList(new List<(string, RectDrawable)>
+        //    {
+        //        ("FishingBarLeft", new RectDrawable(System.Windows.Rect.Empty)),
+        //        ("FishingBarCur", new RectDrawable(System.Windows.Rect.Empty)),
+        //        ("FishingBarRight", new RectDrawable(System.Windows.Rect.Empty))
+        //    });
+        //    VisionContext.Instance().DrawContent.RemoveRect("FishBiteTips");
+        //    VisionContext.Instance().DrawContent.RemoveRect("StartFishingButton");
+        //    WeakReferenceMessenger.Default.Send(new PropertyChangedMessage<object>(this, "RemoveButton", new object(), "开始自动钓鱼"));
+        //}
+
+        //public void Stop()
+        //{
+        //    ClearDraw();
+        //}
+    }
+
+    /// <summary>记录无法证明已结束的自动钓鱼输入活动。</summary>
+    internal sealed class AutoFishingIsolationGuard
+    {
+        /// <summary>一旦行为树开始执行即保持不安全，直到进程结束。</summary>
+        private int _activity;
+
+        /// <summary>在调用可能产生跨帧输入的行为树前标记。</summary>
+        internal void MarkActivity() => Interlocked.Exchange(ref _activity, 1);
+
+        /// <summary>无法证明释放时拒绝暂停，避免冻结行为树的后续松开操作。</summary>
+        internal void ThrowIfUnconfirmed()
+        {
+            if (Volatile.Read(ref _activity) != 0)
+                throw new InvalidOperationException("自动钓鱼曾运行，无法确认其跨帧输入已释放，拒绝隔离触发器。");
+        }
+    }
+
+    public partial class CheckFishingUserInterfaceBehaviour : Behaviour, IScreenshotBehaviour
+    {
+        private readonly AutoFishingTrigger _autoFishingTrigger;
+
+        [BlackboardKey(Access = Access.Read)]
+        public BehaviourKeyAccess<ImageRegion> Screenshot { get; private set; } = null!;
+
+        private CheckFishingUserInterfaceBehaviour(string name, AutoFishingTrigger autoFishingTrigger) : base(name)
+        {
+            _autoFishingTrigger = autoFishingTrigger;
+        }
+
+        protected async override Task<Status> Update()
+        {
+            return AutoFishingTrigger.CheckFishingUserInterface(Screenshot.Get(), _autoFishingTrigger);
+        }
+    }
+}

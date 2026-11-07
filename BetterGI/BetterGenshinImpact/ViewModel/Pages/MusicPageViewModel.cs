@@ -1,0 +1,1385 @@
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.Core.Script;
+using BetterGenshinImpact.GameTask;
+using BetterGenshinImpact.GameTask.Music.Model;
+using BetterGenshinImpact.GameTask.Music.Service;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.Service.Interface;
+using BetterGenshinImpact.View;
+using BetterGenshinImpact.View.Windows;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Microsoft.Extensions.Logging;
+using Wpf.Ui.Violeta.Win32;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Data;
+using System.Windows.Threading;
+using Wpf.Ui;
+using Wpf.Ui.Controls;
+
+namespace BetterGenshinImpact.ViewModel.Pages;
+
+public partial class MusicPageViewModel : ViewModel
+{
+    private readonly IMusicLibraryService _libraryService;
+    private readonly IMusicCoverService _coverService;
+    private readonly IMusicPlaybackService _playbackService;
+    private readonly IInstrumentProfileService _profileService;
+    private readonly IMusicTimelineBuilder _timelineBuilder;
+    private readonly IMusicStateStore _stateStore;
+    private readonly ISnackbarService _snackbarService;
+
+    /// <summary>游戏运行环境服务；引导式跟弹每次读取 Current，不持有运行环境</summary>
+    private readonly GameRuntimeService _runtimeService;
+    private readonly ILogger<MusicPageViewModel> _logger = App.GetLogger<MusicPageViewModel>();
+    private CancellationTokenSource? _refreshCancellationTokenSource;
+    private CancellationTokenSource? _coverLoadCancellationTokenSource;
+    private Task? _sessionTask;
+    private IReadOnlyList<PerformanceScore> _activePlaybackQueue = [];
+    private MusicGuidedSession? _guidedSession;
+    private MusicGuidedWindow? _guidedWindow;
+    private bool _isLoading;
+    private bool _isUpdatingSelection;
+    private bool _isSeeking;
+    private bool _isInitialized;
+    private string _lastSavedPlaybackPath = string.Empty;
+    private long _lastSavedPlaybackSecond = -1;
+
+    public MusicPageViewModel(
+        IMusicLibraryService libraryService,
+        IMusicCoverService coverService,
+        IMusicPlaybackService playbackService,
+        IInstrumentProfileService profileService,
+        IMusicTimelineBuilder timelineBuilder,
+        IMusicStateStore stateStore,
+        IConfigService configService,
+        ISnackbarService snackbarService,
+        GameRuntimeService runtimeService)
+    {
+        _runtimeService = runtimeService;
+        _libraryService = libraryService;
+        _coverService = coverService;
+        _playbackService = playbackService;
+        _profileService = profileService;
+        _timelineBuilder = timelineBuilder;
+        _stateStore = stateStore;
+        _snackbarService = snackbarService;
+        Config = configService.Get();
+        MusicFolderDisplayText = string.IsNullOrWhiteSpace(Config.MusicConfig.MusicFolder)
+            ? "尚未选择曲谱目录"
+            : GetFolderDisplayName(Config.MusicConfig.MusicFolder);
+        MusicFolderHistory = new ObservableCollection<MusicFolderHistoryItem>(
+            _stateStore.State.MusicFolderHistory
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(x => new MusicFolderHistoryItem(x)));
+        if (!string.IsNullOrWhiteSpace(Config.MusicConfig.MusicFolder))
+        {
+            AddMusicFolderToHistory(Config.MusicConfig.MusicFolder);
+            SelectedMusicFolder = Config.MusicConfig.MusicFolder;
+        }
+
+        MusicItemsView = CollectionViewSource.GetDefaultView(MusicItems);
+        MusicItemsView.Filter = FilterMusicItem;
+        MusicItems.CollectionChanged += OnMusicItemsCollectionChanged;
+
+        Profiles = profileService.Profiles;
+        MappingModes = new ObservableCollection<InstrumentMappingMode>(
+            Enum.GetValues<InstrumentMappingMode>());
+        UseBackgroundInput = Config.MusicConfig.InputMode != nameof(MusicInputMode.ForegroundSendInput);
+        PlaybackMode = Config.MusicConfig.PlaybackMode switch
+        {
+            nameof(MusicPlaybackMode.SingleLoop) => MusicPlaybackMode.SingleLoop,
+            nameof(MusicPlaybackMode.Shuffle) => MusicPlaybackMode.Shuffle,
+            _ => MusicPlaybackMode.Sequential
+        };
+        IsGuidedPlayMode = string.Equals(Config.MusicConfig.PlayMode, MusicPlayModeNames.Guided,
+            StringComparison.OrdinalIgnoreCase);
+
+        _libraryService.FilesChanged += OnLibraryFilesChanged;
+        _libraryService.ScoreParseFailed += OnScoreParseFailed;
+        _playbackService.SnapshotChanged += OnPlaybackSnapshotChanged;
+    }
+
+    public AllConfig Config { get; }
+
+    public ObservableCollection<PerformanceScore> MusicItems { get; } = [];
+
+    public ICollectionView MusicItemsView { get; }
+
+    public ObservableCollection<InstrumentProfile> Profiles { get; }
+
+    public ObservableCollection<InstrumentMappingMode> MappingModes { get; }
+
+    public ObservableCollection<MusicFolderHistoryItem> MusicFolderHistory { get; }
+
+    public ObservableCollection<string> FormatFilters { get; } = ["全部格式"];
+
+    public ObservableCollection<string> InstrumentFilters { get; } = ["全部乐器"];
+
+    [ObservableProperty]
+    private PerformanceScore? _selectedMusicItem;
+
+    [ObservableProperty]
+    private PerformanceScore? _currentMusicItem;
+
+    [ObservableProperty]
+    private InstrumentProfile? _selectedInstrumentProfile;
+
+    [ObservableProperty]
+    private string _searchText = string.Empty;
+
+    [ObservableProperty]
+    private string _selectedFormatFilter = "全部格式";
+
+    [ObservableProperty]
+    private string _selectedInstrumentFilter = "全部乐器";
+
+    [ObservableProperty]
+    private string? _selectedMusicFolder;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(InputModeDisplayText))]
+    [NotifyPropertyChangedFor(nameof(InputModeToolTip))]
+    private bool _useBackgroundInput = true;
+
+    /// <summary>true = 引导式跟弹，false = 自动演奏</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlayModeDisplayText))]
+    private bool _isGuidedPlayMode;
+
+    /// <summary>引导式跟弹进行中（用于界面上显示进度）</summary>
+    [ObservableProperty]
+    private bool _isGuidedPlaying;
+
+    /// <summary>引导进度文本，例如「第 2 / 12 段」</summary>
+    [ObservableProperty]
+    private string _guidedStatusText = string.Empty;
+
+    public string PlayModeDisplayText => IsGuidedPlayMode ? "引导式跟弹" : "自动演奏";
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlaybackModeSymbol))]
+    [NotifyPropertyChangedFor(nameof(PlaybackModeToolTip))]
+    private MusicPlaybackMode _playbackMode;
+
+    [ObservableProperty]
+    private int _transpose;
+
+    [ObservableProperty]
+    private double _currentPositionMilliseconds;
+
+    [ObservableProperty]
+    private double _totalDurationMilliseconds = 1;
+
+    [ObservableProperty]
+    private string _currentTimeText = "00:00";
+
+    [ObservableProperty]
+    private string _totalTimeText = "00:00";
+
+    [ObservableProperty]
+    private string _currentTrackName = "未播放";
+
+    [ObservableProperty]
+    private bool _isPlaying;
+
+    [ObservableProperty]
+    private bool _isPaused;
+
+    [ObservableProperty]
+    private bool _isRefreshing;
+
+    [ObservableProperty]
+    private bool _hasMusicItems;
+
+    [ObservableProperty]
+    private string _libraryStatusText = "尚未扫描曲谱目录";
+
+    [ObservableProperty]
+    private string _lastRefreshText = "等待刷新";
+
+    [ObservableProperty]
+    private string _musicFolderDisplayText = "尚未选择曲谱目录";
+
+    public SymbolRegular PlayPauseSymbol => IsPlaying
+        ? SymbolRegular.Pause24
+        : SymbolRegular.Play24;
+
+    public SymbolRegular PlaybackModeSymbol => PlaybackMode switch
+    {
+        MusicPlaybackMode.SingleLoop => SymbolRegular.ArrowRepeatAll24,
+        MusicPlaybackMode.Shuffle => SymbolRegular.ArrowShuffle24,
+        _ => SymbolRegular.ArrowWrap20
+    };
+
+    public string PlaybackModeToolTip => $"播放模式：{GetPlaybackModeText(PlaybackMode)}（点击切换）";
+
+    public string InputModeDisplayText => UseBackgroundInput ? "后台" : "前台";
+
+    public string InputModeToolTip => UseBackgroundInput
+        ? "后台 PostMessage：会继续向已关联的游戏窗口发键。"
+        : "前台 SendInput：游戏需要保持前台。";
+
+    partial void OnIsPlayingChanged(bool value)
+    {
+        OnPropertyChanged(nameof(PlayPauseSymbol));
+    }
+
+    public override Task OnNavigatedToAsync()
+    {
+        return InitializeAsync();
+    }
+
+    public override void OnNavigatedFrom()
+    {
+        // 离开音乐页时不要留下置顶的引导层和键盘钩子。
+        StopGuidedSession("已离开音乐页面");
+    }
+
+    [RelayCommand]
+    private async Task InitializeAsync()
+    {
+        if (!_isInitialized)
+        {
+            _isInitialized = true;
+            _libraryService.Watch(Config.MusicConfig.MusicFolder);
+            // 先让导航完成布局和首帧渲染，再开始读取曲库，避免页面切换看起来卡死。
+            await Application.Current.Dispatcher.InvokeAsync(
+                static () => { },
+                DispatcherPriority.ContextIdle);
+            await RefreshLibraryAsync();
+        }
+    }
+
+    partial void OnSelectedMusicItemChanged(PerformanceScore? value)
+    {
+        if (value == null)
+        {
+            return;
+        }
+
+        _isUpdatingSelection = true;
+        var preferredProfile = string.IsNullOrWhiteSpace(value.OutputProfileName)
+            ? _profileService.Find(value.Instrument)
+            : _profileService.Find(value.OutputProfileName);
+        SelectedInstrumentProfile = preferredProfile;
+        value.OutputProfileName = preferredProfile.Name;
+        Transpose = value.Transpose;
+        _isUpdatingSelection = false;
+        RefreshMapping();
+        if (!_isLoading && _playbackService.Snapshot.State == MusicPlaybackState.Stopped)
+        {
+            CurrentMusicItem = value;
+            UpdateStoppedPlaybackDisplay(value, TimeSpan.Zero);
+            SavePlaybackState(value, TimeSpan.Zero, true);
+        }
+    }
+
+    partial void OnSelectedInstrumentProfileChanged(InstrumentProfile? value)
+    {
+        if (_isUpdatingSelection || value == null || SelectedMusicItem == null)
+        {
+            return;
+        }
+
+        SelectedMusicItem.OutputProfileName = value.Name;
+        Config.MusicConfig.SelectedInstrumentProfile = value.Name;
+        SaveSelectedPreference();
+        RefreshMapping();
+    }
+
+    partial void OnTransposeChanged(int value)
+    {
+        if (_isUpdatingSelection || SelectedMusicItem == null)
+        {
+            return;
+        }
+
+        SelectedMusicItem.Transpose = Math.Clamp(value, -24, 24);
+        SaveSelectedPreference();
+        RefreshMapping();
+    }
+
+    partial void OnCurrentPositionMillisecondsChanged(double value)
+    {
+        if (!_isSeeking)
+        {
+            return;
+        }
+
+        var milliseconds = Math.Clamp(value, 0, TotalDurationMilliseconds);
+        CurrentTimeText = FormatTime(TimeSpan.FromMilliseconds(milliseconds));
+    }
+
+    partial void OnSearchTextChanged(string value)
+    {
+        MusicItemsView.Refresh();
+    }
+
+    partial void OnSelectedFormatFilterChanged(string value)
+    {
+        MusicItemsView.Refresh();
+    }
+
+    partial void OnSelectedInstrumentFilterChanged(string value)
+    {
+        MusicItemsView.Refresh();
+    }
+
+    partial void OnUseBackgroundInputChanged(bool value)
+    {
+        Config.MusicConfig.InputMode = GetInputMode().ToString();
+    }
+
+    partial void OnPlaybackModeChanged(MusicPlaybackMode value)
+    {
+        Config.MusicConfig.PlaybackMode = value.ToString();
+        _playbackService.SetPlaybackMode(value);
+    }
+
+    partial void OnIsGuidedPlayModeChanged(bool value)
+    {
+        Config.MusicConfig.PlayMode = value ? MusicPlayModeNames.Guided : MusicPlayModeNames.Auto;
+
+        // 切模式时把另一条通路停下来，避免「自动演奏」和「引导式跟弹」同时跑。
+        if (value)
+        {
+            _playbackService.Stop();
+        }
+        else if (IsGuidedPlaying)
+        {
+            StopGuidedSession("已切换到自动演奏");
+        }
+    }
+
+    [RelayCommand]
+    private void CyclePlaybackMode()
+    {
+        PlaybackMode = PlaybackMode switch
+        {
+            MusicPlaybackMode.Sequential => MusicPlaybackMode.SingleLoop,
+            MusicPlaybackMode.SingleLoop => MusicPlaybackMode.Shuffle,
+            _ => MusicPlaybackMode.Sequential
+        };
+    }
+
+    [RelayCommand]
+    private async Task ChooseFolderAsync()
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Description = "选择曲谱根目录",
+            UseDescriptionForTitle = true,
+            SelectedPath = Directory.Exists(Config.MusicConfig.MusicFolder)
+                ? Config.MusicConfig.MusicFolder
+                : string.Empty
+        };
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        await SelectMusicFolderAsync(dialog.SelectedPath);
+    }
+
+    [RelayCommand]
+    private async Task SelectMusicFolderAsync(string? folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return;
+        }
+
+        if (!Directory.Exists(folder))
+        {
+            _snackbarService.Show(
+                "曲谱目录不可用",
+                "该历史目录不存在或当前无法访问。",
+                ControlAppearance.Caution,
+                null,
+                TimeSpan.FromSeconds(3));
+            return;
+        }
+
+        var normalizedFolder = Path.GetFullPath(folder);
+        if (string.Equals(
+                Config.MusicConfig.MusicFolder,
+                normalizedFolder,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            SelectedMusicFolder = normalizedFolder;
+            return;
+        }
+
+        if (!string.Equals(
+                Config.MusicConfig.MusicFolder,
+                normalizedFolder,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            _playbackService.Stop();
+        }
+
+        AddMusicFolderToHistory(normalizedFolder);
+        SelectedMusicFolder = normalizedFolder;
+        Config.MusicConfig.MusicFolder = normalizedFolder;
+        MusicFolderDisplayText = GetFolderDisplayName(normalizedFolder);
+        _libraryService.Watch(normalizedFolder);
+        await RefreshLibraryAsync();
+    }
+
+    [RelayCommand]
+    private async Task DeleteMusicFolderAsync(string? folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return;
+        }
+
+        var historyItem = MusicFolderHistory.FirstOrDefault(x =>
+            string.Equals(x.FullPath, folder, StringComparison.OrdinalIgnoreCase));
+        if (historyItem == null)
+        {
+            return;
+        }
+
+        MusicFolderHistory.Remove(historyItem);
+        SaveMusicFolderHistory();
+        if (!string.Equals(
+                Config.MusicConfig.MusicFolder,
+                historyItem.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var nextFolder = MusicFolderHistory.FirstOrDefault(x => Directory.Exists(x.FullPath))?.FullPath;
+        if (nextFolder != null)
+        {
+            await SelectMusicFolderAsync(nextFolder);
+            return;
+        }
+
+        _playbackService.Stop();
+        SelectedMusicFolder = null;
+        Config.MusicConfig.MusicFolder = string.Empty;
+        MusicFolderDisplayText = "尚未选择曲谱目录";
+        _libraryService.Watch(string.Empty);
+        await RefreshLibraryAsync();
+    }
+
+    [RelayCommand]
+    private void OpenFolder()
+    {
+        if (!Directory.Exists(Config.MusicConfig.MusicFolder))
+        {
+            _snackbarService.Show(
+                "曲谱目录不可用",
+                "请先选择一个有效的曲谱目录。",
+                ControlAppearance.Caution,
+                null,
+                TimeSpan.FromSeconds(3));
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo("explorer.exe", Config.MusicConfig.MusicFolder)
+        {
+            UseShellExecute = true
+        });
+    }
+
+    [RelayCommand]
+    private async Task RefreshAsync()
+    {
+        _libraryService.Watch(Config.MusicConfig.MusicFolder);
+        await RefreshLibraryAsync();
+    }
+
+    [RelayCommand]
+    private void OpenSettings()
+    {
+        var window = new MusicSettingsWindow(this)
+        {
+            Owner = Application.Current.MainWindow
+        };
+        window.ShowDialog();
+    }
+
+    [RelayCommand]
+    private void PlayPause()
+    {
+        if (IsGuidedPlayMode)
+        {
+            if (IsGuidedPlaying)
+            {
+                StopGuidedSession("已停止引导式跟弹");
+                return;
+            }
+
+            StartGuidedSessionAsync(SelectedMusicItem);
+            return;
+        }
+
+        var snapshot = _playbackService.Snapshot;
+        if (snapshot.State == MusicPlaybackState.Playing)
+        {
+            _playbackService.Pause();
+            return;
+        }
+
+        if (snapshot.State == MusicPlaybackState.Paused)
+        {
+            _playbackService.Resume();
+            return;
+        }
+
+        StartPlaybackSession();
+    }
+
+    [RelayCommand]
+    private async Task PlaySelectedAsync(PerformanceScore? musicItem)
+    {
+        if (musicItem is not { IsValid: true })
+        {
+            _snackbarService.Show(
+                "无法播放",
+                musicItem?.Error ?? "请选择一首有效曲谱。",
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+            return;
+        }
+
+        if (IsGuidedPlayMode)
+        {
+            SelectedMusicItem = musicItem;
+            StartGuidedSessionAsync(musicItem);
+            return;
+        }
+
+        var currentSession = _sessionTask;
+        if (_playbackService.Snapshot.State != MusicPlaybackState.Stopped)
+        {
+            _playbackService.Stop();
+            if (currentSession != null)
+            {
+                await ObserveSessionAsync(currentSession);
+            }
+        }
+
+        SelectedMusicItem = musicItem;
+        StartPlaybackSession(false);
+    }
+
+    [RelayCommand]
+    private void Stop()
+    {
+        if (IsGuidedPlaying)
+        {
+            StopGuidedSession("已停止引导式跟弹");
+        }
+
+        _playbackService.Stop();
+        if (SelectedMusicItem != null)
+        {
+            UpdateStoppedPlaybackDisplay(SelectedMusicItem, TimeSpan.Zero);
+            SavePlaybackState(SelectedMusicItem, TimeSpan.Zero, true);
+        }
+    }
+
+    [RelayCommand]
+    private void Next()
+    {
+        if (IsGuidedPlaying)
+        {
+            StopGuidedSession("已切换到下一首");
+        }
+
+        _playbackService.Next();
+    }
+
+    [RelayCommand]
+    private void Previous()
+    {
+        if (IsGuidedPlaying)
+        {
+            StopGuidedSession("已切换到上一首");
+        }
+
+        _playbackService.Previous();
+    }
+
+    [RelayCommand]
+    private void BeginSeek()
+    {
+        _isSeeking = true;
+    }
+
+    [RelayCommand]
+    private void Seek(double milliseconds)
+    {
+        var position = TimeSpan.FromMilliseconds(
+            Math.Clamp(milliseconds, 0, TotalDurationMilliseconds));
+        if (_playbackService.Snapshot.State == MusicPlaybackState.Stopped)
+        {
+            var score = CurrentMusicItem ?? SelectedMusicItem;
+            if (score != null)
+            {
+                UpdateStoppedPlaybackDisplay(score, position);
+                SavePlaybackState(score, position, true);
+            }
+        }
+        else
+        {
+            _playbackService.Seek(position);
+        }
+
+        _isSeeking = false;
+    }
+
+    [RelayCommand]
+    private void RefreshMapping()
+    {
+        if (SelectedMusicItem == null || SelectedInstrumentProfile == null)
+        {
+            return;
+        }
+
+        _timelineBuilder.Build(SelectedMusicItem, SelectedInstrumentProfile, Transpose);
+    }
+
+    [RelayCommand]
+    private void UpdateTrackSelection()
+    {
+        RefreshMapping();
+        SaveSelectedPreference();
+    }
+
+    [RelayCommand]
+    private void SaveProfiles()
+    {
+        _profileService.Save();
+        RefreshMapping();
+        _snackbarService.Show(
+            "乐器档案已保存",
+            "新的音高映射将在下次开始曲目时生效。",
+            ControlAppearance.Success,
+            null,
+            TimeSpan.FromSeconds(2));
+    }
+
+    private async Task RefreshLibraryAsync()
+    {
+        Volatile.Read(ref _coverLoadCancellationTokenSource)?.Cancel();
+        var refreshCancellationTokenSource = new CancellationTokenSource();
+        var previousRefresh = Interlocked.Exchange(
+            ref _refreshCancellationTokenSource,
+            refreshCancellationTokenSource);
+        previousRefresh?.Cancel();
+        var cancellationToken = refreshCancellationTokenSource.Token;
+
+        IsRefreshing = true;
+        LibraryStatusText = "正在扫描曲谱目录…";
+        try
+        {
+            var scores = await _libraryService.ScanAsync(Config.MusicConfig.MusicFolder, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            _isLoading = true;
+            var selectedPath = SelectedMusicItem?.FullPath;
+            if (string.IsNullOrWhiteSpace(selectedPath))
+            {
+                selectedPath = _stateStore.State.CurrentTrackFullPath;
+            }
+
+            MusicItems.Clear();
+            foreach (var score in scores)
+            {
+                if (string.IsNullOrWhiteSpace(score.OutputProfileName))
+                {
+                    score.OutputProfileName = _profileService.Find(score.Instrument).Name;
+                }
+
+                MusicItems.Add(score);
+            }
+
+            SelectedMusicItem = MusicItems.FirstOrDefault(x =>
+                                    string.Equals(x.FullPath, selectedPath, StringComparison.OrdinalIgnoreCase))
+                                ?? MusicItems.FirstOrDefault();
+            RebuildFilters();
+            if (_playbackService.Snapshot.State == MusicPlaybackState.Stopped)
+            {
+                RestorePlaybackState();
+            }
+
+            _isLoading = false;
+            StartCoverLoading();
+
+            var playableCount = MusicItems.Count(x => x.IsValid);
+            LibraryStatusText = Directory.Exists(Config.MusicConfig.MusicFolder)
+                ? $"已载入 {MusicItems.Count} 首曲目，其中 {playableCount} 首可播放"
+                : "尚未选择有效的曲谱目录";
+            LastRefreshText = $"上次刷新 {DateTime.Now:HH:mm:ss}";
+        }
+        catch (OperationCanceledException)
+        {
+            // 新一轮刷新已经接管
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "刷新曲库失败：{MusicFolder}", Config.MusicConfig.MusicFolder);
+            LibraryStatusText = "刷新失败，请检查曲谱目录";
+            _snackbarService.Show(
+                "刷新曲库失败",
+                e.Message,
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+        }
+        finally
+        {
+            if (Interlocked.CompareExchange(
+                    ref _refreshCancellationTokenSource,
+                    null,
+                    refreshCancellationTokenSource) == refreshCancellationTokenSource)
+            {
+                IsRefreshing = false;
+            }
+
+            _isLoading = false;
+            refreshCancellationTokenSource.Dispose();
+        }
+    }
+
+    private void StartCoverLoading()
+    {
+        var coverLoadCancellationTokenSource = new CancellationTokenSource();
+        var previous = Interlocked.Exchange(
+            ref _coverLoadCancellationTokenSource,
+            coverLoadCancellationTokenSource);
+        previous?.Cancel();
+        _ = LoadCoversAsync([.. MusicItems], coverLoadCancellationTokenSource);
+    }
+
+    private async Task LoadCoversAsync(
+        IReadOnlyList<PerformanceScore> scores,
+        CancellationTokenSource cancellationTokenSource)
+    {
+        try
+        {
+            foreach (var score in scores)
+            {
+                cancellationTokenSource.Token.ThrowIfCancellationRequested();
+                score.Artwork = await _coverService.GetCoverAsync(
+                    score.DisplayTitle,
+                    cancellationTokenSource.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 新一轮封面加载已经接管
+        }
+        catch (Exception e)
+        {
+            _logger.LogDebug(e, "加载音乐封面失败");
+        }
+        finally
+        {
+            Interlocked.CompareExchange(
+                ref _coverLoadCancellationTokenSource,
+                null,
+                cancellationTokenSource);
+            cancellationTokenSource.Dispose();
+        }
+    }
+
+    private void StartPlaybackSession(bool restoreSavedPosition = true)
+    {
+        if (IsGuidedPlaying)
+        {
+            StopGuidedSession("已切换到自动演奏");
+        }
+
+        if (SelectedMusicItem is not { IsValid: true })
+        {
+            _snackbarService.Show(
+                "无法播放",
+                SelectedMusicItem?.Error ?? "请选择一首有效曲谱。",
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+            return;
+        }
+
+        SaveAllPreferences();
+        // 播放队列应与用户当前看到的筛选结果保持一致，上一首、下一首和自动续播都使用该快照。
+        var queue = MusicItemsView.Cast<PerformanceScore>().Where(x => x.IsValid).ToList();
+        var startIndex = queue.IndexOf(SelectedMusicItem);
+        if (startIndex < 0)
+        {
+            return;
+        }
+
+        var options = new MusicPlaybackOptions
+        {
+            InputMode = GetInputMode(),
+            PlaybackMode = PlaybackMode,
+            Speed = Config.MusicConfig.Speed,
+            CustomBpm = Config.MusicConfig.UseCustomBpm
+                ? Math.Clamp(Config.MusicConfig.CustomBpm, 1, 1000)
+                : null,
+            AutoSwitchInstrument = Config.MusicConfig.AutoSwitchInstrument,
+            StartPosition = restoreSavedPosition
+                ? GetSavedPlaybackPosition(SelectedMusicItem)
+                : TimeSpan.Zero
+        };
+
+        _activePlaybackQueue = queue;
+        // 演奏服务是进程级服务，自行读取当前运行环境，这里只需要本轮取消令牌
+        _sessionTask = new TaskRunner().RunThreadAsync(
+            (_, ct) => _playbackService.RunPlaylistAsync(
+                queue,
+                startIndex,
+                options,
+                ct));
+        _ = ObserveSessionAsync(_sessionTask);
+    }
+
+    private async Task ObserveSessionAsync(Task sessionTask)
+    {
+        try
+        {
+            await sessionTask;
+        }
+        catch (Exception)
+        {
+            // TaskRunner 已经记录并展示任务异常
+        }
+    }
+
+    /// <summary>
+    /// 开始引导式跟弹：不再自动按键，只在游戏画面上显示每一段的引导圈。
+    /// </summary>
+    private void StartGuidedSessionAsync(PerformanceScore? musicItem)
+    {
+        if (musicItem is not { IsValid: true })
+        {
+            _snackbarService.Show(
+                "无法引导",
+                musicItem?.Error ?? "请选择一首有效曲谱。",
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+            return;
+        }
+
+        StopGuidedSession("已切换到新的曲目");
+
+        SelectedMusicItem = musicItem;
+        SaveAllPreferences();
+
+        var profile = _profileService.Find(musicItem.OutputProfileName);
+        musicItem.OutputProfileName = profile.Name;
+
+        var timeline = _timelineBuilder.Build(musicItem, profile, Transpose);
+        var presses = MusicGuidedSegmentBuilder.Build(timeline);
+        if (presses.Count == 0)
+        {
+            _snackbarService.Show(
+                "无法引导",
+                "这首曲谱在当前乐器下没有任何可弹奏的按键。",
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+            return;
+        }
+
+        var layoutConfig = Config.MusicConfig.GuidedKeyLayout;
+        _guidedWindow = new MusicGuidedWindow { IsGameForeground = IsGuidedGameForeground };
+        // 覆盖层与会话共用同一份键位参数：这样在覆盖层上现场微调（按住 Ctrl + 方向键）
+        // 时，窗口改的就是会话正在用的那份配置，改完立刻重画。
+        _guidedWindow.KeyLayout = layoutConfig;
+        _guidedWindow.ExitRequested += OnGuidedExitRequested;
+
+        var options = new MusicGuidedSessionOptions
+        {
+            SegmentSize = Math.Max(1, Config.MusicConfig.GuidedSegmentSize),
+            OverlayEnabled = Config.MusicConfig.GuidedOverlayEnabled,
+            ErrorFlashMilliseconds = Config.MusicConfig.GuidedErrorFlashMilliseconds,
+            TrackName = musicItem.DisplayTitle,
+            InstrumentName = profile.Name,
+            KeyProfile = profile,
+            KeyLayout = layoutConfig,
+            // 开始前先从游戏画面里把琴键的实际位置量出来（1080P / 2K / 4K 都不用自己配键位参数）
+            AutoDetectKeys = Config.MusicConfig.GuidedAutoDetectKeys,
+            // 段内必须按从左往右的顺序弹（默认开；关掉则段内任意顺序都算对）
+            StrictOrder = Config.MusicConfig.GuidedStrictOrder,
+            Overlay = _guidedWindow,
+            // 截图器未绑定时「按进程判断前台」而不是按窗口句柄：引导模式不要求截图器已经绑定游戏窗口，
+            // 玩家切出游戏去聊天时也不会把聊天按键误判成琴键。
+            IsGameActive = IsGuidedGameForeground,
+            Logger = message => _logger.LogInformation("{Message}", message),
+            OnSegmentChanged = OnGuidedSegmentChanged,
+            // 截图器已启动时用当前运行环境截图与定位窗口，否则会话临时创建截图器
+            CurrentRuntime = () => _runtimeService.Current,
+            Config = Config
+        };
+
+        // 自动识别琴键位置要截到「演奏界面」，所以先把游戏窗口切到前台再开始：
+        // 识别发生在 session.Start() 内部、且在贴覆盖层之前截图（覆盖层也画在游戏画面上，
+        // 先贴上去再截图就可能把引导圈一起截进去）。
+        // 手动校准过的参数不会再去识别，也就不用为了截图切前台。
+        if (Config.MusicConfig.GuidedAutoDetectKeys && !layoutConfig.ManualCalibrated)
+        {
+            FocusGameWindow();
+        }
+
+        try
+        {
+            var session = new MusicGuidedSession(presses, options);
+            if (!session.Start())
+            {
+                session.Dispose();
+                StopGuidedSession("引导启动失败");
+                _snackbarService.Show(
+                    "无法引导",
+                    "启动键盘监听失败，请检查是否有其他程序占用了输入。",
+                    ControlAppearance.Danger,
+                    null,
+                    TimeSpan.FromSeconds(4));
+                return;
+            }
+
+            _guidedSession = session;
+            _guidedWindow.Session = session;
+            IsGuidedPlaying = true;
+
+            // 玩家是在 BetterGI 界面上双击曲谱的，不把前台还给游戏，
+            // 接下来敲的琴键就全落在 BetterGI 自己的窗口上（游戏收不到，判定却会当成按错）。
+            FocusGameWindow();
+            TotalDurationMilliseconds = Math.Max(1, timeline.Duration.TotalMilliseconds);
+            CurrentPositionMilliseconds = 0;
+            CurrentTrackName = musicItem.DisplayTitle;
+            CurrentMusicItem = musicItem;
+            _snackbarService.Show(
+                "引导式跟弹已开始",
+                $"共 {session.SegmentCount} 段，每段 {options.SegmentSize} 次按键；按 Esc 退出。",
+                ControlAppearance.Success,
+                null,
+                TimeSpan.FromSeconds(4));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "启动引导式跟弹失败：{TrackName}", musicItem.DisplayTitle);
+            StopGuidedSession("引导启动失败");
+            _snackbarService.Show(
+                "无法引导",
+                ex.Message,
+                ControlAppearance.Danger,
+                null,
+                TimeSpan.FromSeconds(4));
+        }
+    }
+
+    /// <summary>
+    /// 引导式跟弹判断游戏是否在前台：有运行环境时看它的窗口，截图器未启动时按前台窗口的进程名判断。
+    /// </summary>
+    /// <returns>游戏在前台时返回 true。</returns>
+    private bool IsGuidedGameForeground() => SystemControl.IsGameForeground(_runtimeService.Current?.Window);
+
+    /// <summary>
+    /// 引导开始后把前台交还给游戏窗口（覆盖层自己是 WS_EX_NOACTIVATE + 点击穿透的，不会再抢走焦点）。
+    /// </summary>
+    private void FocusGameWindow()
+    {
+        try
+        {
+            var handle = _runtimeService.Current?.Window.Handle ?? IntPtr.Zero;
+            if (handle == IntPtr.Zero)
+            {
+                handle = SystemControl.FindGenshinImpactHandle();
+            }
+
+            if (handle != IntPtr.Zero)
+            {
+                SystemControl.RestoreWindow(handle);
+                return;
+            }
+
+            _logger.LogWarning("引导式跟弹：没有找到原神窗口，无法自动切回游戏，请手动点击游戏窗口。");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "引导式跟弹：切回游戏窗口失败。");
+        }
+    }
+
+    /// <summary>
+    /// 引导过程中切换段落：0 表示整首已经弹完，自动收尾。
+    /// </summary>
+    private void OnGuidedSegmentChanged(int segmentIndex, int totalSegments)
+    {
+        void Update()
+        {
+            if (segmentIndex <= 0)
+            {
+                if (IsGuidedPlaying)
+                {
+                    _logger.LogInformation("引导式跟弹：整首曲目已弹完。");
+                    StopGuidedSession("整首曲目已弹完");
+                }
+
+                return;
+            }
+
+            GuidedStatusText = $"第 {segmentIndex + 1} / {totalSegments} 段";
+            CurrentPositionMilliseconds = 0;
+        }
+
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher == null || dispatcher.CheckAccess())
+        {
+            Update();
+        }
+        else
+        {
+            dispatcher.BeginInvoke(Update);
+        }
+    }
+
+    private void OnGuidedExitRequested()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher == null || dispatcher.CheckAccess())
+        {
+            StopGuidedSession("已退出引导式跟弹");
+        }
+        else
+        {
+            dispatcher.BeginInvoke(() => StopGuidedSession("已退出引导式跟弹"));
+        }
+    }
+
+    private void StopGuidedSession(string reason)
+    {
+        var session = _guidedSession;
+        if (session != null)
+        {
+            session.ExitRequested -= OnGuidedExitRequested;
+            session.Stop(reason);
+            session.Dispose();
+            _guidedSession = null;
+        }
+
+        if (_guidedWindow != null)
+        {
+            _guidedWindow.ExitRequested -= OnGuidedExitRequested;
+            _guidedWindow.Close();
+            _guidedWindow = null;
+        }
+
+        IsGuidedPlaying = false;
+        GuidedStatusText = string.Empty;
+    }
+
+    private bool FilterMusicItem(object item)
+    {
+        if (item is not PerformanceScore score)
+        {
+            return false;
+        }
+
+        var matchesSearch = string.IsNullOrWhiteSpace(SearchText)
+                            || score.DisplayTitle.Contains(SearchText, StringComparison.OrdinalIgnoreCase)
+                            || score.Author.Contains(SearchText, StringComparison.OrdinalIgnoreCase)
+                            || score.RelativePath.Contains(SearchText, StringComparison.OrdinalIgnoreCase);
+        var matchesFormat = string.IsNullOrWhiteSpace(SelectedFormatFilter)
+                            || SelectedFormatFilter == "全部格式"
+                            || score.FormatName == SelectedFormatFilter;
+        var matchesInstrument = string.IsNullOrWhiteSpace(SelectedInstrumentFilter)
+                                || SelectedInstrumentFilter == "全部乐器"
+                                || score.Instrument.Split(',', StringSplitOptions.TrimEntries)
+                                    .Contains(SelectedInstrumentFilter, StringComparer.OrdinalIgnoreCase);
+        return matchesSearch && matchesFormat && matchesInstrument;
+    }
+
+    private void RebuildFilters()
+    {
+        var selectedFormat = SelectedFormatFilter;
+        var selectedInstrument = SelectedInstrumentFilter;
+
+        FormatFilters.Clear();
+        FormatFilters.Add("全部格式");
+        foreach (var format in MusicItems.Select(x => x.FormatName).Distinct().Order())
+        {
+            FormatFilters.Add(format);
+        }
+
+        InstrumentFilters.Clear();
+        InstrumentFilters.Add("全部乐器");
+        foreach (var instrument in MusicItems
+                     .SelectMany(x => x.Instrument.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                     .Order())
+        {
+            InstrumentFilters.Add(instrument);
+        }
+
+        SelectedFormatFilter = !string.IsNullOrWhiteSpace(selectedFormat)
+                               && FormatFilters.Contains(selectedFormat)
+            ? selectedFormat
+            : "全部格式";
+        SelectedInstrumentFilter = !string.IsNullOrWhiteSpace(selectedInstrument)
+                                   && InstrumentFilters.Contains(selectedInstrument)
+            ? selectedInstrument
+            : "全部乐器";
+        MusicItemsView.Refresh();
+    }
+
+    private void SaveSelectedPreference()
+    {
+        if (SelectedMusicItem == null)
+        {
+            return;
+        }
+
+        SavePreference(SelectedMusicItem);
+        _stateStore.Save();
+    }
+
+    private void SaveAllPreferences()
+    {
+        foreach (var item in MusicItems)
+        {
+            SavePreference(item);
+        }
+
+        _stateStore.Save();
+    }
+
+    private void SavePreference(PerformanceScore score)
+    {
+        _stateStore.State.Items[score.RelativePath] = new MusicItemPreference
+        {
+            OutputProfileName = score.OutputProfileName,
+            Transpose = score.Transpose,
+            DisabledTrackIndexes = score.Tracks.Where(x => !x.IsEnabled).Select(x => x.Index).ToList()
+        };
+    }
+
+    private void AddMusicFolderToHistory(string folder)
+    {
+        var existingItem = MusicFolderHistory.FirstOrDefault(x =>
+            string.Equals(x.FullPath, folder, StringComparison.OrdinalIgnoreCase));
+        if (existingItem != null)
+        {
+            if (MusicFolderHistory.IndexOf(existingItem) == 0)
+            {
+                return;
+            }
+
+            MusicFolderHistory.Remove(existingItem);
+        }
+
+        MusicFolderHistory.Insert(0, new MusicFolderHistoryItem(folder));
+        SaveMusicFolderHistory();
+    }
+
+    private void SaveMusicFolderHistory()
+    {
+        _stateStore.State.MusicFolderHistory = [.. MusicFolderHistory.Select(x => x.FullPath)];
+        _stateStore.Save();
+    }
+
+    private void RestorePlaybackState()
+    {
+        if (SelectedMusicItem == null)
+        {
+            CurrentMusicItem = null;
+            CurrentPositionMilliseconds = 0;
+            TotalDurationMilliseconds = 1;
+            CurrentTimeText = "00:00";
+            TotalTimeText = "00:00";
+            CurrentTrackName = "未播放";
+            return;
+        }
+
+        var position = GetSavedPlaybackPosition(SelectedMusicItem);
+        UpdateStoppedPlaybackDisplay(SelectedMusicItem, position);
+        if (!string.Equals(
+                _stateStore.State.CurrentTrackFullPath,
+                SelectedMusicItem.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            SavePlaybackState(SelectedMusicItem, TimeSpan.Zero, true);
+        }
+    }
+
+    private TimeSpan GetSavedPlaybackPosition(PerformanceScore score)
+    {
+        if (!string.Equals(
+                _stateStore.State.CurrentTrackFullPath,
+                score.FullPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return TimeSpan.Zero;
+        }
+
+        var milliseconds = _stateStore.State.CurrentPositionMilliseconds;
+        if (double.IsNaN(milliseconds) || double.IsInfinity(milliseconds) || milliseconds <= 0)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return TimeSpan.FromMilliseconds(Math.Min(milliseconds, score.Duration.TotalMilliseconds));
+    }
+
+    private void UpdateStoppedPlaybackDisplay(PerformanceScore score, TimeSpan position)
+    {
+        CurrentMusicItem = score;
+        position = position > score.Duration ? score.Duration : position;
+        CurrentPositionMilliseconds = position.TotalMilliseconds;
+        TotalDurationMilliseconds = Math.Max(1, score.Duration.TotalMilliseconds);
+        CurrentTimeText = FormatTime(position);
+        TotalTimeText = FormatTime(score.Duration);
+        CurrentTrackName = score.DisplayTitle;
+    }
+
+    private void SavePlaybackState(PerformanceScore score, TimeSpan position, bool force = false)
+    {
+        var pathChanged = !string.Equals(
+            _lastSavedPlaybackPath,
+            score.FullPath,
+            StringComparison.OrdinalIgnoreCase);
+        var playbackSecond = Math.Max(0, (long)position.TotalSeconds);
+
+        _stateStore.State.CurrentTrackFullPath = score.FullPath;
+        _stateStore.State.CurrentPositionMilliseconds = Math.Max(0, position.TotalMilliseconds);
+        if (!force && !pathChanged && playbackSecond == _lastSavedPlaybackSecond)
+        {
+            return;
+        }
+
+        _lastSavedPlaybackPath = score.FullPath;
+        _lastSavedPlaybackSecond = playbackSecond;
+        _stateStore.Save();
+    }
+
+    private void OnMusicItemsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        HasMusicItems = MusicItems.Count > 0;
+    }
+
+    private void OnLibraryFilesChanged(object? sender, EventArgs e)
+    {
+        _ = Application.Current.Dispatcher.InvokeAsync(RefreshLibraryAsync).Task.Unwrap();
+    }
+
+    private void OnScoreParseFailed(object? sender, MusicScoreParseFailedEventArgs e)
+    {
+        _ = Application.Current.Dispatcher.BeginInvoke(() =>
+        {
+            _snackbarService.Show(
+                "曲谱解析失败",
+                $"已跳过 {Path.GetFileName(e.FilePath)}：{e.ErrorMessage}",
+                ControlAppearance.Caution,
+                null,
+                TimeSpan.FromSeconds(5));
+        });
+    }
+
+    private void OnPlaybackSnapshotChanged(object? sender, PlaybackSnapshot snapshot)
+    {
+        var playbackQueue = _activePlaybackQueue;
+        Application.Current?.Dispatcher.BeginInvoke(() =>
+        {
+            if (!_isSeeking)
+            {
+                CurrentPositionMilliseconds = snapshot.Position.TotalMilliseconds;
+                CurrentTimeText = FormatTime(snapshot.Position);
+            }
+
+            TotalDurationMilliseconds = Math.Max(1, snapshot.Duration.TotalMilliseconds);
+            TotalTimeText = FormatTime(snapshot.Duration);
+            CurrentTrackName = string.IsNullOrWhiteSpace(snapshot.TrackName) ? "未播放" : snapshot.TrackName;
+            IsPlaying = snapshot.State == MusicPlaybackState.Playing;
+            IsPaused = snapshot.State == MusicPlaybackState.Paused;
+
+            if (snapshot.QueueIndex >= 0
+                && snapshot.QueueIndex < playbackQueue.Count)
+            {
+                var currentItem = playbackQueue[snapshot.QueueIndex];
+                CurrentMusicItem = currentItem;
+                if (!ReferenceEquals(SelectedMusicItem, currentItem))
+                {
+                    SelectedMusicItem = currentItem;
+                }
+
+                if (snapshot.State is MusicPlaybackState.Playing or MusicPlaybackState.Paused)
+                {
+                    SavePlaybackState(
+                        currentItem,
+                        snapshot.Position,
+                        snapshot.State == MusicPlaybackState.Paused);
+                }
+            }
+        });
+    }
+
+    private MusicInputMode GetInputMode()
+    {
+        return UseBackgroundInput
+            ? MusicInputMode.BackgroundPostMessage
+            : MusicInputMode.ForegroundSendInput;
+    }
+
+    private static string GetPlaybackModeText(MusicPlaybackMode mode)
+    {
+        return mode switch
+        {
+            MusicPlaybackMode.SingleLoop => "单曲循环",
+            MusicPlaybackMode.Shuffle => "随机播放",
+            _ => "顺序播放"
+        };
+    }
+
+    private static string FormatTime(TimeSpan time)
+    {
+        return time.TotalHours >= 1
+            ? time.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture)
+            : time.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
+    }
+
+    private static string GetFolderDisplayName(string folder)
+    {
+        var trimmedPath = folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var folderName = Path.GetFileName(trimmedPath);
+        return string.IsNullOrWhiteSpace(folderName) ? folder : folderName;
+    }
+}
+
+public sealed class MusicFolderHistoryItem(string fullPath)
+{
+    public string FullPath { get; } = fullPath;
+
+    public string DisplayName
+    {
+        get
+        {
+            var trimmedPath = FullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var folderName = Path.GetFileName(trimmedPath);
+            return string.IsNullOrWhiteSpace(folderName) ? FullPath : folderName;
+        }
+    }
+}

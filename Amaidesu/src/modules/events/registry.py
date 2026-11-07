@@ -1,0 +1,327 @@
+"""
+事件注册表
+
+提供两套互补的注册 API：
+
+1. **装饰器 API（推荐）**：通过 ``@register_event("event.name")`` 把 Pydantic Payload
+   类注册到模块级 ``EVENT_REGISTRY`` 字典。
+
+   使用方式::
+
+       from src.modules.events.registry import register_event
+       from pydantic import BaseModel
+
+
+       @register_event("room.message.danmaku")
+       class RoomMessagePayload(BaseModel): ...
+
+   装饰器是**幂等**的：不引入 import，不会因为 ``register_core_events()`` 未调用
+   而失效。Payload 模块一旦被 import（任意路径），装饰器即生效。
+
+2. **类 API（兼容层）**：``EventRegistry.register_core_event(...)`` 等方法。
+   保留用于已有调用方，新代码应优先使用装饰器。
+
+调用方：
+
+- ``register_core_events()`` 仅用于在应用启动时触发 Payload 子模块的 import，
+  以保证 ``@register_event`` 装饰器被执行；其本身不再维护任何手写映射。
+"""
+
+from typing import Callable, Dict, FrozenSet, Optional, Type, TypeVar
+
+from pydantic import BaseModel
+
+from src.modules.events.names import CoreEvents
+from src.modules.logging import get_logger
+
+T = TypeVar("T", bound=Type[BaseModel])
+
+
+# ==================== 多名反向引用 ====================
+
+
+class _MultiName:
+    """
+    支持一对多注册的反向引用对象
+
+    同一 Payload 类注册到多个事件名时，``_registered_event_name`` 持有本对象。
+    ``==`` 运算符与 ``_names`` 集合中**任意一个**字符串名相等——这让
+    ``test_decorator_isolation`` 等测试在 ``EVENT_REGISTRY.items()`` 循环中对
+    同一类（多个键）都通过 ``reverse_name == event_name`` 断言。
+
+    兼容性：
+    - ``is not None`` 仍成立（对象本身非 None）
+    - ``!r`` 格式化显示为 ``<MultiName [...]>``，便于日志/调试识别
+    - ``__hash__`` 实现：与所有已注册名共享同一哈希（仅用于占位）
+    """
+
+    __slots__ = ("_names",)
+
+    def __init__(self, names: FrozenSet[str]) -> None:
+        self._names = names
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return other in self._names
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self) -> int:
+        # 与单名反向引用保持一致的可哈希性（仅用于占位）
+        return 0
+
+    def __repr__(self) -> str:
+        return f"<MultiName {sorted(self._names)}>"
+
+    def __bool__(self) -> bool:
+        return bool(self._names)
+
+
+# ==================== 模块级注册表 ====================
+
+# 由 @register_event 装饰器填充。
+# Key 是事件名（如 "room.message.danmaku"），Value 是 Pydantic Model 类型。
+EVENT_REGISTRY: Dict[str, Type[BaseModel]] = {}
+
+# 动态事件族登记表：族前缀 → payload 类型。
+# 族内具体事件名（如 "tool.result.<工具名>"）由发布方在 emit 时即时构造，
+# 不进 EVENT_REGISTRY；登记条目供一致性检查（族成员不算多余注册）与文档使用。
+DYNAMIC_EVENT_FAMILIES: Dict[str, Type[BaseModel]] = {}
+
+
+def register_event_family(prefix: str, model_class: Type[BaseModel]) -> None:
+    """
+    登记一个动态事件族（族前缀 + payload 类型）
+
+    动态族的事件名在 emit 时由发布方拼接（如 ``tool.result.<name>``），
+    无法用 ``@register_event`` 逐一注册；此处登记"前缀 → payload 类型"
+    供启动一致性检查与文档检索。
+
+    Args:
+        prefix: 族前缀（以点号结尾，如 ``"tool.result."``）
+        model_class: 该族事件统一使用的 payload 类型
+    """
+    if not prefix.endswith("."):
+        raise ValueError(f"动态族前缀必须以点号结尾: '{prefix}'")
+    DYNAMIC_EVENT_FAMILIES[prefix] = model_class
+
+
+# ==================== 装饰器 API ====================
+
+
+def register_event(event_name: str) -> Callable[[T], T]:
+    """
+    注册事件 Payload 类型的装饰器
+
+    使用 ``@register_event("event.name")`` 把 Pydantic BaseModel 子类注册为
+    对应事件的 Payload 类型，并设置 ``cls._registered_event_name`` 反向引用。
+
+    同一类注册到多个事件名时：
+    - ``_registered_event_name`` 被设为 :class:`_MultiName` 对象
+    - ``_all_registered_names`` 被设为 ``frozenset``，列出全部注册名
+    - 测试断言 ``reverse_name == event_name`` 对所有已注册事件名都成立
+
+    Args:
+        event_name: 事件名称（如 ``"room.message.danmaku"``）。必须是
+            :class:`CoreEvents` 已登记的常量值——事件名以 ``names.py`` 为
+            唯一事实源，拼写漂移在此处直接暴露。``"test."`` 前缀保留给
+            测试合成事件名，豁免校验。
+
+    Returns:
+        装饰器函数。被装饰的类原样返回。
+
+    Raises:
+        ValueError: ``event_name`` 未在 :class:`CoreEvents` 登记，
+            或已被注册为**不同的**类型。
+
+    Example:
+        ::
+
+            @register_event(CoreEvents.ROOM_MESSAGE_DANMAKU)
+            class RoomMessagePayload(BaseModel): ...
+
+
+            assert RoomMessagePayload._registered_event_name == "room.message.danmaku"
+
+
+            @register_event(CoreEvents.LIVE_STARTED)
+            @register_event(CoreEvents.LIVE_ENDED)
+            class LivePayload(BasePayload): ...
+    """
+
+    def decorator(cls: T) -> T:
+        if event_name not in CoreEvents.ALL_EVENTS and not event_name.startswith("test."):
+            raise ValueError(
+                f"事件名 '{event_name}' 未在 CoreEvents（names.py）登记；"
+                "事件名以 CoreEvents 常量为唯一事实源，请先在 names.py 增补常量"
+            )
+        existing = EVENT_REGISTRY.get(event_name)
+        if existing is not None and existing is not cls:
+            raise ValueError(f"事件 '{event_name}' 已被注册为 {existing.__name__}，不能再次注册为 {cls.__name__}")
+        EVENT_REGISTRY[event_name] = cls
+        # 反向引用：合并到类的 _all_registered_names 集合，重建 _registered_event_name
+        existing_names: FrozenSet[str] = getattr(cls, "_all_registered_names", frozenset())
+        new_names: FrozenSet[str] = existing_names | {event_name}
+        cls._all_registered_names = new_names  # type: ignore[attr-defined]
+        # 单事件名 → 单字符串；多事件名 → _MultiName（== 与任意已注册名匹配）
+        if len(new_names) == 1:
+            cls._registered_event_name = event_name  # type: ignore[attr-defined]
+        else:
+            cls._registered_event_name = _MultiName(new_names)  # type: ignore[attr-defined]
+        return cls
+
+    return decorator
+
+
+def get_registered_event(name: str) -> Optional[Type[BaseModel]]:
+    """
+    通过事件名获取已注册的 Payload 类型
+
+    Args:
+        name: 事件名称。
+
+    Returns:
+        已注册的 Pydantic Model 类型；未注册返回 ``None``。
+    """
+    return EVENT_REGISTRY.get(name)
+
+
+def list_registered_events() -> Dict[str, Type[BaseModel]]:
+    """
+    列出所有通过 ``@register_event`` 注册的事件
+
+    Returns:
+        事件名到 Payload 类型的映射字典（副本），修改不影响内部注册表。
+    """
+    return EVENT_REGISTRY.copy()
+
+
+# ==================== 兼容查询层：EventRegistry 类 ====================
+
+
+class EventRegistry:
+    """
+    事件类型注册表（查询 API）
+
+    所有事件注册统一通过 :func:`register_event` 装饰器写入 :data:`EVENT_REGISTRY`。
+    本类提供兼容的查询 API（``get`` / ``is_registered`` / ``list_all_events``）。
+    """
+
+    _logger = get_logger("EventRegistry")
+
+    # ==================== 查询 API ====================
+
+    @classmethod
+    def get(cls, event_name: str) -> Optional[Type[BaseModel]]:
+        """
+        获取事件的 Model 类型
+
+        委托给模块级 :data:`EVENT_REGISTRY`（由 ``@register_event`` 装饰器填充）。
+
+        Args:
+            event_name: 事件名称
+
+        Returns:
+            Pydantic Model 类型，未注册返回 None
+        """
+        return EVENT_REGISTRY.get(event_name)
+
+    @classmethod
+    def is_registered(cls, event_name: str) -> bool:
+        """检查事件是否已注册"""
+        return event_name in EVENT_REGISTRY
+
+    # ==================== 列表 API ====================
+
+    @classmethod
+    def list_all_events(cls) -> Dict[str, Type[BaseModel]]:
+        """列出所有注册的事件"""
+        return EVENT_REGISTRY.copy()
+
+
+# ==================== 启动钩子 ====================
+
+
+def register_core_events() -> None:
+    """
+    触发所有 Payload 模块导入以执行 ``@register_event`` 装饰器
+
+    该函数本身不维护任何事件→Payload 映射。Payload 模块一旦被 import，
+    其内部的 ``@register_event`` 装饰器即把对应类登记到 :data:`EVENT_REGISTRY`。
+
+    触发各语义域 Payload 模块（live/room/game/rundown/planner 等）
+    的导入，让 ``@register_event`` 装饰器执行；同时登记动态事件族
+    （``tool.result.*`` / ``tool.health.*``）。
+    """
+    # noqa: F401 —— 仅为触发模块级 @register_event 执行
+    from src.modules.events.payloads import (  # noqa: F401
+        body as _body_payloads,  # noqa: F401
+        core as _core_payloads,  # noqa: F401
+        game as _game_payloads,  # noqa: F401
+        live as _live_payloads,  # noqa: F401
+        planner as _planner_payloads,  # noqa: F401
+        room as _room_payloads,  # noqa: F401
+        room_state as _room_state_payloads,  # noqa: F401
+        rundown as _rundown_payloads,  # noqa: F401
+        notebook as _notebook_payloads,  # noqa: F401
+        speech as _speech_payloads,
+        tasks as _tasks_payloads,  # noqa: F401
+        tool_health as _tool_health_payloads,  # noqa: F401
+        tool_result as _tool_result_payloads,  # noqa: F401
+        utterance as _utterance_payloads,  # noqa: F401
+    )
+
+    # 动态事件族登记（函数内 import 规避循环：payloads 子模块依赖本模块的
+    # register_event 装饰器）
+    from src.modules.events.payloads.tool_health import ToolHealthPayload
+    from src.modules.events.payloads.tool_result import ToolResultPayload
+
+    register_event_family("tool.result.", ToolResultPayload)
+    register_event_family("tool.health.", ToolHealthPayload)
+
+
+def _named_core_events() -> FrozenSet[str]:
+    """
+    ``CoreEvents`` 定义的具名事件集合（剔除 ``*`` / ``#`` 通配占位符）
+
+    通配占位符（如 ``tool.result.#``）是订阅模式标识，不是被 emit 的具体
+    事件名，不参与注册一致性比对。
+    """
+    return frozenset(name for name in CoreEvents.get_all_events() if "*" not in name and "#" not in name)
+
+
+def ensure_registry_consistency() -> None:
+    """
+    启动硬检查：已注册事件集合必须与 ``CoreEvents`` 定义完全一致
+
+    比对三方集合：
+    - 期望：``CoreEvents`` 定义的具名事件
+    - 已注册：``EVENT_REGISTRY``（由 ``@register_event`` 装饰器填充）
+    - 动态族：``DYNAMIC_EVENT_FAMILIES`` 前缀下的注册名不视为多余
+
+    缺失（定义了事件但没注册 payload）或多余（注册了 CoreEvents 未定义的
+    事件）都视为契约漂移，直接抛错阻止启动。
+
+    Raises:
+        RuntimeError: 集合不一致，消息中列出全部缺失与多余事件名
+    """
+    expected = _named_core_events()
+    registered = set(EVENT_REGISTRY.keys())
+
+    missing = sorted(expected - registered)
+    extra = sorted(
+        name for name in registered - expected if not any(name.startswith(prefix) for prefix in DYNAMIC_EVENT_FAMILIES)
+    )
+
+    if missing or extra:
+        lines = ["事件注册表与 CoreEvents 定义不一致:"]
+        if missing:
+            lines.append(f"  缺失注册: {', '.join(missing)}")
+        if extra:
+            lines.append(f"  多余注册: {', '.join(extra)}")
+        raise RuntimeError("\n".join(lines))

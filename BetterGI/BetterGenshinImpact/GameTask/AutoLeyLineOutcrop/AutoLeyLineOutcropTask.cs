@@ -1,0 +1,2805 @@
+using BetterGenshinImpact.GameTask.Common.Resin;
+using BetterGenshinImpact.GameTask.AutoFight.Strategy;
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Recognition;
+using BetterGenshinImpact.Core.Recognition.OpenCv;
+using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.Core.Script;
+using BetterGenshinImpact.Core.Script.Dependence;
+using BetterGenshinImpact.Core.Simulator.Extensions;
+using BetterGenshinImpact.GameTask.AutoDomain;
+using BetterGenshinImpact.GameTask.AutoPathing;
+using BetterGenshinImpact.GameTask.AutoPathing.Handler;
+using BetterGenshinImpact.GameTask.AutoPathing.Model;
+using BetterGenshinImpact.GameTask.AutoTrackPath;
+using BetterGenshinImpact.GameTask.AutoFight;
+using BetterGenshinImpact.GameTask.AutoFight.Assets;
+using BetterGenshinImpact.GameTask.AutoPick.Assets;
+using BetterGenshinImpact.GameTask.AutoFight.Model;
+using BetterGenshinImpact.GameTask.AutoFight.Script;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Common.BgiVision;
+using BetterGenshinImpact.GameTask.Common.Job;
+using BetterGenshinImpact.GameTask.Common.Reward;
+using BetterGenshinImpact.GameTask.Common.Map.Maps.Base;
+using BetterGenshinImpact.GameTask;
+using BetterGenshinImpact.GameTask.Model;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.GameTask.SoloTask;
+using BetterGenshinImpact.Service.Notification;
+using BetterGenshinImpact.Service.Notification.Model.Enum;
+using BetterGenshinImpact.Core.Mask;
+using Microsoft.Extensions.Logging;
+using OpenCvSharp;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using BetterGenshinImpact.GameTask.AutoGeniusInvokation.Exception;
+using Vanara.PInvoke;
+using static BetterGenshinImpact.GameTask.Common.TaskControl;
+using BetterGenshinImpact.View;
+using BetterGenshinImpact.View.Pages.SoloTaskSettings;
+using BetterGenshinImpact.ViewModel.SoloTaskSettings;
+
+namespace BetterGenshinImpact.GameTask.AutoLeyLineOutcrop;
+
+/// <summary>
+/// 自动地脉花：按冒险之证定位地脉花，沿节点路线前往、战斗并领取奖励。
+/// </summary>
+[SoloTaskInfo(TaskId, "自动地脉花", Group = "树脂与战斗", Order = 240, OneDragonOrder = 6)]
+[SoloTaskSettingsView(typeof(AutoLeyLineOutcropSettingsView), typeof(AutoLeyLineOutcropSettingsViewModel))]
+public class AutoLeyLineOutcropTask : ISoloTask<AutoLeyLineOutcropParam, ResinClaimData>
+{
+    /// <summary>本任务支持的树脂使用方式、种类、档位及默认设置。</summary>
+    public static ResinUsageCapability ResinCapability => ResinCapabilities.LeyLineOutcrop;
+
+    /// <summary>
+    /// 独立任务稳定标识。
+    /// </summary>
+    public const string TaskId = "auto_ley_line_outcrop";
+
+    /// <summary>
+    /// 本任务专用原因码：树脂已耗尽，未执行地脉花挑战。
+    /// </summary>
+    public const string ResinExhaustedReason = SoloTaskReasons.ResinExhausted;
+
+    /// <summary>
+    /// 本任务专用原因码：当前地脉花位置没有匹配的路线策略。
+    /// </summary>
+    public const string RouteStrategyNotFoundReason = "ley_line_route_not_found";
+
+    /// <summary>
+    /// 日志与通知中使用的任务名称。
+    /// </summary>
+    private const string TaskName = "自动地脉花";
+
+    private readonly ILogger<AutoLeyLineOutcropTask> _logger = App.GetLogger<AutoLeyLineOutcropTask>();
+
+    /// <summary>
+    /// 本次运行使用的运行环境
+    /// </summary>
+    private readonly GameRuntime _runtime;
+
+    /// <summary>
+    /// 配置根，由创建方传入
+    /// </summary>
+    private readonly AllConfig _config;
+
+    /// <summary>
+    /// 本次运行的业务参数，在 RunAsync 开头赋值。
+    /// </summary>
+    private AutoLeyLineOutcropParam _taskParam = null!;
+
+    /// <summary>
+    /// 是否为一条龙模式（不先传送到七天神像），在 RunAsync 开头从参数赋值。
+    /// </summary>
+    private bool _oneDragonMode;
+
+    /// <summary>
+    /// 本次运行中是否出现过“未找到对应的地脉花策略”。
+    /// </summary>
+    private bool _routeStrategyNotFound;
+    private TpTask _tpTask = null!;
+
+    /// <summary>
+    /// 背包摩拉扫描器
+    /// </summary>
+    private MoraFromInventoryScanner _moraFromInventoryScanner = null!;
+    private readonly ReturnMainUiTask _returnMainUiTask;
+    private SwitchPartyTask? _switchPartyTask;
+    private ISystemInfo _systemInfo = null!;
+
+    private CancellationToken _ct;
+
+    /// <summary>
+    /// 本任务启用的自动拾取，任务结束时撤销
+    /// </summary>
+    private IDisposable? _autoPickLease;
+
+    private AutoLeyLineConfigData? _configData;
+    private NodeData? _nodeData;
+
+    private double _leyLineX;
+    private double _leyLineY;
+    /// <summary>本次统一领奖目标与消耗记录。</summary>
+    private ResinClaimSelector _selector = null!;
+    /// <summary>本批次的内部领奖次数上限，不改写参数。</summary>
+    private int _targetRunTimes;
+    /// <summary>没有可用领奖选项后停止后续路线和挑战。</summary>
+    private bool _rewardStopped;
+    /// <summary>本次树脂结束原因。</summary>
+    private ResinStopReason _stopReason;
+    private int _currentRunTimes;
+    private int _recheckCount;
+    private int _consecutiveFailureCount;
+
+    /// <summary>材料目标是否已全部达成。</summary>
+    private bool _itemStopReached;
+
+    /// <summary>启示之花奖励停止的背包基线。</summary>
+    private Dictionary<string, int>? _expBaseline;
+
+    /// <summary>藏金之花奖励停止的摩拉基线。</summary>
+    private int? _moraBaseline;
+    private DateTime _lastRewardNavLog = DateTime.MinValue;
+
+    private RecognitionObject? _paimonMenuRo;
+    private RecognitionObject? _boxIconRo;
+    private RecognitionObject? _mapSettingButtonRo;
+    private RecognitionObject? _handbookTrackActionRo;
+    private RecognitionObject? _ocrRo1;
+    private RecognitionObject? _ocrRo2;
+    private RecognitionObject? _ocrRo3;
+    private readonly RecognitionObject _ocrRoThis = RecognitionObject.OcrThis;
+
+    private readonly Dictionary<string, Mat> _templateCache = new();
+
+    private const int MaxRecheckCount = 3;
+    private const int MaxConsecutiveFailures = 5;
+    private const int MaxCountryScrollAttempts = 8;
+    private const int CountryScrollDelayMs = 250;
+    private const double CountryListLeftRatio = 0.55;
+    private const double CountryListTopRatio = 0.15;
+    private const double CountryListRightRatio = 0.95;
+    private const double CountryListVisibleBottomRatio = 0.74;
+    private const string OcrFlowOverlayKey = "AutoLeyLineOutcrop.OcrFlow";
+    private const string OcrFightOverlayKey = "AutoLeyLineOutcrop.OcrFight";
+    private const int OcrOverlayRenderLeadMs = 300;
+    private const int KazuhaPickupPostSkillWaitMs = 3000;
+    private static readonly TimeSpan LeyLineFightSeekInitialDelay = TimeSpan.FromSeconds(2);
+    private static readonly Rect HandbookTrackActionButtonRoi = new(ScaleTo1080(1120), ScaleTo1080(680), ScaleTo1080(700), ScaleTo1080(320));
+    private static readonly System.Drawing.Pen OcrOverlayPen = new(System.Drawing.Color.Lime, 2);
+    private static readonly object PickLock = new();
+    private bool _friendshipTeamSwitched;
+
+    /// <summary>
+    /// 创建自动地脉花任务。业务参数通过 <see cref="RunAsync"/> 传入。
+    /// </summary>
+    /// <param name="runtime">本次运行使用的运行环境</param>
+    /// <param name="config">配置根</param>
+    public AutoLeyLineOutcropTask(GameRuntime runtime, AllConfig config)
+    {
+        _runtime = runtime;
+        _config = config;
+        _returnMainUiTask = new ReturnMainUiTask(runtime);
+    }
+
+    /// <summary>
+    /// 运行自动地脉花。
+    /// </summary>
+    /// <param name="param">本次运行的业务参数</param>
+    /// <param name="ct">取消令牌</param>
+    /// <returns>
+    /// 参数无效返回 Failed(invalid_parameter)；树脂耗尽未执行返回 Skipped(resin_exhausted)；
+    /// 出现未匹配的地脉花路线策略返回 Failed(ley_line_route_not_found)；其余正常结束返回 Unverified。
+    /// </returns>
+    public async Task<SoloTaskResult<ResinClaimData>> RunAsync(AutoLeyLineOutcropParam param, CancellationToken ct)
+    {
+        param.ResolveResinUsage();
+        if (param.ResinUsage.Validate(ResinCapability) is { } problem)
+            return SoloTaskResult.Failed(SoloTaskReasons.InvalidParameter, problem);
+        _selector = new ResinClaimSelector(param.ResinUsage, ResinCapability);
+        _currentRunTimes = 0;
+        _recheckCount = 0;
+        _rewardStopped = false;
+        _stopReason = ResinStopReason.ResinExhausted;
+        // 1. 参数校验：无效参数直接返回失败，不做任何游戏操作
+        var invalidReason = ValidateParam(param);
+        if (invalidReason != null)
+        {
+            return SoloTaskResult.Failed(SoloTaskReasons.InvalidParameter, invalidReason);
+        }
+
+        // 2. 保存本次运行的参数（原构造函数参数）
+        _taskParam = param;
+        _oneDragonMode = param.OneDragonMode;
+        _routeStrategyNotFound = false;
+        _ct = ct;
+        _itemStopReached = false;
+        _expBaseline = null;
+        _moraBaseline = null;
+        Notify.Event(NotificationEvent.LeyLineStart).Success($"{TaskName}启动");
+
+        try
+        {
+            Initialize();
+            var runTimesValue = await CalculateTargetRunTimes();
+            if (runTimesValue <= 0)
+            {
+                // 树脂耗尽：条件不满足，未执行挑战
+                Logger.LogInformation("任务结束：{Msg}", "树脂耗尽，任务结束");
+                return SoloTaskResult.Skipped(SoloTaskReasons.ResinExhausted, ResinUsageText.Skipped);
+            }
+
+            await PrepareForLeyLineRun();
+            await CaptureLeylineBaselineAsync();
+            await RunLeyLineChallenges();
+
+            if (_taskParam.ResinUsage.Mode == ResinUsageMode.Exhaust && !_rewardStopped)
+            {
+                await RecheckResinAndContinue();
+            }
+
+            // 3. 汇总结果：流程中出现过未匹配的路线策略视为业务失败
+            if (_routeStrategyNotFound)
+            {
+                return SoloTaskResult.Failed(RouteStrategyNotFoundReason, "未找到对应的地脉花策略");
+            }
+
+            // 领奖次数或材料目标任一达成都按目标完成结算并返回成功；树脂不足等提前结束为“已执行，未核验”。
+            return ResinClaimResults.Complete(_selector,
+                _selector.IsTargetReached || _itemStopReached ? ResinStopReason.TargetReached : _stopReason,
+                "地脉花流程已结束", true, targetItemsReached: _itemStopReached);
+        }
+        catch (Exception e) when (e is NormalEndException or OperationCanceledException)
+        {
+            // 取消或运行环境停止：记录后继续向上抛出，不再吞掉
+            Logger.LogInformation("任务结束：{Msg}", e.Message);
+            throw;
+        }
+        catch (Exception e)
+        {
+            _logger.LogDebug(e, "自动地脉花执行失败");
+            _logger.LogError("自动地脉花执行失败:" + e.Message);
+            Notify.Event(NotificationEvent.LeyLineInfo).Error($"任务失败: {e.Message}");
+            throw new Exception($"自动地脉花执行失败: {e.Message}", e);
+        }
+        finally
+        {
+            try
+            {
+                try
+                {
+                    await EnsureExitRewardPage();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "地脉花结束后尝试退出奖励界面失败");
+                }
+                finally
+                {
+                    _autoPickLease?.Dispose();
+                    _autoPickLease = null;
+                    ClearOcrOverlayKeys();
+                }
+            }
+            finally
+            {
+                Notify.Event(NotificationEvent.LeyLineEnd).Success($"{TaskName}结束");
+            }
+        }
+    }
+
+    private void Initialize()
+    {
+        _systemInfo = _runtime.SystemInfo;
+        _tpTask = new TpTask(_runtime, _config, _ct);
+        _moraFromInventoryScanner = new MoraFromInventoryScanner(_runtime, _logger);
+        NormalizeSettings();
+        LoadConfigData();
+        LoadRecognitionObjects();
+    }
+
+    /// <summary>
+    /// 校验本次运行的业务参数（次数、类型、国家、队伍与材料目标）。
+    /// </summary>
+    /// <param name="param">本次运行的业务参数</param>
+    /// <returns>参数无效时返回中文原因；有效时返回 null</returns>
+    private static string? ValidateParam(AutoLeyLineOutcropParam param)
+    {
+        // 次数与超时必须为正数（与 Pulonia 原执行器的校验一致）
+        if (param.Timeout < 1)
+        {
+            return "地脉花超时必须为正数。";
+        }
+
+        if (string.IsNullOrWhiteSpace(param.LeyLineOutcropType))
+        {
+            return "地脉花类型未选择";
+        }
+
+        if (param.LeyLineOutcropType != "启示之花" && param.LeyLineOutcropType != "藏金之花")
+        {
+            return "地脉花类型无效，请重新选择";
+        }
+
+        if (string.IsNullOrWhiteSpace(param.Country))
+        {
+            return "国家未配置";
+        }
+
+        if (!string.IsNullOrWhiteSpace(param.FriendshipTeam) && string.IsNullOrWhiteSpace(param.Team))
+        {
+            return "配置好感队时必须配置战斗队伍";
+        }
+
+        if (param.TargetItems.Count > 0)
+        {
+            try
+            {
+                TargetItemCatalog.Instance.ValidateLeylineSettings(param.LeyLineOutcropType, param.TargetItems);
+            }
+            catch (TargetItemConfigurationException e)
+            {
+                return e.Message;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 规范化本次参数中的战斗配置与超时（参数已通过 <see cref="ValidateParam"/> 校验）。
+    /// </summary>
+    private void NormalizeSettings()
+    {
+        _taskParam.FightConfig ??= new AutoLeyLineOutcropFightConfig();
+
+        if (string.IsNullOrWhiteSpace(_taskParam.FightConfig.StrategyName) && _taskParam.Timeout > 0)
+        {
+            _taskParam.FightConfig.Timeout = _taskParam.Timeout;
+        }
+
+        if (_taskParam.FightConfig.Timeout <= 0)
+        {
+            _taskParam.FightConfig.Timeout = _taskParam.Timeout > 0 ? _taskParam.Timeout : 120;
+        }
+        else
+        {
+            _taskParam.Timeout = _taskParam.FightConfig.Timeout;
+        }
+    }
+
+    private void LoadConfigData()
+    {
+        // Load and validate the static ley line route config from disk.
+        var workDir = Global.Absolute(@"GameTask\AutoLeyLineOutcrop");
+        var configPath = Path.Combine(workDir, "Assets", "config.json");
+        if (!File.Exists(configPath))
+        {
+            throw new FileNotFoundException("config.json 未找到", configPath);
+        }
+
+        var json = File.ReadAllText(configPath);
+        _configData = JsonSerializer.Deserialize<AutoLeyLineConfigData>(json)
+                      ?? throw new Exception("config.json 解析失败");
+    }
+
+    private void LoadRecognitionObjects()
+    {
+        // Template ROIs are tuned for the 1080p capture region.
+        _paimonMenuRo = BuildTemplate("Assets/icon/paimon_menu.png", new Rect(0, 0, ScaleTo1080(640), ScaleTo1080(216)));
+        _boxIconRo = BuildTemplate("Assets/icon/box.png");
+        _mapSettingButtonRo = BuildTemplate("Assets/icon/map_setting_button.bmp");
+        _handbookTrackActionRo = BuildTemplate("Assets/icon/handbook_track_action_left.png", HandbookTrackActionButtonRoi, 0.72);
+
+        _ocrRo1 = RecognitionObject.Ocr(ScaleTo1080(800), ScaleTo1080(200), ScaleTo1080(300), ScaleTo1080(100));
+        _ocrRo2 = RecognitionObject.Ocr(ScaleTo1080(0), ScaleTo1080(200), ScaleTo1080(300), ScaleTo1080(300));
+        _ocrRo3 = RecognitionObject.Ocr(ScaleTo1080(1200), ScaleTo1080(520), ScaleTo1080(300), ScaleTo1080(300));
+    }
+
+    private static int ScaleTo1080(int value)
+    {
+        // CaptureToRectArea returns a 1080p region already.
+        return value;
+    }
+
+    private RecognitionObject BuildTemplate(string relativePath, Rect? roi = null, double threshold = 0.8)
+    {
+        // Cache + scale templates to the current asset scale to keep matching stable.
+        var mat = LoadTemplate(relativePath);
+        var ro = RecognitionObject.TemplateMatch(mat);
+        ro.Threshold = threshold;
+        if (roi.HasValue)
+        {
+            ro.RegionOfInterest = roi.Value;
+        }
+
+        return ro;
+    }
+
+    private Mat LoadTemplate(string relativePath)
+    {
+        if (_templateCache.TryGetValue(relativePath, out var cached))
+        {
+            return cached;
+        }
+
+        var workDir = Global.Absolute(@"GameTask\AutoLeyLineOutcrop");
+        var fullPath = Path.Combine(workDir, relativePath.Replace("/", Path.DirectorySeparatorChar.ToString()));
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException("模板素材未找到", fullPath);
+        }
+
+        var mat = Mat.FromStream(File.OpenRead(fullPath), ImreadModes.Color);
+        // Resize once and reuse to avoid repeated scaling during recognition.
+        var scaled = ResizeHelper.Resize(mat, _systemInfo.AssetScale);
+        _templateCache[relativePath] = scaled;
+        return scaled;
+    }
+
+    /// <summary>仅按本次允许的树脂预计算批次上限，不改写 JS 兼容 Count 或统一参数。</summary>
+    private async Task<int> CalculateTargetRunTimes()
+    {
+        var result = await CalCountByResin();
+        var remaining = ResinExecutionRules.TargetRunCount(_taskParam.ResinUsage, result.Count, _selector.ClaimCount);
+        _targetRunTimes = _currentRunTimes + remaining;
+        var text = "树脂使用统计结果:\n"
+            + $"原粹树脂次数: {result.OriginalResinTimes}\n浓缩树脂次数: {result.CondensedResinTimes}\n"
+            + $"须臾树脂次数: {result.TransientResinTimes}\n脆弱树脂次数: {result.FragileResinTimes}\n"
+            + $"本批次数: {remaining}";
+        Notify.Event(NotificationEvent.LeyLineInfo).Send(text);
+        return remaining;
+    }
+
+    private async Task PrepareForLeyLineRun()
+    {
+        await EnsureExitRewardPage();
+        await _returnMainUiTask.Start(_ct);
+        if (!_oneDragonMode)
+        {
+            await _tpTask.TpToStatueOfTheSeven();
+        }
+
+        if (!string.IsNullOrWhiteSpace(_taskParam.Team))
+        {
+            await TrySwitchPartyAndSync(_taskParam.Team);
+        }
+
+        _autoPickLease?.Dispose();
+        _autoPickLease = TaskTriggerDispatcher.Instance().AddTrigger("AutoPick");
+    }
+
+    private async Task RunLeyLineChallenges()
+    {
+        while (!_itemStopReached && _currentRunTimes < _targetRunTimes && !_rewardStopped && !_selector.IsTargetReached)
+        {
+            await FindLeyLineOutcropByBook(_taskParam.Country, _taskParam.LeyLineOutcropType);
+
+            var foundStrategy = await ExecuteMatchingStrategy();
+            if (!foundStrategy)
+            {
+                HandleNoStrategyFound();
+                return;
+            }
+        }
+    }
+
+    private async Task<bool> ExecuteMatchingStrategy()
+    {
+        if (_configData?.LeyLinePositions == null)
+        {
+            throw new Exception("地脉花策略配置缺失");
+        }
+
+        if (!_configData.LeyLinePositions.TryGetValue(_taskParam.Country, out var positions))
+        {
+            return false;
+        }
+
+        foreach (var position in positions)
+        {
+            if (IsNearPosition(_leyLineX, _leyLineY, position.X, position.Y, _configData.ErrorThreshold))
+            {
+                _logger.LogInformation("匹配策略: {Strategy} order={Order}", position.Strategy, position.Order);
+                await ExecutePathsUsingNodeData(position);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsNearPosition(double x1, double y1, double x2, double y2, double threshold)
+    {
+        return Math.Abs(x1 - x2) <= threshold && Math.Abs(y1 - y2) <= threshold;
+    }
+
+    private async Task ExecutePathsUsingNodeData(LeyLinePosition position)
+    {
+        try
+        {
+            // Map node graph provides the walking routes for each ley line position.
+            var nodeData = await LoadNodeData();
+            var targetNode = FindTargetNodeByPosition(nodeData, position.X, position.Y);
+            if (targetNode == null)
+            {
+                await EnsureExitRewardPage();
+                return;
+            }
+
+            var paths = FindPathsToTarget(nodeData, targetNode);
+            if (paths.Count == 0)
+            {
+                await EnsureExitRewardPage();
+                return;
+            }
+
+            var optimal = SelectOptimalPath(paths);
+            await ExecutePath(optimal);
+
+            if (_itemStopReached || _currentRunTimes >= _targetRunTimes || _rewardStopped || _selector.IsTargetReached)
+            {
+                return;
+            }
+
+            var currentNode = targetNode;
+            while (!_itemStopReached && currentNode.Next.Count > 0 && _currentRunTimes < _targetRunTimes && !_rewardStopped && !_selector.IsTargetReached)
+            {
+                if (currentNode.Next.Count == 1)
+                {
+                    var next = currentNode.Next[0];
+                    var nextNode = nodeData.Nodes.FirstOrDefault(n => n.Id == next.Target);
+                    if (nextNode == null)
+                    {
+                        await EnsureExitRewardPage();
+                        return;
+                    }
+
+                    var path = new PathInfo
+                    {
+                        StartNode = currentNode,
+                        TargetNode = nextNode,
+                        Routes = [next.Route]
+                    };
+                    await ExecutePath(path);
+                    currentNode = nextNode;
+                }
+                else
+                {
+                    // Multiple branches: re-locate the ley line position before deciding the route.
+                    var originalX = _leyLineX;
+                    var originalY = _leyLineY;
+
+                    await _returnMainUiTask.Start(_ct);
+                    await _tpTask.OpenBigMapUi();
+                    var found = await LocateLeyLineOutcrop(_taskParam.LeyLineOutcropType);
+                    await _returnMainUiTask.Start(_ct);
+
+                    if (!found)
+                    {
+                        _leyLineX = originalX;
+                        _leyLineY = originalY;
+                        await EnsureExitRewardPage();
+                        return;
+                    }
+
+                    var selected = SelectBranchRoute(nodeData, currentNode);
+                    if (selected == null)
+                    {
+                        _leyLineX = originalX;
+                        _leyLineY = originalY;
+                        await EnsureExitRewardPage();
+                        return;
+                    }
+
+                    var path = new PathInfo
+                    {
+                        StartNode = currentNode,
+                        TargetNode = selected.Value.Node,
+                        Routes = [selected.Value.Route]
+                    };
+                    await ExecutePath(path);
+                    currentNode = selected.Value.Node;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            if (ex.Message.Contains("战斗失败", StringComparison.OrdinalIgnoreCase))
+            {
+                _consecutiveFailureCount++;
+                if (_consecutiveFailureCount >= MaxConsecutiveFailures)
+                {
+                    await EnsureExitRewardPage();
+                    throw new Exception($"连续战斗失败{MaxConsecutiveFailures}次，任务终止");
+                }
+
+                await EnsureExitRewardPage();
+                _logger.LogInformation("战斗失败，重新寻找地脉花");
+                return;
+            }
+
+            await EnsureExitRewardPage();
+            throw;
+        }
+    }
+
+    private (string Route, Node Node)? SelectBranchRoute(NodeData nodeData, Node currentNode)
+    {
+        string? selectedRoute = null;
+        Node? selectedNode = null;
+        var closest = double.MaxValue;
+
+        foreach (var next in currentNode.Next)
+        {
+            var branchNode = nodeData.Nodes.FirstOrDefault(n => n.Id == next.Target);
+            if (branchNode == null)
+            {
+                continue;
+            }
+
+            var distance = Calculate2DDistance(_leyLineX, _leyLineY, branchNode.Position.X, branchNode.Position.Y);
+            if (distance < closest)
+            {
+                closest = distance;
+                selectedRoute = next.Route;
+                selectedNode = branchNode;
+            }
+        }
+
+        if (selectedRoute == null || selectedNode == null)
+        {
+            return null;
+        }
+
+        return (selectedRoute, selectedNode);
+    }
+
+    private static double Calculate2DDistance(double x1, double y1, double x2, double y2)
+    {
+        var dx = x1 - x2;
+        var dy = y1 - y2;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    private Node? FindTargetNodeByPosition(NodeData nodeData, double x, double y)
+    {
+        const double errorThreshold = 50;
+        return nodeData.Nodes.FirstOrDefault(node =>
+            node.Type == "blossom" &&
+            Math.Abs(node.Position.X - x) <= errorThreshold &&
+            Math.Abs(node.Position.Y - y) <= errorThreshold);
+    }
+
+    private List<PathInfo> FindPathsToTarget(NodeData nodeData, Node targetNode)
+    {
+        return BreadthFirstPathSearch(nodeData, targetNode);
+    }
+
+    private List<PathInfo> BreadthFirstPathSearch(NodeData nodeData, Node targetNode)
+    {
+        var validPaths = new List<PathInfo>();
+        var teleportNodes = nodeData.Nodes.Where(n => n.Type == "teleport").ToList();
+        var nodeMap = nodeData.Nodes.ToDictionary(n => n.Id, n => n);
+
+        foreach (var startNode in teleportNodes)
+        {
+            var queue = new Queue<(Node Node, PathInfo Path, HashSet<int> Visited)>();
+            // BFS ensures we prefer shorter paths from each teleport node.
+            queue.Enqueue((startNode, new PathInfo
+            {
+                StartNode = startNode,
+                TargetNode = targetNode,
+                Routes = new List<string>()
+            }, new HashSet<int> { startNode.Id }));
+
+            while (queue.Count > 0)
+            {
+                var (current, path, visited) = queue.Dequeue();
+                if (current.Id == targetNode.Id)
+                {
+                    validPaths.Add(path);
+                    continue;
+                }
+
+                foreach (var next in current.Next)
+                {
+                    if (visited.Contains(next.Target))
+                    {
+                        continue;
+                    }
+
+                    if (!nodeMap.TryGetValue(next.Target, out var nextNode))
+                    {
+                        continue;
+                    }
+
+                    var newRoutes = new List<string>(path.Routes) { next.Route };
+                    var newVisited = new HashSet<int>(visited) { next.Target };
+                    queue.Enqueue((nextNode, new PathInfo
+                    {
+                        StartNode = path.StartNode,
+                        TargetNode = targetNode,
+                        Routes = newRoutes
+                    }, newVisited));
+                }
+            }
+        }
+
+        validPaths.AddRange(FindReversePathsIfNeeded(nodeData, targetNode, validPaths));
+        return validPaths;
+    }
+
+    private static List<PathInfo> FindReversePathsIfNeeded(NodeData nodeData, Node targetNode, List<PathInfo> existingPaths)
+    {
+        if (existingPaths.Count > 0 || targetNode.Prev.Count == 0)
+        {
+            return [];
+        }
+
+        // Fallback: allow a single hop into the target when no forward path exists.
+        var reversePaths = new List<PathInfo>();
+        var nodeMap = nodeData.Nodes.ToDictionary(n => n.Id, n => n);
+
+        foreach (var prevNodeId in targetNode.Prev)
+        {
+            if (!nodeMap.TryGetValue(prevNodeId, out var prevNode))
+            {
+                continue;
+            }
+
+            var teleportNodes = nodeData.Nodes.Where(node =>
+                node.Type == "teleport" && node.Next.Any(route => route.Target == prevNode.Id)).ToList();
+
+            foreach (var teleportNode in teleportNodes)
+            {
+                var route = teleportNode.Next.FirstOrDefault(r => r.Target == prevNode.Id);
+                var nextRoute = prevNode.Next.FirstOrDefault(r => r.Target == targetNode.Id);
+                if (route == null || nextRoute == null)
+                {
+                    continue;
+                }
+
+                reversePaths.Add(new PathInfo
+                {
+                    StartNode = teleportNode,
+                    TargetNode = targetNode,
+                    Routes = [route.Route, nextRoute.Route]
+                });
+            }
+        }
+
+        return reversePaths;
+    }
+
+    private static PathInfo SelectOptimalPath(List<PathInfo> paths)
+    {
+        if (paths.Count == 0)
+        {
+            throw new Exception("没有可用路径");
+        }
+
+        return paths.OrderBy(p => p.Routes.Count).First();
+    }
+
+    private async Task ExecutePath(PathInfo path)
+    {
+        foreach (var routePath in path.Routes)
+        {
+            await RunPathingFile(routePath);
+        }
+
+        var lastRoute = path.Routes.Last();
+        var targetRoute = BuildTargetRoute(lastRoute);
+        var rerunRoute = BuildRerunRoute(lastRoute);
+        var fromTeleportStart = "teleport".Equals(path.StartNode.Type, StringComparison.OrdinalIgnoreCase);
+        await ProcessLeyLineOutcrop(_taskParam.FightConfig.Timeout, targetRoute, rerunRoute, fromTeleportStart);
+
+        var rewardSuccess = await AttemptReward();
+        if (!rewardSuccess)
+        {
+            // 树脂原因正常结束，不当作路线或战斗失败重试；材料目标模式同样按树脂结果结算。
+            if (_rewardStopped)
+            {
+                if (_taskParam.TargetItems.Count > 0)
+                {
+                    _logger.LogInformation("地脉花：树脂不足或无可用树脂选项，材料目标未全部达成");
+                }
+
+                return;
+            }
+
+            throw new Exception("无法领取奖励");
+        }
+
+        await TryScanDropsAfterReward();
+        await TryEvaluateLeylineTargetItemAsync();
+        _consecutiveFailureCount = 0;
+    }
+
+    /// <summary>
+    /// 材料目标模式启动时记录背包基线，后续按增量判断。
+    /// </summary>
+    private async Task CaptureLeylineBaselineAsync()
+    {
+        if (_taskParam.TargetItems.Count == 0)
+        {
+            return;
+        }
+
+        if (_taskParam.LeyLineOutcropType == "藏金之花")
+        {
+            _moraBaseline = await ScanMoraWithRetryAsync();
+            if (_moraBaseline == null)
+            {
+                throw new Exception("摩拉背包扫描失败，无法建立奖励基线");
+            }
+
+            _logger.LogInformation("地脉花：摩拉基线 {Mora}", _moraBaseline.Value);
+        }
+        else if (_taskParam.LeyLineOutcropType == "启示之花")
+        {
+            _expBaseline = await ScanExpBooksWithRetryAsync();
+            if (_expBaseline == null)
+            {
+                throw new Exception("经验书背包扫描失败，无法建立奖励基线");
+            }
+
+            _logger.LogInformation("地脉花：经验书基线 {Baseline}",
+                string.Join("，", _expBaseline.Select(x => $"{x.Key} {x.Value}")));
+        }
+    }
+
+    /// <summary>
+    /// 每轮领奖后重新扫描背包，按本次任务增量判断材料目标。
+    /// </summary>
+    private async Task TryEvaluateLeylineTargetItemAsync()
+    {
+        if (_taskParam.TargetItems.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var catalog = TargetItemCatalog.Instance;
+            var gains = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (_taskParam.LeyLineOutcropType == "藏金之花")
+            {
+                var current = await ScanMoraWithRetryAsync();
+                if (current == null)
+                {
+                    _logger.LogWarning("地脉花：本轮摩拉扫描失败，不更新材料目标进度");
+                    return;
+                }
+
+                gains[catalog.LeylineMoraItemName] = Math.Max(0, current.Value - (_moraBaseline ?? 0));
+            }
+            else
+            {
+                var current = await ScanExpBooksWithRetryAsync();
+                if (current == null)
+                {
+                    _logger.LogWarning("地脉花：本轮经验书扫描失败，不更新材料目标进度");
+                    return;
+                }
+
+                foreach (var item in catalog.LeylineExpItems)
+                {
+                    var baseline = _expBaseline?.TryGetValue(item.Name, out var value) == true ? value : 0;
+                    var currentCount = current.TryGetValue(item.Name, out var count) ? count : 0;
+                    gains[item.Name] = Math.Max(0, currentCount - baseline);
+                }
+            }
+
+            var progress = catalog.CalculateLeyline(_taskParam.TargetItems, gains);
+            _itemStopReached = progress.AllSatisfied;
+            _logger.LogInformation("地脉花：材料目标进度 {Progress}",
+                string.Join("，", progress.Targets.Select(x => $"{x.ItemName} {x.CountedCount}/{x.TargetCount}")));
+            if (_itemStopReached)
+            {
+                _logger.LogInformation("地脉花：材料目标已全部达成");
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _logger.LogWarning(e, "地脉花：本轮背包扫描失败，继续任务");
+        }
+    }
+
+    /// <summary>
+    /// 统计三档经验书的当前背包数量。
+    /// </summary>
+    private async Task<Dictionary<string, int>> CountExpBooksAsync()
+    {
+        var itemNames = TargetItemCatalog.Instance.LeylineExpItems.Select(x => x.Name).ToList();
+        var param = new CountInventoryItemParam
+        {
+            ItemNames = itemNames,
+            StopByItemSort = true
+        };
+        var result = await new CountInventoryItem(_runtime).RunAsync(param, _ct);
+        return result.Data?.Counts ?? [];
+    }
+
+    /// <summary>
+    /// 扫描摩拉，失败时重试一次，共两次尝试。
+    /// </summary>
+    private async Task<int?> ScanMoraWithRetryAsync()
+    {
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            try
+            {
+                var result = await _moraFromInventoryScanner.ScanAsync(InputHub.Foreground, _ct);
+                if (result != null)
+                {
+                    return result;
+                }
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                _logger.LogWarning(e, "地脉花：摩拉扫描失败（第 {Attempt} 次）", attempt);
+            }
+
+            _ct.ThrowIfCancellationRequested();
+            if (attempt < 2)
+            {
+                await _runtime.Delay(500, _ct);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 扫描经验书，失败时重试一次，共两次尝试。
+    /// </summary>
+    private async Task<Dictionary<string, int>?> ScanExpBooksWithRetryAsync()
+    {
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            try
+            {
+                var result = await CountExpBooksAsync();
+                // 背包扫描不会返回 0；未识别到的物品会被省略，空结果无法区分“三档都是 0”
+                // 和“未识别到任何目标”，因此要求至少识别到一本，避免把识别失败当成 0 基线。
+                if (result.Count > 0 && result.Values.All(x => x >= 0))
+                {
+                    return result;
+                }
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                _logger.LogWarning(e, "地脉花：经验书扫描失败（第 {Attempt} 次）", attempt);
+            }
+
+            _ct.ThrowIfCancellationRequested();
+            if (attempt < 2)
+            {
+                await _runtime.Delay(500, _ct);
+            }
+        }
+
+        return null;
+    }
+
+    private static string BuildTargetRoute(string routePath)
+    {
+        return routePath
+            .Replace("assets/pathing/", "assets/pathing/target/", StringComparison.OrdinalIgnoreCase)
+            .Replace("-rerun", "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildRerunRoute(string routePath)
+    {
+        var rerunRoute = routePath
+            .Replace("assets/pathing/target/", "assets/pathing/rerun/", StringComparison.OrdinalIgnoreCase)
+            .Replace("assets/pathing/", "assets/pathing/rerun/", StringComparison.OrdinalIgnoreCase);
+
+        if (!rerunRoute.Contains("-rerun", StringComparison.OrdinalIgnoreCase))
+        {
+            rerunRoute = rerunRoute.Replace(".json", "-rerun.json", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return rerunRoute;
+    }
+
+    private bool PathingFileExists(string routePath)
+    {
+        var workDir = Global.Absolute(@"GameTask\AutoLeyLineOutcrop");
+        var localPath = routePath.Replace("/", Path.DirectorySeparatorChar.ToString());
+        var fullPath = Path.Combine(workDir, localPath);
+        return File.Exists(fullPath);
+    }
+
+    private async Task RunPathingFile(string routePath)
+    {
+        await _returnMainUiTask.Start(_ct);
+
+        var workDir = Global.Absolute(@"GameTask\AutoLeyLineOutcrop");
+        var localPath = routePath.Replace("/", Path.DirectorySeparatorChar.ToString());
+        var fullPath = Path.Combine(workDir, localPath);
+
+        var task = PathingTask.BuildFromFilePath(fullPath) ?? throw new Exception("路径文件解析失败");
+        var executor = new PathExecutor(_runtime, _config, _ct);
+        executor.PartyConfig = BuildLeyLinePathingPartyConfig();
+        // 地脉流程保留原有后续花朵识别，本次寻路结果不替代业务判断。
+        _ = await executor.Pathing(task);
+    }
+
+    private static PathingPartyConfig BuildLeyLinePathingPartyConfig()
+    {
+        // 地脉路径使用程序化默认配置，不走配置组禁用时的回退逻辑。
+        return new PathingPartyConfig
+        {
+            Enabled = true,
+            AutoFightEnabled = true,
+            SkipPartySwitch = true
+        };
+    }
+
+    private async Task<NodeData> LoadNodeData()
+    {
+        if (_nodeData != null)
+        {
+            return _nodeData;
+        }
+
+        var workDir = Global.Absolute(@"GameTask\AutoLeyLineOutcrop");
+        var nodePath = Path.Combine(workDir, "Assets", "LeyLineOutcropData.json");
+        if (!File.Exists(nodePath))
+        {
+            throw new FileNotFoundException("LeyLineOutcropData.json 未找到", nodePath);
+        }
+
+        var raw = JsonSerializer.Deserialize<RawNodeData>(File.ReadAllText(nodePath))
+                  ?? throw new Exception("节点数据解析失败");
+        _nodeData = AdaptNodeData(raw);
+        return _nodeData;
+    }
+
+    private static NodeData AdaptNodeData(RawNodeData raw)
+    {
+        var nodes = new List<Node>();
+        foreach (var teleport in raw.Teleports)
+        {
+            nodes.Add(new Node
+            {
+                Id = teleport.Id,
+                Region = teleport.Region,
+                Position = teleport.Position,
+                Type = "teleport",
+                Next = new List<NodeRoute>(),
+                Prev = new List<int>()
+            });
+        }
+
+        foreach (var blossom in raw.Blossoms)
+        {
+            nodes.Add(new Node
+            {
+                Id = blossom.Id,
+                Region = blossom.Region,
+                Position = blossom.Position,
+                Type = "blossom",
+                Next = new List<NodeRoute>(),
+                Prev = new List<int>()
+            });
+        }
+
+        foreach (var edge in raw.Edges)
+        {
+            var sourceNode = nodes.FirstOrDefault(n => n.Id == edge.Source);
+            var targetNode = nodes.FirstOrDefault(n => n.Id == edge.Target);
+            if (sourceNode == null || targetNode == null)
+            {
+                continue;
+            }
+
+            sourceNode.Next.Add(new NodeRoute { Target = edge.Target, Route = edge.Route });
+            targetNode.Prev.Add(edge.Source);
+        }
+
+        return new NodeData
+        {
+            Nodes = nodes,
+            Indexes = raw.Indexes
+        };
+    }
+
+    private async Task<bool> LocateLeyLineOutcrop(string type)
+    {
+        await _runtime.Delay(500, _ct);
+        double currentZoom;
+        using (var zoomCapture = _runtime.CaptureToRectArea())
+        {
+            currentZoom = _tpTask.GetBigMapZoomLevel(zoomCapture);
+        }
+        await _tpTask.AdjustMapZoomLevel(currentZoom, 3.0);
+
+        var iconPath = type == "启示之花"
+            ? "Assets/icon/Blossom_of_Revelation.png"
+            : "Assets/icon/Blossom_of_Wealth.png";
+
+        using var ra = _runtime.CaptureToRectArea();
+        var iconRo = BuildTemplate(iconPath);
+        var list = ra.FindMulti(iconRo);
+        if (list.Count == 0)
+        {
+            return false;
+        }
+
+        var flower = list[0];
+        var center = _tpTask.GetBigMapCenterPoint(MapTypes.Teyvat.ToString());
+        double mapZoomLevel;
+        using (var zoomCapture = _runtime.CaptureToRectArea())
+        {
+            mapZoomLevel = _tpTask.GetBigMapZoomLevel(zoomCapture);
+        }
+        var mapScaleFactor = _config.TpConfig.MapScaleFactor;
+        _leyLineX = (960 - flower.X - 25) * mapZoomLevel / mapScaleFactor + center.X;
+        _leyLineY = (540 - flower.Y - 25) * mapZoomLevel / mapScaleFactor + center.Y;
+        return true;
+    }
+
+    private void HandleNoStrategyFound()
+    {
+        // 记录业务失败，流程结束后由 RunAsync 返回 Failed（不改变原有的后续流程）
+        _routeStrategyNotFound = true;
+        _logger.LogError("未找到对应的地脉花策略");
+        Notify.Event(NotificationEvent.LeyLineInfo).Error("未找到对应的地脉花策略");
+    }
+
+    private async Task<bool> ProcessLeyLineOutcrop(int timeoutSeconds, string targetPath, string rerunPath, bool fromTeleportStart, int retries = 0)
+    {
+        const int maxRetries = 3;
+        if (retries >= maxRetries)
+        {
+            await EnsureExitRewardPage();
+            throw new Exception("开启地脉花失败，已达最大重试次数");
+        }
+
+        await _runtime.Delay(500, _ct);
+        _logger.LogDebug("检测地脉花交互状态，重试次数: {Retries}/{MaxRetries}", retries + 1, maxRetries);
+        using var capture = _runtime.CaptureToRectArea();
+        using var ocrOverlayScope = DrawOcrOverlayScope(capture, OcrFlowOverlayKey, _ocrRo2!.RegionOfInterest, _ocrRo3!.RegionOfInterest);
+        await WaitOcrOverlayRenderTick();
+        string result1Text;
+        string result2Text;
+        var result1 = FindSafe(capture, _ocrRo2!);
+        var result2 = FindSafe(capture, _ocrRo3!);
+        result1Text = result1.Text;
+        result2Text = result2.Text;
+        _logger.LogDebug("OCR结果: result1='{Text1}', result2='{Text2}'", result1Text, result2Text);
+
+        if (IsLeyLineRewardReadyState(capture, result1Text, result2Text))
+        {
+            _logger.LogDebug("识别到地脉花领奖状态");
+            await SwitchToFriendshipTeamIfNeeded();
+            return true;
+        }
+
+        if (ContainsLeyLineFlowerText(result2Text))
+        {
+            _logger.LogDebug("识别到地脉之花入口，尝试接触");
+            InputHub.Foreground.SimulateAction(GIActions.PickUpOrInteract);
+            await _runtime.Delay(800, _ct);
+
+            using var postInteractCapture = _runtime.CaptureToRectArea();
+            result1 = FindSafe(postInteractCapture, _ocrRo2!);
+            result2 = FindSafe(postInteractCapture, _ocrRo3!);
+            result1Text = result1.Text;
+            result2Text = result2.Text;
+            _logger.LogDebug("接触后OCR结果: result1='{Text1}', result2='{Text2}'", result1Text, result2Text);
+
+            if (IsLeyLineRewardReadyState(postInteractCapture, result1Text, result2Text))
+            {
+                _logger.LogDebug("接触后识别到地脉花领奖状态");
+                await SwitchToFriendshipTeamIfNeeded();
+                return true;
+            }
+        }
+
+        if (result2Text.Contains("溢口", StringComparison.Ordinal))
+        {
+            _logger.LogDebug("识别到溢口提示，尝试交互");
+            InputHub.Foreground.SimulateAction(GIActions.PickUpOrInteract);
+            await _runtime.Delay(300, _ct);
+            InputHub.Foreground.SimulateAction(GIActions.PickUpOrInteract);
+            await _runtime.Delay(500, _ct);
+        }
+        else if (!ContainsFightText(result1Text))
+        {
+            var recoverPath = retries == 0
+                ? targetPath
+                : fromTeleportStart
+                    ? targetPath
+                    : rerunPath;
+            if (!PathingFileExists(recoverPath))
+            {
+                _logger.LogWarning("纠偏路径不存在，回退target路径: {Path}", recoverPath);
+                recoverPath = targetPath;
+            }
+
+            _logger.LogDebug("未识别到战斗提示，执行纠偏路径: {Path}", recoverPath);
+            await RunPathingFile(recoverPath);
+            return await ProcessLeyLineOutcrop(timeoutSeconds, targetPath, rerunPath, fromTeleportStart, retries + 1);
+        }
+
+        var fightResult = await AutoFight(timeoutSeconds);
+        if (!fightResult)
+        {
+            await EnsureExitRewardPage();
+            if (await ProcessResurrect())
+            {
+                return await ProcessLeyLineOutcrop(timeoutSeconds, targetPath, rerunPath, fromTeleportStart, retries + 1);
+            }
+
+            throw new Exception("战斗失败");
+        }
+
+        await TryCollectDropsAfterFight();
+        await SwitchToFriendshipTeamIfNeeded();
+        await AutoNavigateToReward();
+        return true;
+    }
+
+    private async Task TryCollectDropsAfterFight()
+    {
+        if (!_taskParam.FightConfig.KazuhaPickupEnabled)
+        {
+            return;
+        }
+
+        try
+        {
+            var combatScenes = await RunnerContext.Instance.GetCombatScenes(_runtime, _config, _ct);
+            if (combatScenes == null)
+            {
+                _logger.LogWarning("战后聚集拾取：队伍识别失败，跳过");
+                return;
+            }
+
+            var kazuha = combatScenes.SelectAvatar("枫原万叶");
+            if (kazuha != null)
+            {
+                await TryKazuhaCollect(kazuha);
+                return;
+            }
+
+            var qin = combatScenes.SelectAvatar("琴");
+            if (qin != null)
+            {
+                await TryQinCollect(combatScenes, qin);
+                return;
+            }
+
+            _logger.LogDebug("战后聚集拾取：当前队伍无万叶/琴，跳过");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "战后聚集拾取异常");
+        }
+        finally
+        {
+            InputHub.ReleaseAll();
+        }
+    }
+
+    /// <summary>
+    /// 在地脉花奖励领取完成后，短时间扫描周围掉落物光柱并尝试靠近拾取。
+    /// </summary>
+    private async Task TryScanDropsAfterReward()
+    {
+        if (!_taskParam.ScanDropsAfterRewardEnabled)
+        {
+            return;
+        }
+
+        const int maxScanSeconds = 60;
+        var scanSeconds = Math.Clamp(_taskParam.ScanDropsAfterRewardSeconds, 0, maxScanSeconds);
+        if (scanSeconds <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _logger.LogInformation("领取奖励后开始扫描掉落物光柱，时长 {Seconds} 秒", scanSeconds);
+            await new ScanPickTask(_runtime, _config).Start(_ct, scanSeconds);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or TaskCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "领取奖励后扫描掉落物光柱异常");
+        }
+        finally
+        {
+            InputHub.ReleaseAll();
+        }
+    }
+
+    private async Task TryKazuhaCollect(Avatar kazuha)
+    {
+        _logger.LogInformation("战后聚集拾取：开始使用枫原万叶执行长E拾取");
+        await _runtime.Delay(200, _ct);
+        if (!kazuha.TrySwitch(10))
+        {
+            _logger.LogWarning("战后聚集拾取：切换到万叶失败，跳过");
+            return;
+        }
+
+        _logger.LogInformation("战后聚集拾取：万叶已切换，等待元素战技CD");
+        await kazuha.WaitSkillCd(_ct);
+        await _runtime.SimulateHoldElementalSkillAsync(1000, _ct);
+        await _runtime.Delay(200, _ct);
+
+        // 获取游戏画面，进行 OCR 及视觉状态双重验证，以确认长E技能是否真正释放成功
+        using (var region = _runtime.CaptureToRectArea())
+        {
+            // 裁剪技能 CD 区域并做 HSV 颜色过滤，分离出白色的 CD 数字
+            using var eRa = region.DeriveCrop(AutoFightAssets.Get(region).ECooldownRect);
+            using var eRaWhite = OpenCvCommonHelper.InRangeHsv(eRa.SrcMat, new Scalar(0, 0, 235), new Scalar(0, 25, 255));
+            var text = OcrFactory.Paddle.OcrWithoutDetector(eRaWhite);
+            
+            // 如果成功读到了大于 0 的 CD 数值，说明技能已释放
+            var hasOcrCd = double.TryParse(text, out var ocrCd) && ocrCd > 0;  
+            // 视觉上判断当前技能图标是否高亮就绪，如果不亮（false）也说明技能释放进入了冷却
+            var isVisualReady = Bv.IsSkillReady(region, kazuha.Index, false);  
+            
+            // 当 OCR 没读出 CD（可能网络卡顿技能没放出来），并且视觉上技能图标依然亮着就绪时，判断为释放失败
+            if (!hasOcrCd && isVisualReady)
+            {
+                _logger.LogWarning("战后聚集拾取：万叶长E释放确认失败（OCR：{Text}），跳过后续拾取动作", text);
+                return;
+            }
+
+            // 更新技能冷却记录，防止干扰后续冷却判断
+            kazuha.AfterUseSkill(region);
+        }
+        await _runtime.SimulateMouseLeftClickLoopAsync(6, _ct);
+        await _runtime.Delay(1500, _ct);
+        _logger.LogInformation("战后聚集拾取：万叶长E动作完成，等待拾取动作结束");
+        await _runtime.Delay(KazuhaPickupPostSkillWaitMs, _ct);
+        _logger.LogInformation("战后聚集拾取：万叶长E聚集动作执行完成");
+    }
+
+    private async Task TryQinCollect(CombatScenes combatScenes, Avatar qin)
+    {
+        _logger.LogInformation("战后聚集拾取：使用琴-长E拾取掉落物");
+        var find = _taskParam.FightConfig.QinDoublePickUp;
+        await _runtime.Delay(150, _ct);
+        if (qin.TrySwitch(10))
+        {
+            var actionsToUse = PickUpCollectHandler.PickUpActions
+                .Where(action => action.StartsWith("琴-长E ", StringComparison.OrdinalIgnoreCase))
+                .Select(action => action.Replace("琴-长E", "琴", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            foreach (var actionStr in actionsToUse)
+            {
+                var pickUpAction = CombatScriptParser.ParseContext(actionStr);
+                for (var i = 0; i < 2; i++)
+                {
+                    await qin.WaitSkillCd(_ct);
+                    foreach (var command in pickUpAction.CombatCommands)
+                    {
+                        command.Execute(combatScenes);
+                        Task.Run(() =>
+                        {
+                            if (Monitor.TryEnter(PickLock))
+                            {
+                                try
+                                {
+                                    if (find)
+                                    {
+                                        using var imagePick = _runtime.CaptureToRectArea();
+                                        if (imagePick.Find(AutoPickAssets.Get(imagePick, _config.AutoPickConfig.PickKey).PickRo).IsExist())
+                                        {
+                                            find = false;
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    Monitor.Exit(PickLock);
+                                }
+                            }
+                        });
+                    }
+
+                    if (!find)
+                    {
+                        break;
+                    }
+
+                    if (i == 0)
+                    {
+                        _logger.LogInformation("战后聚集拾取：尝试再次执行琴-长E拾取");
+                        qin.AfterUseSkill();
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                InputHub.ReleaseAll();
+            }
+        }
+        else
+        {
+            _logger.LogWarning("战后聚集拾取：切换到琴失败，跳过");
+        }
+    }
+
+    private Region FindSafe(ImageRegion capture, RecognitionObject ro)
+    {
+        var roi = ro.RegionOfInterest;
+        if (roi == default)
+        {
+            return capture.Find(ro);
+        }
+
+        var clamped = roi.ClampTo(capture.Width, capture.Height);
+        if (clamped.Width <= 0 || clamped.Height <= 0)
+        {
+            return new Region();
+        }
+
+        if (clamped == roi)
+        {
+            return capture.Find(ro);
+        }
+
+        var cloned = ro.Clone();
+        cloned.RegionOfInterest = clamped;
+        return capture.Find(cloned);
+    }
+
+    private async Task<bool> AutoFight(int timeoutSeconds)
+    {
+        var fightCts = CancellationTokenSource.CreateLinkedTokenSource(_ct);
+        using var autoFightConfigScope = UseLeyLineAutoFightConfigScope();
+        // 地脉花战斗拆成两条并行链路：
+        // 1. AutoFightTask 持续执行战斗脚本，不负责任何结束判定。
+        // 2. RecognizeTextInRegion 只通过 OCR 判定胜负，并在轮询间隙补一次内部寻敌辅助。
+        var fightTask = StartAutoFightWithoutFinishDetect(fightCts.Token);
+        var fightResult = await RecognizeTextInRegion(timeoutSeconds * 1000);
+        fightCts.Cancel();
+
+        try
+        {
+            await fightTask;
+        }
+        catch (Exception ex) when (ex is NormalEndException or TaskCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "自动战斗任务结束");
+        }
+        finally
+        {
+            InputHub.ReleaseAll();
+        }
+
+        return fightResult;
+    }
+
+    private Task StartAutoFightWithoutFinishDetect(CancellationToken ct)
+    {
+        var autoFightConfig = BuildLeyLineAutoFightConfig();
+        var strategyPath = BuildAutoFightStrategyPath(autoFightConfig);
+
+        if (CombatStrategyResolver.Parse(strategyPath).Kind is not (CombatStrategyKind.Txt or CombatStrategyKind.AutoSelect))
+        {
+            var jsonParam = new AutoFightParam
+            {
+                CombatStrategyPath = strategyPath,
+                FightFinishDetectEnabled = false,
+                ExpBasedPickupEnabled = false,
+                KazuhaPickupEnabled = false,
+                PickDropsAfterFightEnabled = false,
+                Timeout = autoFightConfig.Timeout > 0 ? autoFightConfig.Timeout : 600,
+            };
+            // 战斗结束由 OCR 判定后取消 ct 控制，子任务结果不参与判断
+            return new AutoFightEntryTask(_runtime, _config).RunAsync(jsonParam, ct);
+        }
+        else
+        {
+            var taskParam = new AutoFightParam(strategyPath, autoFightConfig)
+            {
+                FightFinishDetectEnabled = false,
+                CheckBeforeBurst = false
+            };
+            taskParam.FinishDetectConfig.FastCheckEnabled = false;
+            taskParam.FinishDetectConfig.RotateFindEnemyEnabled = false;
+            taskParam.PickDropsAfterFightEnabled = false;
+            taskParam.KazuhaPickupEnabled = false;
+            taskParam.QinDoublePickUp = false;
+            taskParam.OnlyPickEliteDropsMode = "DisableAutoPickupForNonElite";
+            return new AutoFightEntryTask(_runtime, _config).RunAsync(taskParam, ct);
+        }
+    }
+
+    private IDisposable UseLeyLineAutoFightConfigScope()
+    {
+        var allConfig = _config;
+        var original = allConfig.AutoFightConfig;
+        allConfig.AutoFightConfig = BuildLeyLineAutoFightConfig();
+        return new AutoFightConfigScope(allConfig, original);
+    }
+
+    private AutoFightConfig BuildLeyLineAutoFightConfig()
+    {
+        var globalAutoFightConfig = _config.AutoFightConfig;
+        var fightConfig = _taskParam.FightConfig;
+        if (string.IsNullOrWhiteSpace(fightConfig.StrategyName))
+        {
+            fightConfig.CopyFromAutoFightConfig(globalAutoFightConfig);
+        }
+
+        if (fightConfig.Timeout <= 0)
+        {
+            fightConfig.Timeout = _taskParam.Timeout > 0 ? _taskParam.Timeout : Math.Max(globalAutoFightConfig.Timeout, 1);
+        }
+
+        _taskParam.Timeout = fightConfig.Timeout;
+        return fightConfig.ToAutoFightConfig();
+    }
+
+    private static string BuildAutoFightStrategyPath(AutoFightConfig config)
+    {
+        var strategy = CombatStrategyResolver.Resolve(config.StrategyName);
+        if (strategy.Kind == CombatStrategyKind.Combo)
+            throw new InvalidOperationException("地脉花不支持自动连招策略");
+        return strategy.Path;
+    }
+
+    private async Task<bool> RecognizeTextInRegion(int timeoutMs)
+    {
+        var start = DateTime.UtcNow;
+        var noTextCount = 0;
+        var fightTextDetectedAt = DateTime.MinValue;
+        var lastSeekAssistAt = DateTime.MinValue;
+        // 键鼠宏独占输入和录制视角，外部的寻敌辅助也不能并发操作。
+        var seekEnemyEnabled = _taskParam.FightConfig.SeekEnemyEnabled
+            && CombatStrategyResolver.Parse(_taskParam.FightConfig.StrategyName).Kind != CombatStrategyKind.KeyMouse;
+        var seekEnemyInterval = TimeSpan.FromSeconds(Math.Clamp(_taskParam.FightConfig.SeekEnemyIntervalSeconds, 1, 60));
+        var seekEnemyRotaryFactor = Math.Clamp(_taskParam.FightConfig.SeekEnemyRotaryFactor, 1, 13);
+        var successKeywords = new[] { "挑战达成", "战斗胜利", "挑战成功" };
+        var failureKeywords = new[] { "挑战失败" };
+
+        while ((DateTime.UtcNow - start).TotalMilliseconds < timeoutMs)
+        {
+            string text;
+            bool foundText;
+            using (var capture = _runtime.CaptureToRectArea())
+            using (var ocrOverlayScope = DrawOcrOverlayScope(capture, OcrFightOverlayKey, _ocrRo1!.RegionOfInterest, _ocrRo2!.RegionOfInterest))
+            {
+                await WaitOcrOverlayRenderTick();
+                var result = capture.Find(_ocrRo1!);
+                text = result.Text;
+                foundText = RecognizeFightText(capture);
+            }
+
+            if (successKeywords.Any(text.Contains))
+            {
+                // OCR recognizes victory text; treat as success.
+                return true;
+            }
+
+            if (failureKeywords.Any(text.Contains))
+            {
+                // OCR recognizes failure text; stop early.
+                return false;
+            }
+
+            if (!foundText)
+            {
+                noTextCount++;
+                if (noTextCount >= 10)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                var now = DateTime.UtcNow;
+                if (fightTextDetectedAt == DateTime.MinValue)
+                {
+                    fightTextDetectedAt = now;
+                }
+
+                noTextCount = 0;
+                if (ShouldRunLeyLineFightSeek(seekEnemyEnabled, now, fightTextDetectedAt, lastSeekAssistAt, seekEnemyInterval))
+                {
+                    lastSeekAssistAt = now;
+                    await TrySeekEnemyDuringLeyLineFight(seekEnemyRotaryFactor);
+                }
+            }
+
+            await _runtime.Delay(1000, _ct);
+        }
+
+        return false;
+    }
+
+    private static bool ShouldRunLeyLineFightSeek(bool seekEnemyEnabled, DateTime now, DateTime fightTextDetectedAt, DateTime lastSeekAssistAt, TimeSpan seekEnemyInterval)
+    {
+        if (!seekEnemyEnabled)
+        {
+            return false;
+        }
+
+        if (fightTextDetectedAt == DateTime.MinValue)
+        {
+            return false;
+        }
+
+        if (now - fightTextDetectedAt < LeyLineFightSeekInitialDelay)
+        {
+            return false;
+        }
+
+        return lastSeekAssistAt == DateTime.MinValue || now - lastSeekAssistAt >= seekEnemyInterval;
+    }
+
+    private async Task TrySeekEnemyDuringLeyLineFight(int rotaryFactor)
+    {
+        try
+        {
+            // isEndCheck=true prevents AutoFightSeek from falling back to any party-screen finish check.
+            await AutoFightSeek.SeekAndFightAsync(_runtime, _logger, 0, 0, _ct, true, rotaryFactor);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "地脉花战斗中内部寻敌异常");
+        }
+    }
+
+    private bool RecognizeFightText(ImageRegion captureRegion)
+    {
+        var result = captureRegion.Find(_ocrRo2!);
+        var text = result.Text;
+        return ContainsFightText(text);
+    }
+
+    private bool IsLeyLineRewardReadyState(ImageRegion capture, string result1Text, string result2Text)
+    {
+        if (ContainsFightText(result1Text))
+        {
+            return false;
+        }
+
+        return ContainsRewardPromptActionText(result2Text) || HasRewardPrompt(capture);
+    }
+
+    private static bool ContainsFightText(string text)
+    {
+        text = NormalizeLeyLineOcrText(text);
+        var keywords = new[] { "打倒", "所有", "敌人" };
+        return keywords.Any(text.Contains);
+    }
+
+    private async Task AutoNavigateToReward()
+    {
+        const int maxRetry = 3;
+        for (var retry = 0; retry < maxRetry; retry++)
+        {
+            // Reset camera and move in short bursts to re-acquire the chest icon.
+            _logger.LogInformation("开始导航到地脉花奖励，尝试 {Retry}/{Max}", retry + 1, maxRetry);
+            InputHub.Foreground.Mouse.MiddleButtonClick();
+            await _runtime.Delay(300, _ct);
+
+            if (await NavigateTowardReward(60000))
+            {
+                _logger.LogInformation("已到达领取奖励页面");
+                return;
+            }
+
+            InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+            InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_X);
+            await _runtime.Delay(500, _ct);
+            InputHub.Foreground.SimulateAction(GIActions.MoveBackward, KeyType.KeyDown);
+            await _runtime.Delay(1000, _ct);
+            InputHub.Foreground.SimulateAction(GIActions.MoveBackward, KeyType.KeyUp);
+            await _runtime.Delay(500, _ct);
+        }
+
+        throw new Exception("导航到地脉花失败：超时未检测到奖励或交互文字");
+    }
+
+    private async Task<bool> NavigateTowardReward(int timeoutMs)
+    {
+        var start = DateTime.UtcNow;
+        try
+        {
+            while ((DateTime.UtcNow - start).TotalMilliseconds < timeoutMs)
+            {
+                // If reward UI is detected, stop moving.
+                if (await DetectRewardPage())
+                {
+                    _logger.LogInformation("检测到奖励/交互文字，停止导航");
+                    return true;
+                }
+
+                using var capture = _runtime.CaptureToRectArea();
+                if (_paimonMenuRo != null && capture.Find(_paimonMenuRo).IsEmpty())
+                {
+                    LogRewardNav("误入其他界面，尝试返回主界面");
+                    await _returnMainUiTask.Start(_ct);
+                }
+
+                if (!AdjustViewForReward(capture))
+                {
+                    // Wait for the icon to re-enter view before moving forward.
+                    LogRewardNav("未对正地脉花图标，等待重新定位");
+                    InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+                    await _runtime.Delay(1000, _ct);
+                    continue;
+                }
+
+                LogRewardNav("地脉花图标已对正，开始前进");
+                InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
+                await _runtime.Delay(200, _ct);
+            }
+        }
+        finally
+        {
+            InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        }
+
+        return false;
+    }
+
+    private bool AdjustViewForReward(ImageRegion capture)
+    {
+        if (_boxIconRo == null)
+        {
+            return false;
+        }
+
+        // Use the chest icon position to align the camera before moving forward.
+        var iconRes = capture.Find(_boxIconRo);
+        if (iconRes.IsEmpty())
+        {
+            LogRewardNav("未找到地脉花图标");
+            return false;
+        }
+
+        const int screenCenterX = 960;
+        const int screenCenterY = 540;
+        const double maxAngle = 10;
+
+        var xOffset = iconRes.X - screenCenterX;
+        var yOffset = screenCenterY - iconRes.Y;
+        var angleInRadians = Math.Atan2(Math.Abs(xOffset), yOffset);
+        var angleInDegrees = angleInRadians * (180 / Math.PI);
+        var isAboveCenter = iconRes.Y < screenCenterY;
+        var isWithinAngle = angleInDegrees <= maxAngle;
+
+        if (isAboveCenter && isWithinAngle)
+        {
+            LogRewardNav("地脉花图标已对正，角度: {Angle}", angleInDegrees);
+            return true;
+        }
+
+        InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+
+        var moveX = Math.Clamp(xOffset, -300, 300);
+        LogRewardNav("调整视角，xOffset={XOffset}, yOffset={YOffset}, angle={Angle}", xOffset, yOffset, angleInDegrees);
+        InputHub.Foreground.Mouse.MoveMouseBy(moveX, 0);
+
+        if (!isAboveCenter)
+        {
+            InputHub.Foreground.Mouse.MoveMouseBy(0, 500);
+        }
+
+        return false;
+    }
+
+    private async Task<bool> DetectRewardPage()
+    {
+        using var capture = _runtime.CaptureToRectArea();
+        // Bv.FindF is faster for common keywords and avoids OCR misses.
+        if (Bv.FindF(capture, "接触") || Bv.FindF(capture, "地脉") || Bv.FindF(capture, "之花"))
+        {
+            return true;
+        }
+
+        var list = capture.FindMulti(_ocrRoThis);
+        foreach (var res in list)
+        {
+            if (res.Text.Contains("原粹树脂", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (res.Text.Contains("接触", StringComparison.Ordinal)
+                || res.Text.Contains("地脉", StringComparison.Ordinal)
+                || res.Text.Contains("之花", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void LogRewardNav(string message, params object[] args)
+    {
+        var now = DateTime.UtcNow;
+        // Throttle log spam during navigation loops.
+        if ((now - _lastRewardNavLog).TotalSeconds < 3)
+        {
+            return;
+        }
+
+        _lastRewardNavLog = now;
+        if (args.Length == 0)
+        {
+            _logger.LogInformation(message);
+        }
+        else
+        {
+            _logger.LogInformation(message, args);
+        }
+    }
+
+    private async Task<bool> ProcessResurrect()
+    {
+        using var capture = _runtime.CaptureToRectArea();
+        var list = capture.FindMulti(_ocrRoThis);
+        foreach (var res in list)
+        {
+            if (res.Text.Contains("复苏", StringComparison.Ordinal))
+            {
+                res.Click();
+                await _runtime.Delay(2000, _ct);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async Task SwitchToFriendshipTeamIfNeeded()
+    {
+        if (string.IsNullOrWhiteSpace(_taskParam.FriendshipTeam))
+        {
+            _friendshipTeamSwitched = false;
+            return;
+        }
+
+        InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        try
+        {
+            _friendshipTeamSwitched = await TrySwitchPartyAndSync(_taskParam.FriendshipTeam);
+            if (!_friendshipTeamSwitched)
+            {
+                _logger.LogWarning("切换好感队失败，保持当前队伍");
+            }
+        }
+        catch (Exception ex)
+        {
+            _friendshipTeamSwitched = false;
+            _logger.LogWarning(ex, "切换好感队失败！");
+        }
+    }
+
+    private async Task SwitchBackToCombatTeam()
+    {
+        if (!_friendshipTeamSwitched || string.IsNullOrWhiteSpace(_taskParam.Team))
+        {
+            return;
+        }
+
+        InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        await TrySwitchPartyAndSync(_taskParam.Team);
+        _friendshipTeamSwitched = false;
+    }
+
+    private async Task<bool> TrySwitchPartyAndSync(string partyName)
+    {
+        if (string.IsNullOrWhiteSpace(partyName))
+        {
+            return false;
+        }
+
+        _switchPartyTask ??= new SwitchPartyTask(_runtime);
+        var success = await _switchPartyTask.Start(partyName, _ct);
+        if (success)
+        {
+            RunnerContext.Instance.PartyName = partyName;
+        }
+
+        return success;
+    }
+
+    private async Task<bool> AttemptReward(int retryCount = 0)
+    {
+        const int maxRetry = 3;
+        if (retryCount >= maxRetry)
+        {
+            throw new Exception("领取奖励失败");
+        }
+
+        InputHub.Foreground.SimulateAction(GIActions.PickUpOrInteract);
+        await _runtime.Delay(800, _ct);
+
+        if (!await VerifyRewardPage())
+        {
+            await _returnMainUiTask.Start(_ct);
+            await AutoNavigateToReward();
+            return await AttemptReward(retryCount + 1);
+        }
+
+        if (!await TryUseRewardResin())
+        {
+            await EnsureExitRewardPage();
+            return false;
+        }
+
+        if (_friendshipTeamSwitched)
+        {
+            await SwitchBackToCombatTeam();
+        }
+        else if (!string.IsNullOrWhiteSpace(_taskParam.FriendshipTeam))
+        {
+            _logger.LogDebug("本次未成功切换到好感队，跳过切回战斗队");
+        }
+
+        await _runtime.Delay(1200, _ct);
+        await EnsureExitRewardPage();
+        return true;
+    }
+
+    private async Task<bool> VerifyRewardPage()
+    {
+        using var capture = _runtime.CaptureToRectArea();
+        return HasRewardPrompt(capture);
+    }
+
+    /// <summary>
+    /// 在遮罩上标出本次 OCR 的区域。功能提示类分组不受「显示识别结果」开关影响，Dispose 时清除
+    /// </summary>
+    private IDisposable DrawOcrOverlayScope(ImageRegion capture, string key, params Rect[] rois)
+    {
+        var group = new MaskWindowDrawingGroup(key, MaskWindowDrawingKind.Feature);
+        var drawList = new List<MaskWindowDrawingShape>(rois.Length);
+        foreach (var roi in rois)
+        {
+            var clamped = roi.ClampTo(capture.Width, capture.Height);
+            if (clamped.Width <= 0 || clamped.Height <= 0)
+            {
+                continue;
+            }
+
+            drawList.Add(capture.ToMaskWindowDrawingRect(clamped, OcrOverlayPen));
+        }
+
+        capture.DrawingBoard.Set(group, drawList);
+        return capture.DrawingBoard.Scope(group);
+    }
+
+    private void ClearOcrOverlayKeys()
+    {
+        // 任务结束时截图区域已释放，从本次运行环境取；运行环境已停止时解绑流程已清空遮罩，这里不做任何事
+        if (_runtime.IsStopping)
+        {
+            return;
+        }
+
+        var drawingBoard = _runtime.MaskWindowDrawingBoard;
+        drawingBoard.Clear(OcrFlowOverlayKey);
+        drawingBoard.Clear(OcrFightOverlayKey);
+    }
+
+    private async Task WaitOcrOverlayRenderTick()
+    {
+        await Task.Yield();
+        await Task.Delay(OcrOverlayRenderLeadMs, _ct);
+    }
+
+    /// <summary>沿用两次点击核验；只在领奖弹窗确实消失后记录一次成功，避免重试重复记账。</summary>
+    private async Task<bool> TryUseRewardResin()
+    {
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var (pressed, kind, spent) = await TryUseRewardResinOnce();
+            if (pressed)
+            {
+                await _runtime.Delay(1000, _ct);
+                if (!await VerifyRewardPage())
+                {
+                    _selector.RecordClaim(kind, spent);
+                    _currentRunTimes = _selector.ClaimCount;
+                    return true;
+                }
+                _stopReason = ResinStopReason.NoUsableOption;
+                _logger.LogDebug("树脂点击后奖励页面仍存在，第{Attempt}次后准备重试", attempt + 1);
+            }
+            await _runtime.Delay(300, _ct);
+        }
+        _rewardStopped = true;
+        return false;
+    }
+
+    /// <summary>按固定使用顺序尝试界面提供的树脂；档位切换只影响原粹候选。</summary>
+    private async Task<(bool Success, ResinKind Kind, int OriginalSpent)> TryUseRewardResinOnce()
+    {
+        await ActivateRewardPrompt();
+        var regions = CaptureRewardPromptRegions();
+        var offered = ResinRewardPrompt.DetectOffered(regions,
+            _runtime.SystemInfo.ScaleMax1080PCaptureRect.Width / 2d, _taskParam.GameCultureInfo);
+        var candidates = _selector.Candidates(offered);
+        if (candidates.Count == 0)
+        {
+            _stopReason = _selector.IsTargetReached ? ResinStopReason.TargetReached
+                : ResinExecutionRules.NoCandidateReason(offered,
+                    ResinRewardPrompt.HasShortageHint(regions, _taskParam.GameCultureInfo));
+            return (false, default, 0);
+        }
+        foreach (var kind in candidates)
+        {
+            if (kind == ResinKind.Original)
+            {
+                var lines = BuildPromptTextLines(regions);
+                var originalLines = lines.Where(text => text.Contains("原粹", StringComparison.Ordinal)).ToArray();
+                var has20 = originalLines.Any(text => text.Contains("20", StringComparison.Ordinal));
+                var has40 = originalLines.Any(text => text.Contains("40", StringComparison.Ordinal));
+                var hasDouble = lines.Any(text => text.Contains("双倍", StringComparison.Ordinal)
+                    || text.Contains("2倍", StringComparison.Ordinal));
+                var tier = _taskParam.ResinUsage.OriginalTier;
+                // 默认沿用双倍活动切 40，其余保持当前界面；指定档位主动切换。
+                var expected = tier == OriginalResinTier.Only20 ? 20
+                    : tier == OriginalResinTier.Prefer40 || hasDouble ? 40 : 0;
+                if (expected != 0 && !(expected == 20 ? has20 : has40))
+                {
+                    var switched = await TrySwitchOriginalTier(expected);
+                    if (!switched && tier == OriginalResinTier.Only20) continue;
+                    if (!switched && tier == OriginalResinTier.Prefer40 && !has20
+                        && !await TrySwitchOriginalTier(20)) continue;
+                    await _runtime.Delay(300, _ct);
+                    regions = CaptureRewardPromptRegions();
+                }
+            }
+            var (success, spent) = await TryPressRewardResin(regions, kind);
+            if (success) return (true, kind, spent);
+        }
+        _stopReason = ResinStopReason.NoUsableOption;
+        return (false, default, 0);
+    }
+
+    private async Task ActivateRewardPrompt()
+    {
+        using var capture = _runtime.CaptureToRectArea();
+        var titleRoi = GetRewardPromptTitleRoi(capture);
+        var titleRegion = CaptureRewardPromptTitleRegion(capture, titleRoi);
+
+        // 对齐自动秘境的处理，先点一次标题区域激活弹窗，再点树脂使用按钮。
+        InputHub.Foreground.Mouse.LeftButtonUp();
+        await _runtime.Delay(60, _ct);
+
+        if (titleRegion != null)
+        {
+            titleRegion.Click();
+            _logger.LogDebug("奖励页面已点击标题激活弹窗：text={Text}, x={X}, y={Y}", titleRegion.Text, titleRegion.X, titleRegion.Y);
+        }
+        else
+        {
+            capture.Derive(titleRoi).Click();
+            _logger.LogDebug("奖励页面标题 OCR 被拆分，回退点击标题区域中心激活弹窗");
+        }
+
+        await _runtime.Delay(800, _ct);
+    }
+
+    private Region? CaptureRewardPromptTitleRegion(ImageRegion capture, Rect titleRoi)
+    {
+        var titleRegions = capture.FindMulti(RecognitionObject.Ocr(titleRoi));
+        var mergedLines = MergeTextRegionsByLine(capture, titleRegions);
+        return mergedLines.FirstOrDefault(r => IsRewardPromptTitleText(r.Text));
+    }
+
+    private static bool IsRewardPromptTitleText(string text)
+    {
+        text = NormalizeLeyLineOcrText(text);
+        return text.Contains("激活地脉之花", StringComparison.Ordinal)
+               || text.Contains("选择激活方式", StringComparison.Ordinal)
+               || text.Contains("地脉之花", StringComparison.Ordinal);
+    }
+
+    private List<Region> CaptureRewardPromptRegions()
+    {
+        using var capture = _runtime.CaptureToRectArea();
+        return capture.FindMulti(RecognitionObject.Ocr(GetRewardPromptContentRoi(capture)));
+    }
+
+    /// <summary>沿用抬起左键与等待，再调用公共行匹配和双击逻辑。</summary>
+    private async Task<(bool Success, int OriginalSpent)> TryPressRewardResin(List<Region> promptRegions, ResinKind kind)
+    {
+        // 某些链路会残留左键按下状态，先显式抬起一次再点使用按钮。
+        InputHub.Foreground.Mouse.LeftButtonUp();
+        await _runtime.Delay(60, _ct);
+        return ResinRewardPrompt.PressUseResin(_runtime, promptRegions, kind, _logger, TaskName, _ct, _taskParam.GameCultureInfo);
+    }
+
+    /// <summary>使用地脉花原有切档模板切至 20 或 40，保留点击后 800 ms 识别等待。</summary>
+    private async Task<bool> TrySwitchOriginalTier(int expectedNum)
+    {
+        var switchRo = BuildTemplate("Assets/icon/switch_button.png", null, 0.7);
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(switchRo);
+        if (res.IsEmpty())
+        {
+            return false;
+        }
+
+        res.Click();
+        await _runtime.Delay(800, _ct);
+
+        using var check = _runtime.CaptureToRectArea();
+        var lineTexts = BuildPromptTextLines(check.FindMulti(_ocrRoThis));
+        return lineTexts.Any(text => text.Contains(expectedNum.ToString(), StringComparison.Ordinal) && text.Contains("原粹", StringComparison.Ordinal));
+    }
+
+    private static Rect GetRewardPromptTitleRoi(ImageRegion capture)
+    {
+        return new Rect(capture.Width / 4, capture.Height * 3 / 20, capture.Width / 2, capture.Height / 4);
+    }
+
+    private static Rect GetRewardPromptContentRoi(ImageRegion capture)
+    {
+        return new Rect(capture.Width / 4, capture.Height / 5, capture.Width / 2, capture.Height * 3 / 5);
+    }
+
+    private static List<string> BuildPromptTextLines(IEnumerable<Region> regions)
+    {
+        return GroupPromptRegionsByLine(regions)
+            .Select(line => NormalizeLeyLineOcrText(string.Concat(line.OrderBy(r => r.X).Select(r => r.Text.Trim()))))
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .ToList();
+    }
+
+    private bool HasRewardPrompt(ImageRegion capture)
+    {
+        var titleRoi = GetRewardPromptTitleRoi(capture);
+        if (CaptureRewardPromptTitleRegion(capture, titleRoi) != null)
+        {
+            return true;
+        }
+
+        var promptRegions = capture.FindMulti(RecognitionObject.Ocr(GetRewardPromptContentRoi(capture)));
+        var lineTexts = BuildPromptTextLines(promptRegions);
+        return lineTexts.Any(ContainsRewardPromptContentText);
+    }
+
+    private static string NormalizeLeyLineOcrText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        return text
+            .Replace("脈", "脉", StringComparison.Ordinal)
+            .Replace("觸", "触", StringComparison.Ordinal)
+            .Replace("樹", "树", StringComparison.Ordinal)
+            .Replace("選", "选", StringComparison.Ordinal)
+            .Replace("擇", "择", StringComparison.Ordinal)
+            .Replace("\r", string.Empty, StringComparison.Ordinal)
+            .Trim();
+    }
+
+    private static bool ContainsLeyLineFlowerText(string text)
+    {
+        text = NormalizeLeyLineOcrText(text);
+        return text.Contains("地脉之花", StringComparison.Ordinal)
+               || (text.Contains("地脉", StringComparison.Ordinal) && text.Contains("之花", StringComparison.Ordinal));
+    }
+
+    private static bool ContainsRewardPromptActionText(string text)
+    {
+        text = NormalizeLeyLineOcrText(text);
+        return text.Contains("使用", StringComparison.Ordinal);
+    }
+
+    private static bool ContainsRewardPromptContentText(string text)
+    {
+        text = NormalizeLeyLineOcrText(text);
+        return text.Contains("原粹树脂", StringComparison.Ordinal)
+               || text.Contains("浓缩树脂", StringComparison.Ordinal)
+               || text.Contains("须臾树脂", StringComparison.Ordinal)
+               || text.Contains("脆弱树脂", StringComparison.Ordinal)
+               || text.Contains("激活地脉之花", StringComparison.Ordinal)
+               || text.Contains("选择激活方式", StringComparison.Ordinal)
+               || (text.Contains("树脂", StringComparison.Ordinal) && text.Contains("使用", StringComparison.Ordinal))
+               || text.Contains("补充", StringComparison.Ordinal);
+    }
+
+    private static List<Region> MergeTextRegionsByLine(Region owner, IEnumerable<Region> regions)
+    {
+        var merged = new List<Region>();
+        foreach (var line in GroupPromptRegionsByLine(regions))
+        {
+            var orderedLine = line.OrderBy(r => r.X).ToList();
+            var left = orderedLine.Min(r => r.X);
+            var top = orderedLine.Min(r => r.Y);
+            var right = orderedLine.Max(r => r.Right);
+            var bottom = orderedLine.Max(r => r.Bottom);
+            var mergedRegion = owner.Derive(left, top, right - left, bottom - top);
+            mergedRegion.Text = string.Concat(orderedLine.Select(r => r.Text.Trim()));
+            merged.Add(mergedRegion);
+        }
+
+        return merged.OrderBy(r => r.Y).ThenBy(r => r.X).ToList();
+    }
+
+    private static List<List<Region>> GroupPromptRegionsByLine(IEnumerable<Region> regions)
+    {
+        var ordered = regions
+            .Where(r => !string.IsNullOrWhiteSpace(r.Text))
+            .OrderBy(r => r.Y)
+            .ThenBy(r => r.X)
+            .ToList();
+
+        var lines = new List<List<Region>>();
+        foreach (var region in ordered)
+        {
+            var line = lines.FirstOrDefault(candidate => IsSamePromptLine(candidate[0], region));
+            if (line == null)
+            {
+                lines.Add(new List<Region> { region });
+            }
+            else
+            {
+                line.Add(region);
+            }
+        }
+
+        return lines;
+    }
+
+    private static bool IsSamePromptLine(Region first, Region second)
+    {
+        var firstCenter = first.Y + first.Height / 2.0;
+        var secondCenter = second.Y + second.Height / 2.0;
+        var tolerance = Math.Max(first.Height, second.Height) * 0.6;
+        return Math.Abs(firstCenter - secondCenter) <= tolerance;
+    }
+
+    private async Task EnsureExitRewardPage()
+    {
+        const int maxAttempts = 5;
+        for (var i = 0; i < maxAttempts; i++)
+        {
+            if (!await VerifyRewardPage())
+            {
+                return;
+            }
+
+            InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+            await _runtime.Delay(800, _ct);
+        }
+    }
+
+    private async Task FindLeyLineOutcropByBook(string country, string type)
+    {
+        await OpenLeyLineOutcropCountryInHandbook(country, type);
+
+        for (var retry = 0; retry < 3; retry++)
+        {
+            if (await TryOpenBigMapFromHandbook())
+            {
+                break;
+            }
+
+            if (retry < 2)
+            {
+                _logger.LogDebug("通过冒险之证打开大地图失败，重新打开冒险之证，第{Retry}次", retry + 1);
+                await OpenLeyLineOutcropCountryInHandbook(country, type);
+            }
+            else
+            {
+                throw new Exception("大地图打开失败");
+            }
+        }
+
+        var center = _tpTask.GetBigMapCenterPoint(MapTypes.Teyvat.ToString());
+        _leyLineX = center.X;
+        _leyLineY = center.Y;
+
+        await CancelTrackingInMap();
+    }
+
+    private async Task OpenLeyLineOutcropCountryInHandbook(string country, string type)
+    {
+        await _returnMainUiTask.Start(_ct);
+        await _runtime.Delay(1000, _ct);
+
+        InputHub.Foreground.SimulateAction(GIActions.OpenAdventurerHandbook);
+        await _runtime.Delay(2500, _ct);
+
+        _runtime.GameRegion1080PPosClick(300, 550);
+        await _runtime.Delay(1000, _ct);
+        _runtime.GameRegion1080PPosClick(500, 200);
+        await _runtime.Delay(1000, _ct);
+        _runtime.GameRegion1080PPosClick(500, 500);
+        await _runtime.Delay(1000, _ct);
+
+        if (type == "启示之花")
+        {
+            _runtime.GameRegion1080PPosClick(700, 350);
+        }
+        else
+        {
+            _runtime.GameRegion1080PPosClick(500, 350);
+        }
+
+        await _runtime.Delay(1000, _ct);
+        _runtime.GameRegion1080PPosClick(1300, 800);
+        await _runtime.Delay(1000, _ct);
+
+        await FindAndClickCountry(country);
+    }
+
+    private async Task<bool> CheckBigMapOpened()
+    {
+        if (_mapSettingButtonRo == null)
+        {
+            return false;
+        }
+
+        using var capture = _runtime.CaptureToRectArea();
+        return capture.Find(_mapSettingButtonRo).IsExist();
+    }
+
+    private async Task FindAndClickCountry(string country)
+    {
+        var match = country == "挪德卡莱" ? "挪德卡" : country;
+
+        for (var attempt = 0; attempt <= MaxCountryScrollAttempts; attempt++)
+        {
+            using var capture = _runtime.CaptureToRectArea();
+            var list = capture.FindMulti(_ocrRoThis);
+            var matchingTargets = list.Where(r => r.Text.Contains(match, StringComparison.Ordinal)).ToList();
+            var target = matchingTargets.FirstOrDefault(r => IsCountryOptionFullyVisible(r, capture));
+            if (target != null)
+            {
+                target.Click();
+                return;
+            }
+
+            if (matchingTargets.Count > 0)
+            {
+                _logger.LogDebug("国家 {Country} 仅在冒险之证下拉列表裁切区域中被识别，继续向下滚动", country);
+            }
+
+            if (attempt == MaxCountryScrollAttempts)
+            {
+                break;
+            }
+
+            _runtime.GameRegion1080PPosMove(1500, 600);
+            InputHub.Foreground.Mouse.VerticalScroll(-1);
+            await _runtime.Delay(CountryScrollDelayMs, _ct);
+        }
+
+        _logger.LogWarning("冒险之证向下滚动{ScrollAttempts}次后仍未找到国家: {Country}", MaxCountryScrollAttempts, country);
+        throw new Exception($"冒险之证未找到国家: {country}");
+    }
+
+    private static bool IsCountryOptionFullyVisible(Region region, ImageRegion capture)
+    {
+        return region.Left >= capture.Width * CountryListLeftRatio
+               && region.Top >= capture.Height * CountryListTopRatio
+               && region.Right <= capture.Width * CountryListRightRatio
+               && region.Bottom <= capture.Height * CountryListVisibleBottomRatio;
+    }
+
+    private async Task<bool> TryOpenBigMapFromHandbook()
+    {
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var button = FindHandbookTrackActionButtonByIcon();
+            if (button == null)
+            {
+                break;
+            }
+
+            button.Click();
+            _logger.LogDebug("通过图标识别点击冒险之证底部操作按钮，第{Attempt}次", attempt + 1);
+            await _runtime.Delay(1500, _ct);
+            if (await CheckBigMapOpened())
+            {
+                return true;
+            }
+        }
+
+        _runtime.GameRegion1080PPosClick(1500, 850);
+        _logger.LogDebug("图标未命中或点击后未打开大地图，回退固定坐标点击");
+        await _runtime.Delay(2500, _ct);
+        return await CheckBigMapOpened();
+    }
+
+    private Region? FindHandbookTrackActionButtonByIcon()
+    {
+        if (_handbookTrackActionRo == null)
+        {
+            return null;
+        }
+
+        using var capture = _runtime.CaptureToRectArea();
+        var button = capture.Find(_handbookTrackActionRo);
+        if (!button.IsExist())
+        {
+            return null;
+        }
+
+        return button;
+    }
+
+    private async Task CancelTrackingInMap()
+    {
+        _runtime.GameRegion1080PPosClick(960, 540);
+        await _runtime.Delay(1000, _ct);
+
+        using var capture = _runtime.CaptureToRectArea();
+        var list = capture.FindMulti(_ocrRoThis);
+        var stop = list.FirstOrDefault(r => r.Text.Contains("停止", StringComparison.Ordinal));
+        if (stop != null)
+        {
+            stop.Click();
+            return;
+        }
+
+        var leyLine = list.FirstOrDefault(r => r.Text.Contains("地脉", StringComparison.Ordinal) || r.Text.Contains("衍出", StringComparison.Ordinal));
+        if (leyLine != null)
+        {
+            leyLine.Click();
+            await _runtime.Delay(1000, _ct);
+            _runtime.GameRegion1080PPosClick(1700, 1010);
+            await _runtime.Delay(1000, _ct);
+        }
+    }
+
+    /// <summary>耗尽方式在批次结束后复查余量并扩展内部目标，保持原复查上限，不修改参数；材料目标已达成时不再重查。</summary>
+    private async Task RecheckResinAndContinue()
+    {
+        while (!_rewardStopped && !_itemStopReached && ++_recheckCount <= MaxRecheckCount)
+        {
+            var count = await CalculateTargetRunTimes();
+            if (count <= 0 || count > 50) return;
+            await RunLeyLineChallenges();
+        }
+    }
+
+    /// <summary>根据本次开关或各类剩余次数，将库存转换为可领奖次数。</summary>
+    private async Task<ResinCountResult> CalCountByResin()
+    {
+        var counts = await CountAllResin();
+        var claims = ResinExecutionRules.AvailableClaims(_taskParam.ResinUsage, new ResinKindValues<int>
+        {
+            Original = counts.OriginalResinCount, Condensed = counts.CondensedResinCount,
+            Transient = counts.TransientResinCount, Fragile = counts.FragileResinCount
+        }, _selector.RemainingCounts);
+        return new ResinCountResult
+        {
+            Count = ResinKinds.InOrder.Sum(kind => claims[kind]),
+            OriginalResinTimes = claims.Original, CondensedResinTimes = claims.Condensed,
+            TransientResinTimes = claims.Transient, FragileResinTimes = claims.Fragile
+        };
+    }
+
+    /// <summary>只识别本次仍允许的库存；分别指定时已完成的种类不再计入。</summary>
+    private async Task<ResinCounts> CountAllResin()
+    {
+        await _returnMainUiTask.Start(_ct);
+        await _runtime.Delay(1500, _ct);
+        InputHub.Foreground.SimulateAction(GIActions.OpenMap);
+        await _runtime.Delay(1500, _ct);
+        var result = new ResinCounts
+        {
+            OriginalResinCount = ResinExecutionRules.CanUse(_taskParam.ResinUsage, _selector, ResinKind.Original) ? await CountOriginalResin() : 0,
+            CondensedResinCount = ResinExecutionRules.CanUse(_taskParam.ResinUsage, _selector, ResinKind.Condensed) ? await CountCondensedResin() : 0
+        };
+        var transient = ResinExecutionRules.CanUse(_taskParam.ResinUsage, _selector, ResinKind.Transient);
+        var fragile = ResinExecutionRules.CanUse(_taskParam.ResinUsage, _selector, ResinKind.Fragile);
+        if (transient || fragile)
+        {
+            await OpenReplenishResinUi();
+            await _runtime.Delay(1500, _ct);
+            if (transient) result.TransientResinCount = await CountTransientResin();
+            if (fragile) result.FragileResinCount = await CountFragileResin();
+        }
+        await _returnMainUiTask.Start(_ct);
+        return result;
+    }
+
+    private async Task<int> CountOriginalResin()
+    {
+        var icon = BuildTemplate("Assets/1920x1080/original_resin.png");
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(icon);
+        if (res.IsEmpty())
+        {
+            return 0;
+        }
+
+        var roi = new Rect(res.X, res.Y, ScaleTo1080(200), ScaleTo1080(40));
+        using var region = capture.DeriveCrop(roi);
+        var text = OcrFactory.Paddle.OcrWithoutDetector(region.CacheGreyMat);
+        var match = Regex.Match(text, @"(\d{1,3})\s*/\s*\d+");
+        if (match.Success)
+        {
+            return int.TryParse(match.Groups[1].Value, out var value) ? value : 0;
+        }
+
+        return 0;
+    }
+
+    private async Task<int> CountCondensedResin()
+    {
+        var icon = BuildTemplate("Assets/1920x1080/condensed_resin.png");
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(icon);
+        if (res.IsEmpty())
+        {
+            return 0;
+        }
+
+        var roi = new Rect(res.Right, res.Y, ScaleTo1080(90), ScaleTo1080(40));
+        using var region = capture.DeriveCrop(roi);
+        var text = OcrFactory.Paddle.OcrWithoutDetector(region.CacheGreyMat);
+        if (int.TryParse(Regex.Match(text, @"\d+").Value, out var value))
+        {
+            return value;
+        }
+
+        return await RecognizeWhiteNumber(region, capture);
+    }
+
+    private async Task<int> CountTransientResin()
+    {
+        var icon = BuildTemplate("Assets/1920x1080/transient_resin.png");
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(icon);
+        if (res.IsEmpty())
+        {
+            return 0;
+        }
+
+        var roi = new Rect(res.X, res.Bottom, res.Width, ScaleTo1080(60));
+        using var region = capture.DeriveCrop(roi);
+        return await RecognizeNumberWithFallback(region);
+    }
+
+    private async Task<int> CountFragileResin()
+    {
+        var icon = BuildTemplate("Assets/1920x1080/fragile_resin.png");
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(icon);
+        if (res.IsEmpty())
+        {
+            return 0;
+        }
+
+        var roi = new Rect(res.X, res.Bottom, res.Width, ScaleTo1080(60));
+        using var region = capture.DeriveCrop(roi);
+        return await RecognizeNumberWithFallback(region);
+    }
+
+    private async Task<int> RecognizeNumberWithFallback(ImageRegion region)
+    {
+        var text = OcrFactory.Paddle.OcrWithoutDetector(region.CacheGreyMat);
+        if (int.TryParse(Regex.Match(text, @"\d+").Value, out var value))
+        {
+            return value;
+        }
+
+        return await RecognizeNumberByTemplate(region, false);
+    }
+
+    private async Task<int> RecognizeWhiteNumber(ImageRegion region, ImageRegion capture)
+    {
+        return await RecognizeNumberByTemplate(region, true);
+    }
+
+    private async Task<int> RecognizeNumberByTemplate(ImageRegion region, bool white)
+    {
+        var icons = white
+            ? new Dictionary<int, string>
+            {
+                { 0, "Assets/1920x1080/num0_white.png" },
+                { 1, "Assets/1920x1080/num1_white.png" },
+                { 2, "Assets/1920x1080/num2_white.png" },
+                { 3, "Assets/1920x1080/num3_white.png" },
+                { 4, "Assets/1920x1080/num4_white.png" },
+                { 5, "Assets/1920x1080/num5_white.png" }
+            }
+            : new Dictionary<int, string>
+            {
+                { 1, "Assets/1920x1080/num1.png" },
+                { 2, "Assets/1920x1080/num2.png" },
+                { 3, "Assets/1920x1080/num3.png" },
+                { 4, "Assets/1920x1080/num4.png" }
+            };
+
+        foreach (var kvp in icons)
+        {
+            var ro = BuildTemplate(kvp.Value);
+            var result = region.Find(ro);
+            if (result.IsExist())
+            {
+                return kvp.Key;
+            }
+        }
+
+        return 0;
+    }
+
+    private async Task OpenReplenishResinUi()
+    {
+        var ro = BuildTemplate("Assets/icon/replenish_resin_button.png");
+        using var capture = _runtime.CaptureToRectArea();
+        var res = capture.Find(ro);
+        if (res.IsExist())
+        {
+            res.Click();
+        }
+    }
+
+    private class AutoLeyLineConfigData
+    {
+        [JsonPropertyName("errorThreshold")]
+        public double ErrorThreshold { get; set; }
+
+        [JsonPropertyName("leyLinePositions")]
+        public Dictionary<string, List<LeyLinePosition>> LeyLinePositions { get; set; } = [];
+    }
+
+    private class LeyLinePosition
+    {
+        [JsonPropertyName("x")]
+        public double X { get; set; }
+
+        [JsonPropertyName("y")]
+        public double Y { get; set; }
+
+        [JsonPropertyName("strategy")]
+        public string Strategy { get; set; } = string.Empty;
+
+        [JsonPropertyName("steps")]
+        public int Steps { get; set; }
+
+        [JsonPropertyName("order")]
+        public int Order { get; set; }
+    }
+
+    private class RawNodeData
+    {
+        [JsonPropertyName("teleports")]
+        public List<RawNode> Teleports { get; set; } = [];
+
+        [JsonPropertyName("blossoms")]
+        public List<RawNode> Blossoms { get; set; } = [];
+
+        [JsonPropertyName("edges")]
+        public List<RawEdge> Edges { get; set; } = [];
+
+        [JsonPropertyName("indexes")]
+        public Dictionary<string, Dictionary<string, List<int>>> Indexes { get; set; } = [];
+    }
+
+    private class RawNode
+    {
+        [JsonPropertyName("id")]
+        public int Id { get; set; }
+
+        [JsonPropertyName("region")]
+        public string Region { get; set; } = string.Empty;
+
+        [JsonPropertyName("position")]
+        public NodePosition Position { get; set; } = new();
+    }
+
+    private class RawEdge
+    {
+        [JsonPropertyName("source")]
+        public int Source { get; set; }
+
+        [JsonPropertyName("target")]
+        public int Target { get; set; }
+
+        [JsonPropertyName("route")]
+        public string Route { get; set; } = string.Empty;
+    }
+
+    private class NodeData
+    {
+        public List<Node> Nodes { get; set; } = [];
+        public Dictionary<string, Dictionary<string, List<int>>> Indexes { get; set; } = [];
+    }
+
+    private class Node
+    {
+        public int Id { get; set; }
+        public string Region { get; set; } = string.Empty;
+        public NodePosition Position { get; set; } = new();
+        public string Type { get; set; } = string.Empty;
+        public List<NodeRoute> Next { get; set; } = [];
+        public List<int> Prev { get; set; } = [];
+    }
+
+    private class NodeRoute
+    {
+        public int Target { get; set; }
+        public string Route { get; set; } = string.Empty;
+    }
+
+    private class NodePosition
+    {
+        [JsonPropertyName("x")]
+        public double X { get; set; }
+
+        [JsonPropertyName("y")]
+        public double Y { get; set; }
+    }
+
+    private class PathInfo
+    {
+        public Node StartNode { get; set; } = new();
+        public Node TargetNode { get; set; } = new();
+        public List<string> Routes { get; set; } = [];
+    }
+
+    private class ResinCounts
+    {
+        public int OriginalResinCount { get; set; }
+        public int CondensedResinCount { get; set; }
+        public int TransientResinCount { get; set; }
+        public int FragileResinCount { get; set; }
+    }
+
+    private class ResinCountResult
+    {
+        public int Count { get; set; }
+        public int OriginalResinTimes { get; set; }
+        public int CondensedResinTimes { get; set; }
+        public int TransientResinTimes { get; set; }
+        public int FragileResinTimes { get; set; }
+    }
+
+    private sealed class AutoFightConfigScope(AllConfig allConfig, AutoFightConfig originalConfig) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            allConfig.AutoFightConfig = originalConfig;
+        }
+    }
+
+}

@@ -1,0 +1,59 @@
+name: Ruff
+on:
+  push:
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ruff.yml'
+  pull_request:
+    paths:
+      - '**.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ruff.yml'
+
+# 同分支连续推送时取消未跑完的旧 run，只保留最新一次
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Format Code
+        run: uv run ruff format .
+
+      - name: Lint Code
+        run: uv run ruff check .
+
+      # - name: Commit and Push Changes (Optional) # 自动格式化后提交并推送更改
+      #   if: github.event_name == 'push'  # 仅在 Push 时提交更改
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     # 配置 Git 用户信息
+      #     git config --global user.name "github-actions[bot]"
+      #     git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      #     # 检查是否有格式化修改
+      #     if git diff --quiet; then
+      #       echo "No changes to commit."
+      #     else
+      #       # 提交并推送格式化后的代码
+      #       git add .
+      #       git commit -m "Auto-format code via Ruff"
+      #       git push origin HEAD:$GITHUB_REF
+      #     fi

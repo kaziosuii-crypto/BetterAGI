@@ -1,0 +1,533 @@
+"""
+ConfigService - 统一的配置管理服务
+
+职责:
+- 提供统一的配置加载接口（多文件模式：按文件视图 + 拍平合并视图）
+- 集中管理所有配置加载逻辑
+- 拦截器配置读取
+- 配置热重载：FileWatcher + 回调机制
+"""
+
+import asyncio
+import inspect
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
+
+
+from src.modules.config.self_write_guard import consume_self_write
+from src.modules.logging import get_logger
+
+if TYPE_CHECKING:
+    from src.modules.config.file_watcher import FileChange, FileWatcher
+
+# 热重载回调签名: 支持 (scopes) 或 () 两种调用形态
+ConfigReloadCallback = Union[
+    Callable[[Sequence[str]], Any],
+    Callable[[], Any],
+]
+
+_CONFIG_FILE_TO_SCOPE: Dict[str, str] = {
+    "agents.toml": "agents",
+    "collectors.toml": "collectors",
+    "tools.toml": "tools",
+    "avatar.toml": "avatar",
+    "model.toml": "model",
+    "storage.toml": "storage",
+    "infra.toml": "infra",
+}
+
+# reload 策略（scope 级声明）：
+# - "restart"：装配类配置（Agent/采集器实例、provider 连接、端口、
+#   disabled_tools 等）——重载后仅日志"待重启"，已构造实例不热注入
+# - "hot"：基础设施标量——经 ConfigProxy 实时拉取 _main_config 即时生效
+_SCOPE_RELOAD_POLICY: Dict[str, str] = {
+    "agents": "restart",
+    "collectors": "restart",
+    "tools": "restart",
+    "avatar": "restart",
+    "model": "restart",
+    "storage": "restart",
+    "infra": "hot",
+}
+
+
+class ConfigService:
+    """
+    统一的配置管理服务
+
+    提供一个集中的配置管理入口，所有组件的配置加载都通过此服务进行。
+
+    使用示例:
+        config_service = ConfigService(base_dir="/path/to/project")
+        config, was_created = config_service.initialize()
+
+        general_config = config_service.get_section("general")
+        interceptor_config = config_service.get_interceptor_config("rate_limit")
+
+        # 热重载
+        config_service.register_reload_callback(my_callback)
+        await config_service.start_file_watcher()
+    """
+
+    def __init__(self, base_dir: str) -> None:
+        self.base_dir = base_dir
+        self._main_config: Dict[str, Any] = {}
+        self._main_config_copied = False
+        self._initialized = False
+        # 按文件的原始视图（拍平前）：多文件模式下由 _try_multi_file_init 填充；
+        # 单文件/未初始化路径保持空 dict，get_file_section 才有确定行为
+        self._file_sections: Dict[str, Any] = {}
+        # 热重载状态
+        self._reload_callbacks: List[ConfigReloadCallback] = []
+        self._file_watcher: Optional["FileWatcher"] = None
+        self._file_watcher_subscription_id: Optional[str] = None
+        self._reload_lock: asyncio.Lock = asyncio.Lock()
+        self._reload_revision: int = 0
+        self._last_coverage_result: Optional[Any] = None
+        self.logger = get_logger("ConfigService")
+        self.logger.debug("ConfigService 初始化完成")
+
+    @property
+    def main_config(self) -> Dict[str, Any]:
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回空配置")
+            return {}
+        return self._main_config
+
+    def _try_multi_file_init(self) -> tuple[bool, bool]:
+        """尝试使用多文件配置模式（首次运行自动生成）
+
+        决策逻辑：
+        1. config/ 存在且有 .toml → 直接加载
+        2. config/ 不存在或为空 → 从 Schema 生成默认配置
+
+        成功时将配置拍平到 _main_config 以保持向后兼容。
+
+        Returns:
+            (success, was_created) — success=True 表示多文件模式就绪；
+            was_created=True 表示本次执行了生成
+        """
+        # 函数内 import：multi_file_loader 顶层拉起 tomlkit 与全部域 Schema，
+        # 本模块被 Dashboard 等只读入口顶层引用时不应付出该成本，仅在配置管线运行时加载
+        from src.modules.config.multi_file_loader import (
+            generate_default_configs,
+            load_config_dir,
+        )
+
+        config_dir = Path(self.base_dir) / "config"
+        was_created = False
+
+        if not config_dir.exists() or not any(config_dir.glob("*.toml")):
+            self.logger.info("首次运行：从 Schema 生成默认配置到 config/...")
+            generate_default_configs(config_dir)
+            was_created = True
+
+        try:
+            multi_config, drift = load_config_dir(config_dir)
+        except Exception as e:
+            self.logger.error(f"多文件配置加载失败: {e}")
+            # 原样带 cause 传播：加载硬错的消息（未注册段名/合法名单/出路
+            # 指引）是用户修复配置的唯一入口，吞成布尔失败会让硬错退化
+            # 为一句无信息量的失败提示
+            raise RuntimeError(
+                "配置初始化失败：无法加载 config/ 目录下的配置文件。"
+                "按上方错误详情修正配置后重启；无法定位时可删除 config/ 目录重新生成。"
+            ) from e
+
+        if drift.has_drift:
+            for key in drift.redundant:
+                self.logger.warning(f"漂移检测: 冗余配置项 '{key}'")
+            for key in drift.missing:
+                self.logger.info(f"漂移检测: 补充缺失配置项 '{key}'")
+
+        self._main_config = {}
+        for category in ("agents", "collectors", "tools", "avatar", "model", "storage", "infra"):
+            section_data = multi_config.get(category, {})
+            if isinstance(section_data, dict):
+                for key, value in section_data.items():
+                    self._main_config[key] = value
+        # 拍平会丢掉"哪个键属于哪个文件"，而部分消费方需要的正是**按文件**的视图：
+        # collectors.toml 的根键就是 enabled + 各采集器同名表（没有 [collectors] 包裹表），
+        # 拍平后顶层只剩 enabled 与各采集器名，取不到"这一个文件的这一段"。
+        # 保留原始多文件视图供 get_file_section() 使用。
+        self._file_sections: Dict[str, Any] = dict(multi_config)
+
+        return True, was_created
+
+    def initialize(self) -> tuple[Dict[str, Any], bool]:
+        """
+        初始化配置（多文件模式）。
+
+        自动检测 config/ 目录：
+        1. 已存在 → 直接加载
+        2. 不存在 + 旧 config.toml 存在 → 迁移到 config/
+        3. 不存在 + 无旧 config.toml → 从 Schema 生成默认配置
+
+        Returns:
+            (main_config, was_created) — was_created 表示本次执行了生成或迁移
+        """
+        if self._initialized:
+            self.logger.warning("ConfigService 已经初始化，跳过重复初始化")
+            return self._main_config, False
+
+        self.logger.info("开始初始化配置服务...")
+
+        success, was_created = self._try_multi_file_init()
+        if not success:
+            raise RuntimeError(
+                "配置初始化失败：无法加载 config/ 目录下的配置文件。请检查配置文件格式或删除 config/ 目录重新生成。"
+            )
+
+        self._initialized = True
+        self._main_config_copied = was_created
+        self.logger.info("配置服务初始化完成")
+
+        return self._main_config, was_created
+
+    def _check_schema_registry_coverage(self) -> None:
+        """空实现，兼容旧调用方。"""
+        self._last_coverage_result = None
+
+    def get_file_section(self, file_stem: str, default: Any = None) -> Dict[str, Any]:
+        """按**文件**取配置段（多文件模式下的原始命名空间）。
+
+        与 ``get_section`` 的区别：``get_section`` 查的是拍平后的合并视图，
+        而每个文件在拍平前各自是一棵独立的树。需要"某文件这一段"时必须用本方法：
+
+        - ``file_stem="collectors"`` → ``{enabled: [...], <采集器名>: {...}, ...}``
+          （collectors.toml 的根键就是 enabled 与各采集器同名表，没有包裹表，
+          拍平后顶层只剩 enabled 与各采集器名，用 ``get_section`` 取不到）
+        - ``file_stem="agents"`` → ``{agents: {...}}``（该文件有 ``[agents]`` 包裹表）
+
+        Args:
+            file_stem: 配置文件名（不含扩展名，如 "collectors"）
+            default: 文件不存在或未初始化时的返回值（缺省空 dict）
+
+        Returns:
+            该文件的配置树（meta 已在加载期剥离）
+        """
+        empty = {} if default is None else default
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回空配置")
+            return empty
+        section = self._file_sections.get(file_stem)
+        return section if isinstance(section, dict) else empty
+
+    def get_section(self, section: str, default: Any = None) -> Dict[str, Any]:
+        """
+        获取配置节
+
+        支持点分路径访问嵌套配置节，例如：
+        - "general" → config["general"]
+        - "collectors" → config["collectors"]
+        - "collectors.stt" → config["collectors"]["stt"]
+
+        Args:
+            section: 配置节名称（如 "general", "collectors", "collectors.stt"）
+            default: 如果配置节不存在，返回的默认值
+
+        Returns:
+            配置节字典
+        """
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回空配置")
+            return {} if default is None else default
+
+        if "." in section:
+            parts = section.split(".")
+            current = self._main_config
+
+            for part in parts:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    self.logger.debug(f"配置节 '{section}' 不存在（在 '{part}' 处中断）")
+                    return {} if default is None else default
+
+            return current if isinstance(current, dict) else {}
+        else:
+            result: Any = self._main_config.get(section, default)
+            if result is None:
+                self.logger.warning(f"配置节 '{section}' 不存在")
+                return {}
+
+            return result if isinstance(result, dict) else {}
+
+    def get(self, key: str, default: Any = None, section: Optional[str] = None) -> Any:
+        """
+        获取配置项
+
+        Args:
+            key: 配置项键
+            default: 默认值
+            section: 配置节名称（可选，如果提供则从该节中查找）
+
+        Returns:
+            配置项值
+        """
+        if section:
+            section_config = self.get_section(section)
+            return section_config.get(key, default)
+        else:
+            return self._main_config.get(key, default)
+
+    def get_interceptor_config(self, interceptor_name: str) -> Dict[str, Any]:
+        """
+        获取事件拦截器配置
+
+        配置来源：主配置文件中 [interceptors.interceptor_name]
+
+        Args:
+            interceptor_name: 拦截器名称（如 "rate_limit", "similar_filter"）
+
+        Returns:
+            拦截器配置字典
+        """
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回空配置")
+            return {}
+
+        return self.get_section("interceptors", {}).get(interceptor_name, {}).copy()
+
+    def get_all_interceptor_configs(self) -> Dict[str, Dict[str, Any]]:
+        """获取所有事件拦截器的配置"""
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回空配置")
+            return {}
+
+        return self.get_section("interceptors", {}).copy()
+
+    def is_interceptor_enabled(self, interceptor_name: str) -> bool:
+        """
+        检查事件拦截器是否启用
+
+        启用语义与 main.py 注册逻辑一致：``[interceptors.<name>]`` 的
+        ``enabled`` 键，缺省视为启用（拦截器以默认参数注册）。
+
+        Args:
+            interceptor_name: 拦截器名称
+
+        Returns:
+            是否启用
+        """
+        if not self._initialized:
+            self.logger.warning("ConfigService 未初始化，返回 False")
+            return False
+
+        interceptor_config = self.get_section("interceptors", {}).get(interceptor_name, {})
+        if not isinstance(interceptor_config, dict):
+            return True
+
+        return bool(interceptor_config.get("enabled", True))
+
+    # ========== 热重载 + Schema API ==========
+
+    def register_reload_callback(self, callback: ConfigReloadCallback) -> None:
+        """注册配置热重载回调。
+
+        Args:
+            callback: 配置热重载回调。允许无参回调 ``()``，也允许
+                ``(scopes: Sequence[str]) -> Any`` 接收变更范围列表的回调。
+                async 回调会被自动 await。
+        """
+        self._reload_callbacks.append(callback)
+
+    def unregister_reload_callback(self, callback: ConfigReloadCallback) -> None:
+        """注销已注册的回调。未注册的回调静默忽略。"""
+        try:
+            self._reload_callbacks.remove(callback)
+        except ValueError:
+            return
+
+    @staticmethod
+    def _callback_accepts_scopes(callback: ConfigReloadCallback) -> bool:
+        """通过 inspect 检查回调是否接受位置参数 (scopes)。"""
+        try:
+            params = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):
+            return False
+
+        positional_kinds = {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+        for param in params:
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                return True
+            if param.kind in positional_kinds:
+                return True
+        return False
+
+    async def _invoke_reload_callback(
+        self,
+        callback: ConfigReloadCallback,
+        changed_scopes: Sequence[str],
+    ) -> None:
+        """调用单个回调，根据签名决定是否传 scopes；async 回调自动 await。"""
+        if self._callback_accepts_scopes(callback):
+            cb_with_scopes = cast(Callable[[Sequence[str]], Any], callback)
+            result = cb_with_scopes(changed_scopes)
+        else:
+            cb_no_scopes = cast(Callable[[], Any], callback)
+            result = cb_no_scopes()
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _normalize_changed_scopes(
+        scopes: Optional[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        """规范化输入 scopes: 去重/小写/过滤未知值。None → 全部 scope。"""
+        all_scopes = tuple(_CONFIG_FILE_TO_SCOPE.values())
+        if scopes is None:
+            return all_scopes
+        seen: List[str] = []
+        valid = set(all_scopes)
+        for raw in scopes:
+            if not isinstance(raw, str):
+                continue
+            s = raw.strip().lower()
+            if not s or s not in valid or s in seen:
+                continue
+            seen.append(s)
+        return tuple(seen)
+
+    @staticmethod
+    def _resolve_changed_scopes(
+        changes: Sequence["FileChange"],
+    ) -> Tuple[str, ...]:
+        """FileChange 列表 → scope 元组 (基于文件名)。"""
+        scopes: List[str] = []
+        for change in changes:
+            scope = _CONFIG_FILE_TO_SCOPE.get(change.path.name)
+            if scope and scope not in scopes:
+                scopes.append(scope)
+        return tuple(scopes)
+
+    async def reload_config(
+        self,
+        changed_scopes: Optional[Sequence[str]] = None,
+    ) -> bool:
+        """重载配置文件并调用所有已注册回调。
+
+        Args:
+            changed_scopes: 要重载的 scope 列表（agents/collectors/tools/avatar/
+                model/storage/infra 的子集）。None 表示重载全部。
+
+        Returns:
+            True 表示重载流程完成 (即使个别回调失败)，False 表示加载失败。
+        """
+        scopes = self._normalize_changed_scopes(changed_scopes)
+        if not scopes:
+            self.logger.debug("reload_config: 无有效 scope，跳过")
+            return True
+
+        async with self._reload_lock:
+            try:
+                self._main_config = self._load_main_config_from_disk()
+            except Exception as exc:
+                # 热重载失败语义：保留旧配置继续运行（不打断直播）
+                self.logger.error(f"配置重载失败（保留旧配置继续运行）: {exc}")
+                return False
+
+            self._reload_revision += 1
+            self.logger.info(f"配置已重载 (revision={self._reload_revision}, scopes={list(scopes)})")
+
+            # 按策略分流：restart 段仅提示待重启；hot 段经 ConfigProxy 即时生效
+            hot_scopes = tuple(s for s in scopes if _SCOPE_RELOAD_POLICY.get(s) == "hot")
+            restart_scopes = tuple(s for s in scopes if _SCOPE_RELOAD_POLICY.get(s) != "hot")
+            if restart_scopes:
+                self.logger.warning(f"以下配置段含装配类变更，需重启进程后完全生效: {list(restart_scopes)}")
+
+            if hot_scopes:
+                for callback in list(self._reload_callbacks):
+                    try:
+                        await self._invoke_reload_callback(callback, hot_scopes)
+                    except Exception as exc:
+                        self.logger.warning(f"reload 回调执行失败: {exc}")
+            else:
+                self.logger.debug("reload_config: 无 hot 段变更，跳过回调分发")
+        return True
+
+    def _load_main_config_from_disk(self) -> Dict[str, Any]:
+        """从磁盘重新加载所有配置文件, 返回扁平化的 _main_config。"""
+        # 函数内 import：同 _try_multi_file_init，仅在真正读盘时拉起 loader 及其依赖
+        from src.modules.config.multi_file_loader import load_config_dir
+
+        config_dir = Path(self.base_dir) / "config"
+        multi_config, _drift = load_config_dir(config_dir)
+
+        flattened: Dict[str, Any] = {}
+        for category in ("agents", "collectors", "tools", "avatar", "model", "storage", "infra"):
+            section_data = multi_config.get(category, {})
+            if isinstance(section_data, dict):
+                for key, value in section_data.items():
+                    flattened[key] = value
+        return flattened
+
+    async def _handle_reload(
+        self,
+        changes: Sequence["FileChange"],
+    ) -> None:
+        """FileWatcher 回调入口: 自写抑制过滤 → 解析 scopes → reload_config。"""
+        if not changes:
+            return
+        # 自写抑制：配置管线自身写盘产生的事件不触发重载（防重入放大）
+        external = [c for c in changes if not consume_self_write(c.path)]
+        if not external:
+            self.logger.debug("_handle_reload: 变更全部来自配置管线自写，跳过重载")
+            return
+        scopes = self._resolve_changed_scopes(external)
+        if not scopes:
+            return
+        await self.reload_config(changed_scopes=scopes)
+
+    async def start_file_watcher(self) -> None:
+        """启动 FileWatcher 监听 config/ 下全部域 TOML 文件。
+
+        幂等: 重复调用不会重启 watcher。
+        """
+        if self._file_watcher is not None and self._file_watcher.running:
+            return
+
+        # 函数内 import：watchfiles 为可选第三方依赖，仅在启动文件监听时加载
+        from src.modules.config.file_watcher import FileWatcher
+
+        config_dir = Path(self.base_dir) / "config"
+        watched = [config_dir / name for name in _CONFIG_FILE_TO_SCOPE.keys()]
+
+        self._file_watcher = FileWatcher(
+            paths=watched,
+            debounce_ms=600,
+            callback_timeout_s=15.0,
+            callback_failure_threshold=3,
+            callback_cooldown_s=30.0,
+        )
+        self._file_watcher_subscription_id = self._file_watcher.subscribe(
+            self._handle_reload,
+            paths=watched,
+        )
+        await self._file_watcher.start()
+        self.logger.info(f"ConfigService 文件监视器已启动 (paths={len(watched)})")
+
+    async def stop_file_watcher(self) -> None:
+        """停止 FileWatcher。未启动时调用是安全的 (no-op)。"""
+        if self._file_watcher is None:
+            return
+        if self._file_watcher_subscription_id is not None:
+            self._file_watcher.unsubscribe(self._file_watcher_subscription_id)
+            self._file_watcher_subscription_id = None
+        await self._file_watcher.stop()
+        self._file_watcher = None
+        self.logger.info("ConfigService 文件监视器已停止")

@@ -1,0 +1,545 @@
+"""
+Dashboard 服务器主类
+
+负责启动 FastAPI 服务器，协调各子模块。
+"""
+
+import asyncio
+import mimetypes
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional, TYPE_CHECKING
+
+from fastapi import WebSocket
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from src.modules.agents.control import AgentControl
+from src.modules.dashboard.api.router import create_app, setup_cors
+from src.modules.dashboard.dependencies import set_dashboard_server
+from src.modules.config.core_schemas import DEFAULT_VITE_DEV_PORT, DashboardConfig
+from src.modules.dashboard.vite_dev import ViteDevServer
+from src.modules.dashboard.widget import DanmakuWidgetService, Game2048WidgetService
+from src.modules.dashboard.widget.models import DanmakuWidgetConfig, SubtitleWidgetConfig
+from src.modules.dashboard.widget.routes import WidgetGateway, create_widget_router
+from src.modules.llm.quota import ProviderQuotaService
+from src.modules.llm.request_history_manager import RequestHistoryManager
+from src.modules.logging import get_logger
+from src.modules.logging.log_streamer import LogStreamer
+
+try:
+    import uvicorn
+
+    # 显式指定 sansio 实现避免触发 websockets.legacy 弃用警告。
+    # 当前 uvicorn 尚未将 websockets-sansio 暴露为字符串选项，
+    # 且 uvicorn 依赖的 websockets 版本引入了 sansio 实现，因此在此处直接导入类传入 ws=。
+    # 后续若 uvicorn 支持字符串选项，可改为 ws="websockets-sansio" 并删除此处导入。
+    from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+
+    UVICORN_AVAILABLE = True
+except ImportError:
+    UVICORN_AVAILABLE = False
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+    from src.modules.config.service import ConfigService
+    from src.modules.diagnostics.writer import DiagnosticsWriter
+    from src.modules.events.event_bus import EventBus
+    from src.modules.events.event_history import EventHistoryService
+    from src.modules.simulator.service import SimulatorService
+
+from src.modules.dashboard.websocket.broadcaster import EventBroadcaster
+from src.modules.dashboard.websocket.handler import WebSocketHandler
+
+
+class DashboardServer:
+    """Dashboard 服务器主类"""
+
+    # 配置端口被占用时的回退候选数（含配置端口本身，即依次试 port..port+9）
+    _PORT_FALLBACK_CANDIDATES = 10
+
+    def __init__(
+        self,
+        event_bus: "EventBus",
+        config_service: "ConfigService",
+        dashboard_config: DashboardConfig,
+        collector_manager: Optional[Any] = None,
+        agent_manager: Optional[Any] = None,
+        tool_registry: Optional[Any] = None,
+        llm_manager: Optional[Any] = None,
+        prompt_manager: Optional[Any] = None,
+        log_streamer: Optional[LogStreamer] = None,
+        event_history: Optional["EventHistoryService"] = None,
+        simulator_service: Optional["SimulatorService"] = None,
+        session_manager: Optional[Any] = None,
+        viewer_repo: Optional[Any] = None,
+        chat_repo: Optional[Any] = None,
+        llm_repo: Optional[Any] = None,
+        rundown_repo: Optional[Any] = None,
+        viewer_profile_repo: Optional[Any] = None,
+        viewer_identity_repo: Optional[Any] = None,
+        event_repo: Optional[Any] = None,
+        recap_repo: Optional[Any] = None,
+        rundown_transition_repo: Optional[Any] = None,
+        storage_db_path: Optional[Path] = None,
+        task_tracker: Optional[Any] = None,
+        subtitle_service: Optional[Any] = None,
+        tts_engine: Optional[Any] = None,
+        diagnostics_writer: Optional["DiagnosticsWriter"] = None,
+        request_history_manager: Optional[RequestHistoryManager] = None,
+    ) -> None:
+        self.event_bus = event_bus
+        self.collector_manager = collector_manager
+        self.agent_manager = agent_manager
+        # 任务跟踪器：任务卡快照（GET /api/v1/tasks）读 ledger，运营委派经
+        # AgentControl 登记任务；未注入（极简启动/测试）时相关端点返回 503。
+        self.task_tracker = task_tracker
+        # AgentControl 是 /api/v1/agents 控制面（pause/resume/shutdown/state）的
+        # 直接调用接口；agent_manager 未注入（极简启动/测试）时保持 None，
+        # 相关端点返回 503。
+        self.agent_control: Optional[AgentControl] = (
+            AgentControl(
+                agent_manager,
+                task_tracker.ledger if task_tracker is not None else None,
+                event_bus=event_bus,
+            )
+            if agent_manager is not None
+            else None
+        )
+        self.tool_registry = tool_registry
+        self.llm_manager = llm_manager
+        # 平台额度查询（上下文面板 Usage 区）按模型反查 provider 配置，依附 LLMManager；
+        # 未注入（极简启动/测试）时 /llm/quota 恒返回 null
+        self.provider_quota: Optional[ProviderQuotaService] = (
+            ProviderQuotaService(llm_manager) if llm_manager is not None else None
+        )
+        self.prompt_manager = prompt_manager
+        self.config_service = config_service
+        # 注入 SimulatorService 让 `/api/v1/simulator/*` 控制面可用。
+        # 未注入（如默认生产配置 enabled=false）时相关端点仍可调用（返回 is_available=false）。
+        self.simulator_service = simulator_service
+        # 注入 LiveSessionManager 让 `/api/v1/sessions/*` 控制面可用（场次开启/结束/删除）。
+        # 未注入时相关端点返回 is_available=false，不影响其余 API。
+        self.session_manager = session_manager
+        self.viewer_repo = viewer_repo
+        # 注入 ChatRepo 让 `/api/v1/viewers/*` 的观众明细聚合（对话交织 /
+        # 贡献 / 参与场次）直查 live_chat 三表；未注入时相关端点返回 503
+        self.chat_repo = chat_repo
+        # 注入 LLMRepo 让 `/api/v1/llm/usage*` 从 SQLite 聚合用量；未注入时相关端点返回空数据
+        self.llm_repo = llm_repo
+        # 请求历史管理器（与 LLMManager 写入侧同源，组合根传同一实例）；
+        # 未注入（极简启动/测试）时自建仅内存缓存的实例，历史查询返回空数据
+        self.request_history_manager: RequestHistoryManager = (
+            request_history_manager if request_history_manager is not None else RequestHistoryManager()
+        )
+        # 注入 RundownRepo 让 `/api/v1/rundowns*` 承载流程单库 CRUD；
+        # 未注入（极简启动/测试）时相关端点降级 success=false
+        self.rundown_repo = rundown_repo
+        # 注入 ViewerProfileRepo 让 `/api/v1/memory/*` 承载观众画像管理接口
+        # （列表/纠正/删除）；未注入（极简启动/测试）时相关端点返回 503
+        self.viewer_profile_repo = viewer_profile_repo
+        # 注入 ViewerIdentityRepo 让 `/api/v1/viewers/pending|merge|keep|unlink` 承载观众身份的
+        # 人工处理（待确认、合并、取消关联）；未注入（极简启动/测试）时相关端点返回 503
+        self.viewer_identity_repo = viewer_identity_repo
+        # 注入 EventRepo 让 /api/v1/review 的游戏事件计数直查 game_events；
+        # storage_db_path 供 /api/v1/review/export 打包 db 一致性快照副本；
+        # 未注入时相应分节/打包项按缺数据降级
+        self.event_repo = event_repo
+        self.storage_db_path = storage_db_path
+        # 注入 SessionRecapRepo 让 /api/v1/review 的总结面板读 session_recaps；
+        # 未注入（极简启动/测试）时复盘聚合的回顾字段按缺数据降级为空
+        self.recap_repo = recap_repo
+        # 注入 RundownTransitionRepo 让 /live-sessions/{id}/rundown-execution
+        # 读流程单变更事实行；未注入（极简启动/测试）时该端点返回 503
+        self.rundown_transition_repo = rundown_transition_repo
+        # 注入字幕服务与 TTS 引擎让 `/api/v1/debug/subtitle|tts` 直测端点
+        # 可用；未注入（极简启动/测试）时相关端点返回 503
+        self.subtitle_service = subtitle_service
+        self.tts_engine = tts_engine
+        # 注入诊断落盘器让场次回看事件侧能读到 logs/events 诊断流；
+        # 未注入（极简启动/测试）时回看事件侧只有内存环形缓冲
+        self.diagnostics_writer = diagnostics_writer
+
+        self.port = dashboard_config.port
+        self.host = dashboard_config.host
+        self.cors_origins = dashboard_config.cors_origins
+        self.max_history_messages = dashboard_config.max_history_messages
+        self.websocket_heartbeat = dashboard_config.websocket_heartbeat
+        self.dashboard_config = dashboard_config
+        self.logger = get_logger("DashboardServer")
+
+        self._is_running = False
+
+        self.app: Optional["FastAPI"] = None
+        self._server_task: Optional[asyncio.Task] = None
+        self._server: Optional["uvicorn.Server"] = None
+
+        self.ws_handler: Optional[WebSocketHandler] = None
+        self.event_broadcaster: Optional[EventBroadcaster] = None
+        self.event_history = event_history
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._external_log_streamer = log_streamer
+        self.log_streamer: Optional[LogStreamer] = None
+
+        self.widget_gateway = WidgetGateway()
+
+        self.dev_mode: bool = dashboard_config.dev_mode
+        self.vite_dev_port: int = dashboard_config.vite_dev_port
+        self._vite_dev: Optional[ViteDevServer] = None
+
+    async def start(self) -> None:
+        """启动 Dashboard 服务器"""
+        if not UVICORN_AVAILABLE:
+            self.logger.warning("uvicorn 未安装，Dashboard 无法启动")
+            self.logger.warning("请运行: uv add fastapi 'uvicorn[standard]'")
+            return
+
+        self.logger.info(f"Dashboard 服务器启动中: http://{self.host}:{self.port}")
+
+        self.app = create_app()
+        setup_cors(self.app, self.cors_origins)
+
+        # widget 路由必须先于下方 serve_spa catch-all 挂载（路由按注册顺序匹配，
+        # 反了则 /api/widget/* 全部被 catch-all 的 api/ 守卫截成 Not Found）
+        await self._setup_widget_service()
+
+        DASHBOARD_DIST = Path(__file__).parent.parent.parent.parent / "dashboard" / "dist"
+
+        if DASHBOARD_DIST.exists() and DASHBOARD_DIST.is_dir():
+            assets_dir = DASHBOARD_DIST / "assets"
+            if assets_dir.exists():
+                # Windows 注册表可能将 .js 标记为 text/plain，模块脚本需要正确的 MIME 类型。
+                mimetypes.add_type("text/javascript", ".js")
+                mimetypes.add_type("text/javascript", ".mjs")
+                self.app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+            # FileResponse|dict 混合返回无法生成 Pydantic 响应模型，须显式关闭
+            @self.app.get("/{full_path:path}", response_model=None)
+            async def serve_spa(full_path: str) -> FileResponse | Dict[str, str]:
+                if full_path.startswith("api/") or full_path == "ws":
+                    return {"detail": "Not Found"}
+                # dist 根下的真实文件（public/ 拷贝物如 icon.png）优先于 SPA 回退：
+                # 只挂 /assets 时这类路径会拿到 index.html，浏览器把 HTML 当图片
+                candidate = DASHBOARD_DIST / full_path
+                if full_path and candidate.is_file() and candidate.resolve().is_relative_to(DASHBOARD_DIST.resolve()):
+                    # 与 index.html 同理 no-cache：icon.png 等未带内容 hash，重验避免换图后失效
+                    return FileResponse(str(candidate), headers={"Cache-Control": "no-cache"})
+                # no-cache 强制每次重验（未变时 304）：后端重建后标签页必须拿到新 index，
+                # 否则启发式缓存会让旧入口引用已被清掉的 chunk hash，懒加载路由卡死
+                return FileResponse(str(DASHBOARD_DIST / "index.html"), headers={"Cache-Control": "no-cache"})
+
+            self.logger.info(f"前端静态文件已挂载: {DASHBOARD_DIST}")
+        else:
+
+            @self.app.get("/")
+            async def root() -> Dict[str, str]:
+                return {
+                    "name": "Amaidesu Dashboard API",
+                    "version": "1.0.0",
+                    "docs": "/docs",
+                    "message": (
+                        "前端未构建（dashboard/dist/ 不存在），开发模式请先执行 'cd dashboard && pnpm run dev' "
+                        f"并访问 http://localhost:{DEFAULT_VITE_DEV_PORT}"
+                    ),
+                }
+
+            self.logger.info("前端未构建，仅 API 模式运行")
+
+        # 预绑定端口：在任何副作用（broadcaster/log_streamer/vite/心跳）之前完成，
+        # 端口被占用时在此失败，避免先打印“已启动”再退出的假象。
+        config = uvicorn.Config(
+            app=self.app,
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            ws=WebSocketsSansIOProtocol,
+        )
+        server = uvicorn.Server(config)
+        self._server = server
+        bound_socket = self._bind_socket()
+
+        set_dashboard_server(self)
+
+        self.ws_handler = WebSocketHandler(heartbeat_interval=self.websocket_heartbeat)
+
+        # 事件广播仅走 WS 推送，不负责记录（记录所有权在 EventHistoryService）
+        self.event_broadcaster = EventBroadcaster(
+            event_bus=self.event_bus,
+            ws_handler=self.ws_handler,
+            event_history=self.event_history,
+            history_push_limit=self.dashboard_config.max_history_messages,
+        )
+        await self.event_broadcaster.start()
+
+        if self._external_log_streamer:
+            self._external_log_streamer.ws_handler = self.ws_handler
+            self.log_streamer = self._external_log_streamer
+            if not hasattr(self.log_streamer, "_is_running") or not self.log_streamer._is_running:
+                await self.log_streamer.start()
+        else:
+            self.log_streamer = LogStreamer(ws_handler=self.ws_handler, min_level="DEBUG")
+            await self.log_streamer.start()
+
+        @self.app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket) -> None:
+            ws_handler = self.ws_handler
+            # 防御: dashboard.cleanup() 可能已把 ws_handler 置 None（孤儿 WS task 场景），
+            # 直接调用会抛 AttributeError -> starlette traceback
+            if ws_handler is None:
+                await websocket.close()
+                return
+
+            # 连接建立后、接收循环开始前推送历史（日志 + 事件）
+            async def push_history(client_id: str) -> None:
+                if self.log_streamer:
+                    await self.log_streamer.broadcast_history(client_id)
+                if self.event_broadcaster:
+                    await self.event_broadcaster.push_history_to_client(client_id)
+
+            await ws_handler.run_client_handler(websocket, on_connected=push_history)
+
+        self._heartbeat_task = asyncio.create_task(self._run_heartbeat())
+
+        if self.dev_mode:
+            dashboard_dir = Path(__file__).parent.parent.parent.parent / "dashboard"
+            self._vite_dev = ViteDevServer(
+                dashboard_dir=dashboard_dir,
+                port=self.vite_dev_port,
+                backend_host=self.host,
+                backend_port=self.port,
+            )
+            await self._vite_dev.start()
+
+        # socket 已预绑定，serve 直接复用，不会再绑定端口
+        self._server_task = asyncio.create_task(server.serve(sockets=[bound_socket]))
+
+        self._is_running = True
+        self.logger.info(f"Dashboard 已启动: {self.get_url()}")
+
+    def _bind_socket(self) -> socket.socket:
+        """预绑定 Dashboard 端口；配置端口被占用时依次回退尝试后续端口
+
+        回退成功即更新 ``self.port`` 并告警（访问地址随之变化，OBS 浏览器源 /
+        书签等旧地址引用需手动更新）；开发模式不回退——vite 代理目标硬编码
+        配置端口，换口后前端代理断链，保持立即报错。
+
+        注意：不设置 SO_REUSEADDR——Windows 上该选项允许绑定已被监听的端口，
+        会使端口占用检测失效；与 asyncio.create_server（uvicorn）行为保持一致。
+        """
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        candidates = (
+            (self.port,)
+            if self.dev_mode
+            else tuple(self.port + offset for offset in range(self._PORT_FALLBACK_CANDIDATES))
+        )
+        last_error: Optional[OSError] = None
+        for candidate in candidates:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.bind((self.host, candidate))
+            except OSError as e:
+                sock.close()
+                last_error = e
+                continue
+            if candidate != self.port:
+                self.logger.warning(
+                    f"Dashboard 端口 {self.host}:{self.port} 被占用，已回退到 {self.host}:{candidate}，"
+                    f"访问地址变为 http://{self.host}:{candidate}（旧端口的地址引用需手动更新）"
+                )
+                self.port = candidate
+            return sock
+        if self.dev_mode:
+            detail = f"{self.host}:{self.port} 被占用（开发模式不回退换口，vite 代理硬编码该端口）"
+        else:
+            detail = f"{self.host}:{self.port} 起连续 {self._PORT_FALLBACK_CANDIDATES} 个候选端口均被占用"
+        raise RuntimeError(f"Dashboard 端口绑定失败（{detail}）: {last_error}") from last_error
+
+    async def stop(self) -> None:
+        """停止 Dashboard 服务器"""
+        self.logger.info("Dashboard 服务器停止中...")
+        self._is_running = False
+
+        # 停止弹幕小部件服务并关闭 widget 客户端
+        await self.widget_gateway.stop()
+
+        # 停止日志流广播器
+        if self.log_streamer:
+            await self.log_streamer.stop()
+            self.log_streamer = None
+
+        # 停止事件广播器
+        if self.event_broadcaster:
+            await self.event_broadcaster.stop()
+            self.event_broadcaster = None
+
+        # 释放事件历史服务引用（所有权在 main.py，缓冲清理由 owner 负责）
+        self.event_history = None
+
+        # 停止心跳任务
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        # 先排干全部 WS 客户端 writer task，再让 uvicorn 优雅关闭：
+        # 否则连接被 uvicorn 关闭后残留 writer 仍可能 send，报"connection is closing"
+        if self.ws_handler is not None:
+            await self.ws_handler.shutdown()
+
+        if self._server:
+            # 优雅关闭：should_exit 让 main_loop 正常退出并触发 uvicorn shutdown，
+            # 释放监听 socket（直接 cancel 会跳过 shutdown，端口残留占用）
+            self._server.should_exit = True
+            server_task = self._server_task
+            if server_task is not None:
+                try:
+                    await asyncio.wait_for(server_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    self.logger.warning("Dashboard 服务器未在 5s 内优雅退出，强制取消")
+                    server_task.cancel()
+                    try:
+                        await server_task
+                    except asyncio.CancelledError:
+                        pass
+            self._server = None
+            self._server_task = None
+
+        if self._vite_dev:
+            await self._vite_dev.stop()
+
+    async def cleanup(self) -> None:
+        """清理资源"""
+        self.logger.info("Dashboard 清理资源中...")
+        self.app = None
+        self.event_broadcaster = None
+        self.event_history = None
+        self.ws_handler = None
+        # 必须先 stop 注销 loguru sink 再丢引用：只置 None 会让 sink 永久残留，
+        # 后续新实例再注册时同一日志被写出多份
+        if self.log_streamer:
+            await self.log_streamer.stop()
+        self.log_streamer = None
+        self.widget_gateway.reset()
+
+    def get_url(self) -> str:
+        """获取访问 URL"""
+        return f"http://{self.host}:{self.port}"
+
+    async def graceful_restart(self) -> None:
+        """重启整个服务进程：拉起新实例 → 优雅清理当前进程 → os._exit 收口。
+
+        先拉起新进程再清理旧进程：旧进程的 stop/清理序列只需几百毫秒即可完成，
+        而新进程的 Python 解释器冷启动加应用装配需要数秒，新进程绑定端口时旧
+        进程监听 socket 早已释放，不会冲突。
+
+        终态必须用 ``os._exit``：运行在 ``asyncio.run`` 内，``sys.exit`` 会转为
+        异常沿事件循环传播走非干净路径；os._exit 跳过的清理由前面的优雅清理
+        序列补齐（WS/广播/日志 sink/vite 子进程/SQLite 连接落盘）。
+        """
+        self.logger.info("准备重启服务进程...")
+        await asyncio.sleep(0.5)
+        try:
+            subprocess.Popen(
+                [sys.executable] + sys.argv,
+                cwd=os.getcwd(),
+                close_fds=True,
+            )
+        except Exception:
+            self.logger.exception("拉起新进程失败，放弃重启（当前进程保持运行）")
+            return
+
+        await self.stop()
+        await self.cleanup()
+        await self._close_shared_storage()
+        self.logger.info("重启清理完成，进程即将退出")
+        os._exit(0)
+
+    async def _close_shared_storage(self) -> None:
+        """关闭注入仓储共享的 SQLite 连接管理器，确保 WAL/事务落盘。
+
+        各仓储构造时注入同一连接管理器，关闭一次即可（close_all 幂等）。
+        """
+        repos = (self.viewer_repo, self.chat_repo, self.llm_repo, self.rundown_repo)
+        for repo in repos:
+            if repo is not None:
+                await repo.close()
+                return
+        self.logger.debug("无注入仓储，跳过 SQLite 连接关闭")
+
+    @property
+    def widget_service(self) -> Optional[DanmakuWidgetService]:
+        """弹幕小部件服务；danmaku_widget 未启用或未启动时为 None"""
+        return self.widget_gateway.widget_service
+
+    async def _run_heartbeat(self) -> None:
+        """心跳任务"""
+        while self._is_running:
+            await asyncio.sleep(self.websocket_heartbeat)
+            if self.ws_handler:
+                await self.ws_handler.send_heartbeat()
+
+    async def _setup_widget_service(self) -> None:
+        """初始化 widget 族服务并挂载 widget 族路由（各 widget 独立开关，任一启用即挂路由）"""
+        danmaku_widget_config = self.dashboard_config.danmaku_widget
+        subtitle_widget_config = self.dashboard_config.subtitle_widget
+        game2048_widget_config = self.dashboard_config.game2048_widget
+
+        subtitle_config = SubtitleWidgetConfig(
+            enabled=subtitle_widget_config.enabled,
+            max_messages=subtitle_widget_config.max_messages,
+            auto_hide_after_ms=subtitle_widget_config.auto_hide_after_ms,
+            font_size=subtitle_widget_config.font_size,
+            font_color=subtitle_widget_config.font_color,
+            background_color=subtitle_widget_config.background_color,
+            border_color=subtitle_widget_config.border_color,
+            position=subtitle_widget_config.position,
+        )
+
+        danmaku_enabled = bool(danmaku_widget_config and danmaku_widget_config.enabled)
+        if danmaku_enabled:
+            widget_config = DanmakuWidgetConfig(
+                enabled=danmaku_widget_config.enabled,
+                font_size=danmaku_widget_config.font_size,
+                max_messages=danmaku_widget_config.max_messages,
+                show_danmaku=danmaku_widget_config.show_danmaku,
+                show_gift=danmaku_widget_config.show_gift,
+                show_super_chat=danmaku_widget_config.show_super_chat,
+                show_guard=danmaku_widget_config.show_guard,
+                show_enter=danmaku_widget_config.show_enter,
+                show_reply=danmaku_widget_config.show_reply,
+                min_importance=danmaku_widget_config.min_importance,
+            )
+
+            widget_service = DanmakuWidgetService(
+                event_bus=self.event_bus,
+                config=widget_config,
+                subtitle_config=subtitle_config,
+            )
+            self.widget_gateway.widget_service = widget_service
+            widget_service.set_danmaku_callback(self.widget_gateway.broadcast_danmaku)
+            widget_service.set_subtitle_callback(self.widget_gateway.broadcast_subtitle)
+
+            await widget_service.start()
+            self.logger.info(f"弹幕小部件服务已启动 (max_messages={widget_config.max_messages})")
+        else:
+            self.logger.info("弹幕小部件服务已禁用")
+
+        game2048_enabled = bool(game2048_widget_config and game2048_widget_config.enabled)
+        if game2048_enabled:
+            game_service = Game2048WidgetService(event_bus=self.event_bus)
+            self.widget_gateway.game2048_service = game_service
+            game_service.set_state_callback(self.widget_gateway.broadcast_game2048)
+
+            await game_service.start()
+            self.logger.info("2048 棋盘小部件服务已启动")
+
+        if danmaku_enabled or game2048_enabled:
+            self.app.include_router(create_widget_router(self.widget_gateway))
+            self.logger.info("widget 族路由已注册: /ws/widget/danmaku, /ws/widget/subtitle, /ws/widget/game2048")

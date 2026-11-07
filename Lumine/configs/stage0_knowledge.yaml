@@ -1,0 +1,36 @@
+# Lumine Stage 0: Knowledge Injection
+# Injects Genshin Impact lore/wiki Q&A into Qwen2-VL-7B-Instruct (text-only)
+
+model:
+  model_path: models/Qwen2-VL-7B-Instruct
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: configs/data_knowledge.yaml
+  chat_template: qwen2vl
+  max_seq_len: 4096
+  train_size: -1
+  num_workers: 32
+  drop_last: False  # CRITICAL: Use capital F for Python bool
+  mm_configs:
+    image_max_pixels: 921600
+    video_max_pixels: 921600
+    max_frames: 1
+    fps: 1.0
+
+train:
+  output_dir: output/Lumine-Agent-Knowledge-VL-7B
+  data_parallel_mode: fsdp2
+  wandb_project: lumine
+  wandb_name: lumine_stage0_knowledge
+  rmpad: false
+  rmpad_with_pos_ids: false  # Must be false when rmpad is false
+  ulysses_parallel_size: 1
+  freeze_vit: true
+  lr: 2.0e-5
+  init_device: meta
+  lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 8
+  global_batch_size: 64  # 8 GPUs × 8 MBS = 64
+  save_epochs: 1

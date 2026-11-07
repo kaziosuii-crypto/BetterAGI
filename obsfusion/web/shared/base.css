@@ -1,0 +1,32 @@
+:root {
+  --of-ink: #07080d;
+  --of-ink-2: #0c0f16;
+  --of-slate: #121722;
+  --of-panel: rgba(18, 22, 32, 0.72);
+  --of-panel-line: rgba(255, 255, 255, 0.08);
+  --of-amber: #e8b05a;
+  --of-amber-soft: rgba(232, 176, 90, 0.16);
+  --of-silver: #e9ecf2;
+  --of-muted: #8d95a6;
+  --of-dim: #5d6577;
+  --of-ok: #6fd1a0;
+  --of-warn: #e8b05a;
+  --of-bad: #e8746a;
+  --of-blue: #7fa8d9;
+  --of-mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+  --of-sans: "Microsoft YaHei UI", "PingFang SC", "Source Han Sans SC", system-ui, sans-serif;
+  --of-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
+  --of-ease: cubic-bezier(.22,.61,.36,1);
+  --of-ease-out: cubic-bezier(.16,1,.3,1);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body.of-body { background: var(--of-ink); color: var(--of-silver); font-family: var(--of-sans); }
+.of-grain::before {
+  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 999;
+  background-image: radial-gradient(rgba(255,255,255,0.045) 1px, transparent 1px);
+  background-size: 3px 3px; opacity: .5; mix-blend-mode: overlay;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}

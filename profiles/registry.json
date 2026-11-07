@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "games": {
+    "genshin-impact": {
+      "display_name": "Genshin Impact",
+      "group_id": "genshin-impact",
+      "aliases": [
+        "原神",
+        "genshin",
+        "Genshin"
+      ]
+    },
+    "undertale": {
+      "display_name": "Undertale",
+      "group_id": "undertale",
+      "aliases": [
+        "UT",
+        "undertale"
+      ]
+    }
+  }
+}

@@ -1,0 +1,174 @@
+{
+  "captured_utc": "2026-11-05T04:48:00Z",
+  "source": "gs_ssh.py exec env_probe.py + ckptlog.sh + mtp.sh (read-only, no inference)",
+  "server": {
+    "ssh": "ssh -p 28390 root@i-1.gpushare.com (via 127.0.0.1:7897 HTTP CONNECT tunnel)",
+    "model_endpoint_local": "http://127.0.0.1:8000/v1 (vLLM OpenAI API)",
+    "model_endpoint_external": "http://i-2.gpushare.com:47960/ (proxy to 8000)",
+    "hostname": "I2c248deb7900b01f91",
+    "cpu": "INTEL(R) XEON(R) GOLD 6530, 128 vCPU (2 sockets x 32 cores x 2 threads)",
+    "ram": "503 GiB total, 449 GiB available",
+    "gpu": "NVIDIA GeForce RTX 5090, compute_cap 12.0 (sm_120, consumer Blackwell GB202)",
+    "vram": "32607 MiB total, 26464 MiB used by vLLM EngineCore (pid 11557), 26454 MiB compute",
+    "driver": "580.76.05",
+    "nvidia_smi_power_draw_idle_W": 13.14,
+    "power_limit_W": 575,
+    "clocks_idle_MHz": {
+      "sm": 180,
+      "memory": 405
+    },
+    "temperature_C": 27,
+    "cuda": "no nvcc on host; PyTorch 2.14.0+cu130 (CUDA 13.0)",
+    "python": "vllm-env Python 3.11, torch 2.14.0+cu130, vllm 0.33.0 (2026-11-01 release)",
+    "gpu_util_idle_pct": 0,
+    "gpu_mem_util_idle_pct": 0
+  },
+  "serve_command": "/root/vllm-env/bin/vllm serve /hy-tmp/gs/model/GameScaling-9B-S3 --served-model-name gamescaling --port 8000 --tensor-parallel-size 1 --dtype bfloat16 --max-model-len 32768 --limit-mm-per-prompt '{\"image\": 8}' --gpu-memory-utilization 0.85 --trust-remote-code",
+  "serve_log": "/hy-tmp/gs/logs/vllm_gs.log",
+  "checkpoint": {
+    "path": "/hy-tmp/gs/model/GameScaling-9B-S3",
+    "config_json": "/hy-tmp/gs/model/GameScaling-9B-S3/config.json",
+    "architectures": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5",
+    "dtype": "bfloat16",
+    "text_config": {
+      "hidden_size": 4096,
+      "num_hidden_layers": 32,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "head_dim": 256,
+      "vocab_size": 248320,
+      "intermediate_size": 12288,
+      "max_position_embeddings": 262144,
+      "full_attention_interval": 4,
+      "layer_types_32": "linear_attention x3 + full_attention x1 repeated 8 times (24 GDN + 8 full)",
+      "linear_conv_kernel_dim": 4,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 32,
+      "linear_key_head_dim": 128,
+      "linear_value_head_dim": 128,
+      "mamba_ssm_dtype": "float32",
+      "mtp_num_hidden_layers": 1,
+      "mtp_use_dedicated_embeddings": false
+    },
+    "vision_config": {
+      "depth": 27,
+      "hidden_size": 1152,
+      "out_hidden_size": 4096,
+      "num_heads": 16,
+      "patch_size": 16,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2,
+      "num_position_embeddings": 2304
+    },
+    "weights": "single model.safetensors 18,819,722,392 bytes (~18.8 GB, BF16)",
+    "weight_files": [
+      "model.safetensors",
+      "config.json",
+      "generation_config.json",
+      "chat_template.jinja",
+      "preprocessor_config.json",
+      "processor_config.json",
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ],
+    "note": "MTP weight-key scan FAILED on system python (ModuleNotFoundError: No module named 'safetensors'); mtp_num_hidden_layers=1 in config.json is a declaration, NOT yet verified against actual tensor keys. Re-scan with /root/vllm-env/bin/python.",
+    "mtp_weight_verification": {
+      "scanned_with": "/root/vllm-env/bin/python + safetensors.safe_open (system python lacks safetensors)",
+      "total_tensors": 760,
+      "mtp_related_tensors": 0,
+      "layer_indices": "0..31 (32 layers, max 31)",
+      "layer_32_keys": [],
+      "top_level_prefixes": {
+        "model": 759,
+        "lm_head": 1
+      },
+      "conclusion": "config.json text_config.mtp_num_hidden_layers=1 is ONLY a declaration; NO actual MTP/draft/nextn tensors exist in model.safetensors. The deployed checkpoint has NO usable MTP head — confirms task's warning not to assume MTP exists. Any MTP speculative decoding would require separate weights (not present) and cannot be enabled on this checkpoint without retraining/replacing weights."
+    }
+  },
+  "runtime_config_from_startup_log": {
+    "speculative_config": "None (no spec decode / MTP / ngram / suffix / eagle enabled)",
+    "quantization": "None (no FP8/W8A8; dtype bfloat16)",
+    "enforce_eager": false,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "max_cudagraph_capture_size": 512,
+    "cudagraph_capture_sizes": "1,2,4,8,16,...,512 (51 PIECEWISE + 35 FULL captured at startup)",
+    "cudagraph_mm_encoder": false,
+    "compile_mm_encoder": false,
+    "attention_backend": "FLASH_ATTN (out of FLASH_ATTN/FLASHINFER/TRITON_ATTN/FLEX_ATTENTION)",
+    "vit_attention_backend": "FLASH_ATTN (cuda.py:567, mm_encoder_attention.py:372)",
+    "gdn_prefill_kernel": "FlashInfer GDN prefill kernel (qwen_gdn_linear_attn.py:300)",
+    "mamba_cache_mode": "align (config.py:766, prefix caching enabled for Qwen3_5ForConditionalGeneration)",
+    "kv_cache_layout": "LBNHC (utils.py:381)",
+    "kv_cache_size_tokens": 182706,
+    "kv_cache_memory_GiB": 6.48,
+    "max_concurrency_32768_tokens": 5.58,
+    "gpu_memory_utilization_configured": 0.85,
+    "gpu_memory_utilization_effective_without_graph_profiling": 0.836,
+    "weights_plus_activation_GiB": 20.17,
+    "cudagraph_pool_GiB": 0.19,
+    "histogram_buckets": "custom_histogram_buckets=None (default min bucket 0.3s — sub-300ms SLO NOT measurable from histogram buckets; use _sum/_count deltas instead)",
+    "per_request_spec_decode_metrics": "none",
+    "structured_outputs_backend": "auto",
+    "reasoning_parser": "empty (enable_in_reasoning=False)",
+    "kernel_config": {
+      "rms_norm": [
+        "native"
+      ],
+      "fused_add_rms_norm": [
+        "native"
+      ],
+      "gelu_and_mul_sparse": [
+        "triton",
+        "native"
+      ],
+      "moe_backend": "auto",
+      "linear_backend": "auto",
+      "enable_flashinfer_autotune": true
+    }
+  },
+  "startup_log_findings": [
+    "Mamba cache mode 'align' for Qwen3_5ForConditionalGeneration by default when prefix caching enabled",
+    "torch.compile AOT loaded from cache in 1.32s; init engine 65.84s",
+    "Capturing CUDA graphs (PIECEWISE) 51/51 and (FULL) 35/35 succeeded => FULL CUDA graph IS active, not --enforce-eager",
+    "FlashInfer precompiled kernels missing warning (flashinfer-cubin/jit-cache not installed), managed autotune cache attached",
+    "Triton kernel JIT compilation DURING inference at 11:07:25: store_cache_checkpoints_kernel — causes latency spike, warmup does not cover this shape",
+    "serving.py:291 chat template requires system-first ordering; inline system messages would miss prefix cache (official client uses leading system prompt => OK)",
+    "Multi-modal warmup 19.469s; encoder cache budget 16384 tokens profiled with 1 image of max feature size"
+  ],
+  "other_gpu_processes": "none (only vLLM EngineCore pid 11557 on GPU; frame_relay uvicorn pid 12242 is CPU-only on 127.0.0.1:8010)",
+  "chat_template_notes": "Qwen3_5 chat_template.jinja injects '<think>\\n\\n</think>\\n\\n' into assistant turns that lack think tags; add_generation_prompt lets inference fill thinking content. System message must be leading. Matches official policy.py prefill/continue_final_message design.",
+  "official_client_defaults": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "model": "gamescaling",
+    "api_key": "EMPTY",
+    "history_len": 5,
+    "history_think": 0,
+    "image_size": null,
+    "image_format": "jpeg",
+    "jpeg_quality": 90,
+    "resample": "bilinear",
+    "reasoning": true,
+    "temperature": 1,
+    "max_tokens": 2048,
+    "stop": [
+      "<|action_end|>"
+    ],
+    "lenient_parse": false,
+    "timeout": 120
+  },
+  "preflight_findings": "see compressed block; 7 configs all HTTP 200; guided regex反例 parsed=False/truncated=True/2048 tokens/23s; stream逐步到达 ~10.6ms/token; unique cache_salt gives clean prefix-off control; reasoning=True outputs no visible think because <think> is prefilled and model continues from empty closed think",
+  "chart_tooling": {
+    "bundled_python": "C:/Users/Tsuba/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe",
+    "matplotlib": false,
+    "pandas": "3.0.1",
+    "numpy": "2.3.5",
+    "PIL": "12.3.0",
+    "server_python": "requests 2.32.3, PIL, numpy 2.2.5; no matplotlib/pandas/aiohttp",
+    "plan": "Generate charts locally with PIL (custom renderer) or pure-SVG/HTML via visualize; do NOT pip install matplotlib. Use pandas+numpy for stats aggregation; charts as PNG via PIL drawing or SVG strings."
+  }
+}

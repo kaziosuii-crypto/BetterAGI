@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ObsFusion 控制台</title>
+<link rel="stylesheet" href="/shared/base.css" />
+<link rel="stylesheet" href="/control/control.css" />
+</head>
+<body class="of-body of-grain">
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <span class="brand-dot"></span><span class="brand-dot"></span><span class="brand-dot"></span>
+      </div>
+      <div class="brand-text">
+        <h1>ObsFusion</h1>
+        <p>文字 · 时间 · 画面</p>
+      </div>
+    </div>
+
+    <div class="scene-switch" id="sceneSwitch">
+      <button class="scene-btn" id="sceneBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span class="scene-name" id="sceneName">载入中…</span>
+        <span class="scene-meta" id="sceneMeta">—</span>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6.5 8 10.5 12 6.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="scene-menu" id="sceneMenu" role="listbox" hidden></div>
+    </div>
+
+    <div class="pills">
+      <span class="pill" id="pillServer" data-state="idle"><i></i><b>服务</b><em>连接中</em></span>
+      <span class="pill" id="pillObs" data-state="idle"><i></i><b>OBS</b><em>未连接</em></span>
+      <span class="pill" id="pillViewers" data-state="ok"><i></i><b>叠加层</b><em>0</em></span>
+    </div>
+
+    <div class="top-actions">
+      <button class="btn ghost" id="btnTts" title="为整条时间线生成 TTS 语音">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6.5v3h2.2L9 12.6V3.4L5.2 6.5H3Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M11.4 5.6a3.4 3.4 0 0 1 0 4.8M13 4a5.8 5.8 0 0 1 0 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        生成语音
+      </button>
+      <button class="btn ghost" id="btnOpenOverlay" title="在新窗口打开叠加层">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 3H3v10h10V9.5M9 3h4v4M13 3 7 9" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        叠加层
+      </button>
+      <button class="btn primary" id="btnSave" title="保存工程 (Ctrl+S)">
+        <span class="btn-label">保存</span>
+        <span class="btn-saved" id="saveHint">已保存</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+
+    <aside class="rail rail-left">
+      <section class="panel panel-scenes">
+        <header class="panel-head">
+          <h2>场景</h2>
+          <button class="icon-btn" id="btnNewScene" title="新建场景">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </button>
+        </header>
+        <div class="scene-list" id="sceneList"></div>
+      </section>
+
+      <section class="panel panel-ext">
+        <header class="panel-head">
+          <h2>扩展</h2>
+          <button class="icon-btn" id="btnReloadExt" title="重新加载扩展">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6v3h-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </header>
+        <div class="ext-list" id="extList"></div>
+      </section>
+
+      <section class="panel panel-log">
+        <header class="panel-head">
+          <h2>事件流</h2>
+          <span class="count" id="logCount">0</span>
+        </header>
+        <div class="log-stream" id="logStream"></div>
+      </section>
+    </aside>
+
+    <section class="stage-col">
+      <div class="panel panel-stage" id="stagePanel">
+        <header class="panel-head stage-head">
+          <h2>画面监视</h2>
+          <div class="stage-tools">
+            <button class="chip-btn" id="btnSafeArea" title="显示安全区与网格">安全区</button>
+            <button class="chip-btn" id="btnReloadStage" title="重载叠加层页面">重载</button>
+            <span class="stage-res">1920 × 1080</span>
+          </div>
+        </header>
+        <div class="stage-wrap">
+          <div class="stage-frame" id="stageFrame">
+            <iframe id="stageIframe" title="ObsFusion 叠加层预览" src="about:blank"></iframe>
+            <div class="stage-marks" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+            <div class="stage-badge"><span class="live-dot"></span>PREVIEW</div>
+            <div class="stage-loading" id="stageLoading"><span></span><span></span><span></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel panel-transport">
+        <div class="transport-row">
+          <div class="transport-btns">
+            <button class="tbtn" id="btnPlay" title="播放 / 暂停 (Space)">
+              <svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.4 12.4 8 5 12.6Z" fill="currentColor"/></svg>
+              <svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5h2.2v9H5zM8.8 3.5H11v9H8.8z" fill="currentColor"/></svg>
+            </button>
+            <button class="tbtn" id="btnStop" title="停止">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.2" fill="currentColor"/></svg>
+            </button>
+          </div>
+          <div class="timecode">
+            <span class="tc-now" id="tcNow">00:00.0</span>
+            <span class="tc-sep">/</span>
+            <span class="tc-total" id="tcTotal">00:00.0</span>
+          </div>
+          <div class="transport-status" id="transportStatus" data-state="idle">待机</div>
+          <div class="transport-spacer"></div>
+          <div class="cue-count"><b id="cueCount">0</b> 条字幕 · <b id="durTotal">0.0s</b></div>
+        </div>
+
+        <div class="timeline" id="timeline">
+          <div class="tl-ruler" id="tlRuler"></div>
+          <div class="tl-track" id="tlTrack">
+            <div class="tl-progress" id="tlProgress"></div>
+            <div class="tl-playhead" id="tlPlayhead"><span></span></div>
+            <div class="tl-cues" id="tlCues"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="rail rail-right" id="inspector">
+      <div class="tabs" id="tabs" role="tablist">
+        <button class="tab is-active" data-tab="cue" role="tab">字幕</button>
+        <button class="tab" data-tab="danmaku" role="tab">弹幕</button>
+        <button class="tab" data-tab="ext" role="tab">扩展</button>
+        <button class="tab" data-tab="obs" role="tab">OBS</button>
+        <span class="tab-indicator" id="tabIndicator"></span>
+      </div>
+
+      <div class="tab-body">
+
+        <section class="tab-pane is-active" data-pane="cue">
+          <div class="pane-toolbar">
+            <button class="btn tiny" id="btnAddCue">新增字幕</button>
+            <button class="btn tiny" id="btnDupCue">复制</button>
+            <button class="btn tiny danger" id="btnDelCue">删除</button>
+          </div>
+          <div class="cue-empty" id="cueEmpty">
+            <p>在时间线上点一个字幕块，或新建一条。</p>
+            <p class="dim">每条字幕 = 一段时间 + 一句话，语音会自动生成。</p>
+          </div>
+          <div class="cue-form" id="cueForm" hidden>
+            <label class="field field-wide">
+              <span>文本</span>
+              <textarea id="fText" rows="3" placeholder="这一句会被读出来，也会成为字幕"></textarea>
+            </label>
+            <div class="field-row">
+              <label class="field"><span>入点 (s)</span><input id="fStart" type="number" step="0.05" min="0" /></label>
+              <label class="field"><span>出点 (s)</span><input id="fEnd" type="number" step="0.05" min="0" /></label>
+            </div>
+            <div class="field-row">
+              <label class="field"><span>说话人</span><input id="fSpeaker" type="text" placeholder="解说" /></label>
+              <label class="field"><span>位置</span>
+                <select id="fAnchor">
+                  <option value="bottom-center">底部居中</option>
+                  <option value="bottom-left">底部居左</option>
+                  <option value="center">画面中央</option>
+                  <option value="top-center">顶部居中</option>
+                  <option value="top-left">左上</option>
+                  <option value="top-right">右上</option>
+                </select>
+              </label>
+            </div>
+            <div class="field-row">
+              <label class="field"><span>样式</span>
+                <select id="fStyle">
+                  <option value="subtitle">字幕</option>
+                  <option value="title">标题</option>
+                  <option value="caption">说明</option>
+                  <option value="quote">引文</option>
+                </select>
+              </label>
+              <label class="field"><span>语音</span><select id="fVoice"></select></label>
+            </div>
+            <label class="switch-row">
+              <span>卡拉 OK 逐字高亮</span>
+              <button class="switch" id="fKaraoke" role="switch" aria-checked="true"><i></i></button>
+            </label>
+            <div class="cue-audio" id="cueAudio" hidden>
+              <div class="cue-audio-head">
+                <span>语音</span><span class="mono" id="cueAudioDur">—</span>
+              </div>
+              <audio id="cueAudioEl" controls preload="metadata"></audio>
+              <button class="btn tiny" id="btnCueTts">重新生成这一条</button>
+            </div>
+          </div>
+
+          <div class="cue-list-head"><span>全部字幕</span><span class="dim" id="cueListHint">按时间排序</span></div>
+          <div class="cue-list" id="cueList"></div>
+        </section>
+
+        <section class="tab-pane" data-pane="danmaku">
+          <p class="pane-lead">发一条弹幕，看它被扩展映射到哪。路由规则在「扩展 → danmaku」里改。</p>
+          <div class="field-row">
+            <label class="field"><span>用户</span><input id="dmUser" type="text" value="观众A" /></label>
+            <label class="field"><span>预设</span>
+              <select id="dmPreset">
+                <option value="normal">普通观众</option>
+                <option value="host">主播</option>
+                <option value="sc">SC（醒目留言）</option>
+              </select>
+            </label>
+          </div>
+          <label class="field field-wide"><span>内容</span><input id="dmText" type="text" value="来了来了" /></label>
+          <div class="pane-actions">
+            <button class="btn primary" id="btnDmSend">发射</button>
+            <button class="btn ghost" id="btnDmBurst">连发 12 条</button>
+          </div>
+          <div class="dm-result" id="dmResult" data-state="empty">
+            <div class="dm-result-empty">最近一次映射结果会出现在这里</div>
+            <div class="dm-result-body" hidden>
+              <div class="dm-route"><b id="dmRule">—</b><em id="dmZone">—</em></div>
+              <div class="dm-coords mono" id="dmCoords">x 0.00 · y 0.00</div>
+              <div class="dm-map" id="dmMap">
+                <i class="dm-dot" id="dmDot"></i>
+                <span class="dm-zone-label" id="dmZoneLabel">bottom-left</span>
+              </div>
+            </div>
+          </div>
+          <div class="hint-block">
+            <b>路由是怎么生效的</b>
+            <p>服务端按 <code>routes[].when</code>（user / regex / level）匹配，命中后输出 <code>zone</code>、<code>mode</code>、<code>lane</code>。扩展通过能力链 <code>danmaku.route</code> 接管，任何扩展都能改写结果。</p>
+          </div>
+        </section>
+
+        <section class="tab-pane" data-pane="ext">
+          <div class="ext-picker" id="extPicker"></div>
+          <div class="ext-config" id="extConfig">
+            <div class="ext-config-empty">选择一个扩展来编辑它的配置</div>
+          </div>
+        </section>
+
+        <section class="tab-pane" data-pane="obs">
+          <div class="obs-status-card" id="obsStatusCard">
+            <div class="obs-status-head">
+              <span class="obs-dot" id="obsDot" data-state="idle"></span>
+              <b id="obsState">未连接</b>
+              <em id="obsMeta">ws://127.0.0.1:4455</em>
+            </div>
+            <div class="obs-status-body" id="obsBody">obs-websocket 5.x · OBS 28+ 内置</div>
+          </div>
+          <label class="field field-wide"><span>WebSocket 地址</span><input id="obsUrl" type="text" value="ws://127.0.0.1:4455" /></label>
+          <label class="field field-wide"><span>密码（留空则用启动参数）</span><input id="obsPassword" type="password" placeholder="•••••••" /></label>
+          <div class="pane-actions">
+            <button class="btn primary" id="btnObsConnect">连接</button>
+            <button class="btn ghost" id="btnObsDisconnect">断开</button>
+          </div>
+          <div class="divider"></div>
+          <p class="pane-lead">直接在当前场景里建一个浏览器源，把叠加层推上去。</p>
+          <div class="field-row">
+            <label class="field"><span>场景名</span><input id="obsScene" type="text" value="" placeholder="ObsFusion - demo" /></label>
+            <label class="field"><span>源名</span><input id="obsSource" type="text" value="ObsFusion Overlay" /></label>
+          </div>
+          <div class="pane-actions">
+            <button class="btn primary" id="btnObsApply">推送到 OBS</button>
+            <button class="btn ghost" id="btnObsDocs">安装指南</button>
+          </div>
+          <div class="obs-apply-log" id="obsApplyLog" hidden></div>
+        </section>
+
+      </div>
+    </aside>
+  </main>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+</div>
+
+<script src="/control/control.js" type="module"></script>
+</body>
+</html>

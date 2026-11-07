@@ -1,0 +1,139 @@
+"""
+RateLimitInterceptor —— 限流事件拦截器
+
+拦截 ``room.message.*`` 事件（作用域见 ``EventInterceptor.scope_prefixes``），
+按 (event_name + user_id) 键做滑动窗口限流：
+- 全局消息频率限制（滑动窗口）
+- 用户级消息频率限制（滑动窗口）
+- 超限返回 ``None`` 丢弃事件
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, Optional
+
+from src.modules.events.interceptors.base import EventInterceptor
+from src.modules.events.interceptors.lookup import extract_text, extract_user_id
+from src.modules.logging import get_logger
+
+
+class RateLimitInterceptor(EventInterceptor):
+    """
+    限流事件拦截器
+
+    - 全局消息频率限制（每 ``window_size`` 秒内最多 ``global_rate_limit`` 条）
+    - 用户级消息频率限制（每 ``window_size`` 秒内最多 ``user_rate_limit`` 条/用户）
+    - 超限返回 ``None`` 丢弃事件
+
+    配置参数：
+        global_rate_limit (int): 全局上限（默认 100）
+        user_rate_limit (int): 每用户上限（默认 10）
+        window_size (int): 滑动窗口大小（秒，默认 60）
+    """
+
+    # 只拦截直播间行为流：user_id 提取对其他域 payload 无意义，会全部
+    # 落入 "unknown_user" 桶造成误丢
+    scope_prefixes = ("room.message.",)
+
+    # 净化阶段：限流在加工类拦截器（场次盖章）之前执行，超限消息不必解析归属
+    priority = 100
+
+    def __init__(
+        self,
+        global_rate_limit: int = 100,
+        user_rate_limit: int = 10,
+        window_size: int = 60,
+    ) -> None:
+        self._global_rate_limit = global_rate_limit
+        self._user_rate_limit = user_rate_limit
+        self._window_size = window_size
+
+        self._global_timestamps: Deque[float] = deque()
+        self._user_timestamps: Dict[str, Deque[float]] = defaultdict(deque)
+        self._lock = asyncio.Lock()
+
+        self.logger = get_logger("RateLimitInterceptor")
+        self.logger.info(
+            f"RateLimitInterceptor 初始化: "
+            f"全局={self._global_rate_limit}/{self._window_size}s, "
+            f"用户={self._user_rate_limit}/{self._window_size}s"
+        )
+
+    @property
+    def name(self) -> str:
+        return "rate_limit"
+
+    async def intercept(
+        self,
+        event_name: str,
+        payload: Dict[str, Any],
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        user_id = extract_user_id(payload)
+        current_time = time.time()
+
+        await self._clean_expired_timestamps(current_time)
+
+        if await self._is_throttled(user_id):
+            text_preview = extract_text(payload)
+            self.logger.info(
+                f"消息限流: user_id={user_id}, event={event_name}, "
+                f"text_preview='{text_preview[:50]}{'...' if len(text_preview) > 50 else ''}'"
+            )
+            return None
+
+        await self._record_message(user_id, current_time)
+        return payload
+
+    async def _clean_expired_timestamps(self, current_time: float) -> None:
+        async with self._lock:
+            cutoff_time = current_time - self._window_size
+
+            while self._global_timestamps and self._global_timestamps[0] < cutoff_time:
+                self._global_timestamps.popleft()
+
+            for user_id in list(self._user_timestamps.keys()):
+                timestamps = self._user_timestamps[user_id]
+                while timestamps and timestamps[0] < cutoff_time:
+                    timestamps.popleft()
+                if not timestamps:
+                    del self._user_timestamps[user_id]
+
+    async def _is_throttled(self, user_id: str) -> bool:
+        async with self._lock:
+            global_count = len(self._global_timestamps)
+            if global_count >= self._global_rate_limit:
+                self.logger.warning(
+                    f"全局消息限流触发: {global_count}/{self._window_size}s "
+                    f">= {self._global_rate_limit}/{self._window_size}s"
+                )
+                return True
+
+            user_timestamps = self._user_timestamps.get(user_id)
+            if user_timestamps and len(user_timestamps) >= self._user_rate_limit:
+                self.logger.warning(
+                    f"用户 {user_id} 消息限流触发: "
+                    f"{len(user_timestamps)}/{self._window_size}s "
+                    f">= {self._user_rate_limit}/{self._window_size}s"
+                )
+                return True
+
+            return False
+
+    async def _record_message(self, user_id: str, current_time: float) -> None:
+        async with self._lock:
+            self._global_timestamps.append(current_time)
+            self._user_timestamps[user_id].append(current_time)
+
+    async def reset(self) -> None:
+        """重置所有计数器（便于测试）"""
+        async with self._lock:
+            self._global_timestamps.clear()
+            self._user_timestamps.clear()
+        self.logger.debug("RateLimitInterceptor 已重置")
+
+
+__all__ = ["RateLimitInterceptor"]

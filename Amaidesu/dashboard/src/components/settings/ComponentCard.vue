@@ -1,0 +1,251 @@
+<template>
+  <div class="component-card" :class="{ 'is-disabled': !enabled }">
+    <!-- 卡片头部：图标 + 名称 + 开关 -->
+    <div class="card-header" @click="toggleExpand">
+      <div class="card-header-left">
+        <el-icon class="card-toggle">
+          <ArrowRight v-if="!expanded" />
+          <ArrowDown v-else />
+        </el-icon>
+        <el-icon class="card-icon"><Coin /></el-icon>
+        <span class="card-title">{{ label }}</span>
+      </div>
+      <div class="card-header-right">
+        <!-- 开关仅在具备语义时显示：布尔 enabled 子字段，或名单驱动的文件。
+             裸开关（不印启用/禁用文字）：开关位置固定在卡头，明暗态一眼可辨 -->
+        <el-switch
+          v-if="booleanEnabledKey || hasListSemantics"
+          :model-value="enabled"
+          size="small"
+          @click.stop
+          @change="toggleEnabled"
+        />
+        <el-badge v-if="changeCount > 0" :value="changeCount" type="warning" size="small" />
+      </div>
+    </div>
+
+    <!-- 组件描述 -->
+    <div v-if="description" class="card-desc">{{ description }}</div>
+
+    <!-- 卡片体：展开时显示子字段（禁用时也可查看配置） -->
+    <div v-if="componentFields.length > 0 && expanded" class="card-body">
+      <SubFieldGroup
+        :fields="componentFields"
+        :get-value="getValue"
+        :get-original="getOriginal"
+        :update-value="updateValue"
+        :get-change-count="getChangeCount"
+        :show-advanced="showAdvanced"
+        layout="grid"
+      />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch } from 'vue';
+import { ArrowRight, ArrowDown, Coin } from '@element-plus/icons-vue';
+import type { ConfigFieldSchema } from '@/types/settings';
+import SubFieldGroup from './SubFieldGroup.vue';
+
+const props = defineProps<{
+  label: string;
+  description?: string;
+  componentKey: string;
+  enabledList: string[];
+  /** 非空时卡片开关绑定该布尔字段（如 tools.studio.obs.enabled），优先于名单模式 */
+  booleanEnabledKey?: string | null;
+  /** 卡片处于名单驱动文件（collectors/agents）：开关写启用名单 */
+  hasListSemantics?: boolean;
+  componentFields: ConfigFieldSchema[];
+  getValue: (key: string) => unknown;
+  getOriginal: (key: string) => unknown;
+  updateValue: (field: ConfigFieldSchema, value: unknown) => void;
+  onToggle: (name: string, newEnabled: boolean) => void;
+  /** 透传给内部 SubFieldGroup 的子卡片徽标查询函数 */
+  getChangeCount?: (key: string) => number;
+  /** 工具栏「全部展开/全部收起」命令；seq 递增触发执行 */
+  expandCommand?: { action: 'expand' | 'collapse'; seq: number } | null;
+  /** 高级字段总开关（透传卡体 SubFieldGroup）；false = 卡内不渲染 advanced 字段 */
+  showAdvanced?: boolean;
+}>();
+
+// 默认展开：配置卡内容即页面主体，折叠与否交给工具栏命令
+const expanded = ref(true);
+
+watch(
+  () => props.expandCommand,
+  cmd => {
+    if (!cmd) return;
+    expanded.value = cmd.action === 'expand';
+  },
+);
+
+const compName = computed(() => props.componentKey.split('.').pop() || '');
+const enabled = computed(() => {
+  if (props.booleanEnabledKey) return props.getValue(props.booleanEnabledKey) === true;
+  return props.enabledList.includes(compName.value);
+});
+
+const changeCount = computed(() => {
+  let count = 0;
+  const seen = new Set<string>();
+  function walk(fields: ConfigFieldSchema[]) {
+    for (const f of fields) {
+      if (f.children) {
+        walk(f.children);
+        continue;
+      }
+      if (seen.has(f.key)) continue;
+      seen.add(f.key);
+      if (JSON.stringify(props.getValue(f.key)) !== JSON.stringify(props.getOriginal(f.key)))
+        count++;
+    }
+  }
+  walk(props.componentFields);
+  return count;
+});
+
+function toggleExpand() {
+  expanded.value = !expanded.value;
+}
+
+function toggleEnabled(val: boolean) {
+  if (props.booleanEnabledKey) {
+    // 合成最小字段对象：写路径只消费 key 与 label
+    props.updateValue({ key: props.booleanEnabledKey, label: 'enabled' } as ConfigFieldSchema, val);
+    return;
+  }
+  props.onToggle(props.componentKey, val);
+}
+</script>
+
+<style scoped>
+.component-card {
+  border: 1px solid var(--border-color-light);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--bg-card);
+  transition:
+    box-shadow var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.component-card:hover {
+  box-shadow: var(--shadow-sm);
+}
+
+.component-card:not(.is-disabled) {
+  border-left: 3px solid var(--color-primary);
+}
+
+/* 禁用节整卡降不透明度示意不可用；保持默认展开，配置内容仍可查看 */
+.component-card.is-disabled {
+  opacity: 0.55;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--transition-fast);
+}
+
+.card-header:hover {
+  background: var(--bg-hover);
+}
+
+.card-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+}
+
+.card-toggle {
+  font-size: 14px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.card-icon {
+  font-size: 18px;
+  color: var(--color-primary);
+  flex-shrink: 0;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.card-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  padding: 0 var(--spacing-lg) var(--spacing-sm);
+  margin-top: -4px;
+}
+
+.card-header-right {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-shrink: 0;
+}
+
+/* 节体自然生长：不设高度上限，滚动交给页面级（卡内滚动会让长节来回找不到上下文） */
+.card-body {
+  border-top: 1px solid var(--border-color-light);
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: var(--bg-elevated);
+}
+
+.card-body :deep(.sub-card) {
+  border-color: var(--border-color-light);
+}
+
+.card-body :deep(.sub-card-header) {
+  padding: var(--spacing-xs) var(--spacing-sm);
+}
+
+.card-body :deep(.sub-card-body) {
+  padding: var(--spacing-xs) var(--spacing-sm) var(--spacing-sm);
+}
+
+.card-body :deep(.field-card) {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-color-light);
+  border-radius: 0;
+  padding: var(--spacing-xs) 0;
+}
+
+.card-body :deep(.field-card:last-child) {
+  border-bottom: none;
+}
+
+.card-body :deep(.field-card:hover) {
+  box-shadow: none;
+}
+
+.card-body :deep(.field-renderer) {
+  border: none;
+  padding: var(--spacing-xs) 0;
+  background: transparent;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border-color-light);
+}
+
+.card-body :deep(.field-renderer:last-child) {
+  border-bottom: none;
+}
+
+.card-body :deep(.field-label) {
+  font-size: 13px;
+}
+</style>

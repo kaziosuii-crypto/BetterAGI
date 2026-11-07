@@ -1,0 +1,151 @@
+<ui:FluentWindow x:Class="BetterGenshinImpact.View.Windows.Pulonia.PuloniaRepositoryManagerWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:i="http://schemas.microsoft.com/xaml/behaviors"
+                 xmlns:behavior="clr-namespace:BetterGenshinImpact.View.Behavior"
+                 Title="Pulonia 仓库管理" Width="560" MinWidth="500" Height="640" MinHeight="480"
+                 WindowStartupLocation="CenterOwner" ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="Mica" Background="{DynamicResource ApplicationBackgroundBrush}">
+    <ui:FluentWindow.Resources>
+        <!-- 仓库级操作共用尺寸，主题图标和文本始终同时可见。 -->
+        <Style x:Key="RepositoryOperationButton" TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
+            <Setter Property="Height" Value="36" />
+            <Setter Property="Padding" Value="10,0" />
+        </Style>
+    </ui:FluentWindow.Resources>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <ui:TitleBar Title="Pulonia 仓库管理" ShowMaximize="False" ShowMinimize="False"
+                     Icon="{ui:SymbolIcon BranchFork24}" />
+        <ScrollViewer Grid.Row="1" Margin="16,6,16,10" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <!-- 添加和引用管理集中到独立窗口；仓库选择不会解析脚本正文，也不展示添加草稿。 -->
+                <ComboBox Margin="0,0,0,12" ItemsSource="{Binding RepositoryChoices}"
+                          SelectedValue="{Binding SelectedRepository, Mode=TwoWay}" IsEnabled="{Binding CanEdit}"
+                          Style="{StaticResource PuloniaRepositorySelectorStyle}" />
+                <!-- 同一操作卡片的第一行添加来源，第二行维护当前真实仓库。 -->
+                <Border Padding="14" CornerRadius="8" BorderThickness="1"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel>
+                        <DockPanel LastChildFill="True">
+                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                <ui:Button Margin="0,0,8,0" Content="添加远程仓库" Icon="{ui:SymbolIcon Add24}"
+                                           Style="{StaticResource RepositoryOperationButton}" Command="{Binding AddRemoteCommand}" />
+                                <ui:Button Content="添加本地仓库" Icon="{ui:SymbolIcon FolderAdd24}"
+                                           Style="{StaticResource RepositoryOperationButton}" Command="{Binding AddLocalCommand}"
+                                           ToolTip="拖入或选择目录、ZIP，通过 repo.json 校验后立即添加" />
+                            </StackPanel>
+                            <TextBlock Text="仓库操作" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        </DockPanel>
+                        <Border Margin="0,12,0,0" Padding="0,12,0,0" BorderThickness="0,1,0,0"
+                                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <StackPanel Margin="0,0,10,0" VerticalAlignment="Center">
+                                    <TextBlock Text="当前仓库" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock Text="{Binding SelectedRepositoryName}" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding SelectedRepositoryName}" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <ui:Button Margin="0,0,8,0" Appearance="Primary" Content="{Binding UpdateButtonText}"
+                                               Icon="{ui:SymbolIcon ArrowSync24}" Style="{StaticResource RepositoryOperationButton}"
+                                               Command="{Binding UpdateCommand}"
+                                               Visibility="{Binding IsRemote, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                                    <ui:Button Margin="0,0,8,0" Appearance="Primary" Content="刷新目录"
+                                               Icon="{ui:SymbolIcon ArrowClockwise24}" Style="{StaticResource RepositoryOperationButton}"
+                                               Command="{Binding RefreshLocalCommand}"
+                                               Visibility="{Binding IsLocal, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                                    <ui:Button Margin="0,0,8,0" Content="重置仓库" Icon="{ui:SymbolIcon ArrowCounterclockwise24}"
+                                               Foreground="{DynamicResource SystemFillColorCautionBrush}"
+                                               Style="{StaticResource RepositoryOperationButton}" Command="{Binding ResetCommand}"
+                                               ToolTip="清理本机仓库副本，之后需要重新同步；保留任务使用版本"
+                                               Visibility="{Binding IsRemote, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                                    <ui:Button Content="移除仓库" Icon="{ui:SymbolIcon Delete24}"
+                                               Foreground="{DynamicResource SystemFillColorCriticalBrush}"
+                                               Style="{StaticResource RepositoryOperationButton}" Command="{Binding RemoveCommand}"
+                                               ToolTip="只移除仓库注册，保留本地文件和任务已固定的资源版本"
+                                               Visibility="{Binding CanShowRemove, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Border>
+                <!-- 所有仓库维护操作在同一位置显示进度及结果。 -->
+                <StackPanel Margin="0,10,0,0" Visibility="{Binding IsBusy, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <ProgressBar Minimum="0" Maximum="100" Value="{Binding ProgressValue}" IsIndeterminate="{Binding IsProgressIndeterminate}" Height="4" />
+                    <TextBlock Margin="0,5,0,0" Text="{Binding ProgressText}" FontSize="12" TextWrapping="Wrap" />
+                </StackPanel>
+                <TextBlock Margin="0,10,0,12" Text="{Binding StatusMessage}" TextWrapping="Wrap"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                <Border Padding="14" CornerRadius="8" BorderThickness="1"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel>
+                        <TextBlock FontWeight="SemiBold" Text="{Binding RepositoryKindText}" />
+                        <TextBlock Margin="0,10,0,5" Text="仓库名称" />
+                        <TextBox Text="{Binding RepositoryName, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding CanEdit}">
+                            <TextBox.Style>
+                                <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+                                    <Setter Property="IsReadOnly" Value="True" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsThirdParty}" Value="True">
+                                            <Setter Property="IsReadOnly" Value="False" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBox.Style>
+                        </TextBox>
+                        <!-- 官方保留 CNB、GitHub、自定义三种渠道，并复用旧窗口的配置。 -->
+                        <StackPanel Margin="0,12,0,0" Visibility="{Binding IsOfficial, Converter={StaticResource BooleanToVisibilityConverter}}">
+                            <TextBlock Margin="0,0,0,5" Text="更新渠道" />
+                            <ComboBox ItemsSource="{Binding OfficialChannels}" SelectedItem="{Binding SelectedOfficialChannel, Mode=TwoWay}"
+                                      IsEnabled="{Binding CanEdit}" />
+                        </StackPanel>
+                        <StackPanel Margin="0,12,0,0" Visibility="{Binding IsRemote, Converter={StaticResource BooleanToVisibilityConverter}}">
+                            <TextBlock Margin="0,0,0,5" Text="仓库地址" />
+                            <TextBox Text="{Binding RemoteUrl, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding CanEditRemoteUrl}" />
+                            <StackPanel Margin="0,12,0,0" Visibility="{Binding IsThirdParty, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                <TextBlock Margin="0,0,0,5" Text="拉取分支" />
+                                <TextBox Text="{Binding Branch, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding CanEdit}" />
+                                <ui:Button Margin="0,8,0,0" HorizontalAlignment="Right" Content="保存配置" Command="{Binding SaveCommand}" />
+                            </StackPanel>
+                        </StackPanel>
+                        <TextBlock Margin="0,12,0,5" Text="{Binding DirectoryLabel}" />
+                        <TextBlock Text="{Binding DirectoryText}" TextWrapping="Wrap" FontSize="12"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Margin="0,8,0,0" FontSize="12" TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Text="同步或刷新只改变本机可浏览的仓库内容，不会修改任务计划使用的资源版本。" />
+                        <WrapPanel Margin="0,10,0,0">
+                            <ui:Button Content="打开目录" Icon="{ui:SymbolIcon FolderOpen24}" Command="{Binding OpenDirectoryCommand}" />
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <!-- 私有 Git 来源沿用 Windows 凭据管理器，不在仓库注册信息中保存令牌。 -->
+                <Expander Margin="0,10,0,0" Header="Git 认证（可选）"
+                          Visibility="{Binding IsRemote, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <StackPanel Margin="12,8">
+                        <TextBlock Margin="0,0,0,5" Text="用户名称" />
+                        <TextBox Text="{Binding GitUsername, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding CanEdit}" />
+                        <TextBlock Margin="0,8,0,5" Text="访问令牌" />
+                        <PasswordBox IsEnabled="{Binding CanEdit}">
+                            <i:Interaction.Behaviors>
+                                <behavior:PasswordBoxBindingBehavior Password="{Binding GitToken, Mode=TwoWay}" />
+                            </i:Interaction.Behaviors>
+                        </PasswordBox>
+                        <ui:Button Margin="0,8,0,0" HorizontalAlignment="Right" Content="保存认证" Command="{Binding SaveCredentialsCommand}" />
+                    </StackPanel>
+                </Expander>
+            </StackPanel>
+        </ScrollViewer>
+        <Border Grid.Row="2" Padding="16,10" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}">
+            <ui:Button HorizontalAlignment="Right" Content="关闭" IsCancel="True" MinWidth="76" Height="36" />
+        </Border>
+    </Grid>
+</ui:FluentWindow>

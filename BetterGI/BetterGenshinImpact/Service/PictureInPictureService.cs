@@ -1,0 +1,95 @@
+using BetterGenshinImpact.Helpers;
+using BetterGenshinImpact.View.Windows;
+using OpenCvSharp;
+using System;
+using BetterGenshinImpact.GameTask;
+using BetterGenshinImpact.GameTask.AutoSkip;
+using BetterGenshinImpact.GameTask.Runtime;
+
+namespace BetterGenshinImpact.Service;
+
+public static class PictureInPictureService
+{
+    private static PictureInPictureWindow? _window;
+    private static bool _manualClosed;
+
+    public static bool IsManuallyClosed => _manualClosed;
+
+    public static void Update(Mat frame)
+    {
+        if (_manualClosed || !IsWindowAllowed())
+        {
+            return;
+        }
+
+        Mat? copy = null;
+        // 静态服务没有创建方可以传参，暂时读配置根（见 task-context-removal.md 第 5 节）
+        if (ConfigService.Config!.AutoSkipConfig.PictureInPictureSourceType == nameof(PictureSourceType.TriggerDispatcher))
+        {
+            copy = frame.Clone();
+        }
+        UIDispatcherHelper.BeginInvoke(() =>
+        {
+            EnsureWindow();
+            if (_window == null)
+            {
+                copy?.Dispose();
+                return;
+            }
+
+            if (!_window.IsVisible)
+            {
+                _window.Show();
+            }
+
+            _window.SetFrame(copy);
+        });
+    }
+
+    public static void Hide(bool resetManual = false)
+    {
+        UIDispatcherHelper.BeginInvoke(() =>
+        {
+            if (resetManual)
+            {
+                _manualClosed = false;
+            }
+
+            if (_window != null && _window.IsVisible)
+            {
+                _window.Hide();
+            }
+        });
+    }
+
+    public static void ResetManualClose()
+    {
+        _manualClosed = false;
+    }
+
+    private static void EnsureWindow()
+    {
+        if (_window != null || !IsWindowAllowed())
+        {
+            return;
+        }
+
+        _window = new PictureInPictureWindow();
+        _window.ClosedByUser += () =>
+        {
+            _manualClosed = true;
+        };
+        _window.Closed += (_, _) =>
+        {
+            _window = null;
+        };
+    }
+
+    /// <summary>
+    /// 云原神 WebView2 子实例只在主界面 Banner 内显示预览，禁止创建独立画中画窗口。
+    /// </summary>
+    private static bool IsWindowAllowed()
+    {
+        return App.GetService<GameRuntimeService>()?.Kind != GameRuntimeKind.WebPage;
+    }
+}

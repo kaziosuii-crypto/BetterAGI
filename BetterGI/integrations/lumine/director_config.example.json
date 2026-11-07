@@ -1,0 +1,10 @@
+{
+  "bettergiWs": "ws://127.0.0.1:30648/ws/v1/agent/live",
+  "bettergiHttp": "http://127.0.0.1:30648",
+  "interval": 4,
+  "sessionId": "vtuber",
+  "persona": "persona.json",
+  "maxCommentaryPerTick": 4,
+  "promptMemoryLimit": 4000,
+  "reconnectDelay": 3
+}

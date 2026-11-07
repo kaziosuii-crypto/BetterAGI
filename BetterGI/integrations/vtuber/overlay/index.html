@@ -1,0 +1,1543 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280, height=720">
+<title>BetterGI 虚拟主播叠加层</title>
+<style>
+  /* ============================================================
+     BetterGI VTuber 叠加层
+     设计尺寸：1280×720，背景透明，供 OBS 浏览器源使用。
+     不加载任何外部 CDN / 字体 / 音频资源。
+     ============================================================ */
+
+  :root {
+    --panel-bg: rgba(9, 14, 26, 0.66);
+    --panel-bg-strong: rgba(9, 14, 26, 0.82);
+    --panel-border: rgba(255, 255, 255, 0.14);
+    --text: #eef5ff;
+    --muted: #9fb0c7;
+    --muted-strong: #c4d2e6;
+    --accent: #7ad7ff;
+    --ok: #6ee7b7;
+    --warn: #ffb86b;
+    --danger: #ff7b8a;
+    --font: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+    font-family: var(--font);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  [hidden] { display: none !important; }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 1280px;
+    height: 720px;
+    max-width: 100vw;
+    max-height: 100vh;
+    overflow: hidden;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  /* ---------------- 右侧信息面板 ---------------- */
+
+  #side-panel {
+    position: absolute;
+    top: 18px;
+    right: 20px;
+    width: 340px;
+    max-height: 684px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 14px 12px;
+    border-radius: 20px;
+    background: linear-gradient(160deg, rgba(20, 30, 52, 0.78), var(--panel-bg));
+    border: 1px solid var(--panel-border);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px) saturate(1.25);
+    -webkit-backdrop-filter: blur(12px) saturate(1.25);
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    border-radius: 9px;
+    background: linear-gradient(140deg, #7ad7ff, #b388ff 58%, #ff9fc4);
+    box-shadow: 0 0 16px rgba(122, 215, 255, 0.45);
+    position: relative;
+  }
+
+  .brand-mark::after {
+    content: "";
+    position: absolute;
+    inset: 7px;
+    border-radius: 4px;
+    border: 2px solid rgba(8, 14, 26, 0.72);
+    border-bottom-color: transparent;
+    border-right-color: transparent;
+    transform: rotate(-45deg);
+  }
+
+  .brand-title {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+
+  .brand-sub {
+    margin-top: 2px;
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: 0 0 auto;
+    padding: 5px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: var(--muted-strong);
+  }
+
+  .pill .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+
+  .pill.conn.connecting .dot { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+  .pill.conn.online .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .pill.conn.offline .dot { background: var(--danger); animation: pulse 1s ease-in-out infinite; }
+  .pill.conn.unconfigured .dot { background: var(--warn); }
+  .pill.conn.stopped .dot { background: var(--muted); }
+
+  #conn-detail {
+    margin-top: -2px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--warn);
+    overflow-wrap: anywhere;
+  }
+
+  .card {
+    border-radius: 14px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.085);
+  }
+
+  .card-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+
+  .card-title .tag {
+    font-size: 10px;
+    letter-spacing: 0;
+    color: var(--accent);
+    background: rgba(122, 215, 255, 0.12);
+    border: 1px solid rgba(122, 215, 255, 0.24);
+    border-radius: 999px;
+    padding: 2px 7px;
+  }
+
+  #guidance-card { transition: border-color 0.35s, box-shadow 0.35s; }
+  #guidance-card.flash {
+    border-color: rgba(122, 215, 255, 0.55);
+    box-shadow: 0 0 18px rgba(122, 215, 255, 0.18);
+  }
+
+  #guidance-text {
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--text);
+    max-height: 4.65em;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+
+  #guidance-text.empty { color: var(--muted); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .stat {
+    border-radius: 12px;
+    padding: 8px 9px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    min-width: 0;
+  }
+
+  .stat-label {
+    display: block;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    margin-bottom: 3px;
+  }
+
+  .stat-value {
+    display: block;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .stat-value.ok { color: var(--ok); }
+  .stat-value.warn { color: var(--warn); }
+  .stat-value.danger { color: var(--danger); }
+  .stat-value.muted { color: var(--muted-strong); }
+
+  .stat-detail {
+    margin-top: 5px;
+    font-size: 10px;
+    line-height: 1.45;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .keys-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-height: 24px;
+  }
+
+  .key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    height: 24px;
+    padding: 0 7px;
+    border-radius: 7px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #e9f7ff;
+    background: linear-gradient(180deg, rgba(122, 215, 255, 0.26), rgba(122, 215, 255, 0.10));
+    border: 1px solid rgba(122, 215, 255, 0.42);
+    box-shadow: 0 2px 0 rgba(0, 0, 0, 0.28);
+  }
+
+  .key.empty {
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.10);
+    box-shadow: none;
+    font-weight: 400;
+  }
+
+  .feed-section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+
+  #feed {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    min-height: 54px;
+    max-height: 255px;
+    overflow: hidden;
+  }
+
+  .feed-item {
+    position: relative;
+    flex: 0 0 auto;
+    padding: 7px 9px 7px 12px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    overflow: hidden;
+  }
+
+  .feed-item::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+  }
+
+  .feed-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 2px;
+    font-size: 9px;
+    color: var(--muted);
+  }
+
+  .feed-kind {
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+
+  .feed-time { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  .feed-text {
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--muted-strong);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+
+  .feed-empty {
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--muted);
+    padding: 6px 2px;
+  }
+
+  /* ---------------- 头像区 ---------------- */
+
+  #avatar-zone {
+    position: absolute;
+    left: 26px;
+    bottom: 10px;
+    width: 316px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  #avatar-bob {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    transform-origin: 50% 100%;
+    animation: bob 3.6s ease-in-out infinite;
+  }
+
+  #avatar-frame {
+    position: relative;
+    width: 306px;
+    height: 352px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+  }
+
+  #avatar-frame.speaking #avatar-bob { animation-duration: 2.2s; }
+
+  /* 占位形象的嘴巴直接由 SVG 自己动；自定义立绘使用叠加的小嘴提示。 */
+  #avatar-frame.speaking.has-placeholder .ph-mouth {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: ph-talk 0.24s ease-in-out infinite alternate;
+  }
+
+  #avatar-img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    object-position: bottom center;
+    filter: drop-shadow(0 14px 26px rgba(0, 0, 0, 0.48));
+  }
+
+  #avatar-placeholder {
+    width: 276px;
+    height: auto;
+    max-height: 340px;
+    filter: drop-shadow(0 14px 26px rgba(0, 0, 0, 0.42));
+    animation: sway 6s ease-in-out infinite;
+    transform-origin: 50% 90%;
+  }
+
+  #avatar-placeholder .eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: blink 4.8s infinite;
+  }
+
+  #avatar-frame.speaking #avatar-placeholder .eyes { animation-duration: 2.6s; }
+
+  /* 嘴部动画：仅用于自定义立绘；占位形象使用 SVG 内部嘴型。 */
+  #mouth {
+    position: absolute;
+    left: 50%;
+    bottom: 96px;
+    width: 38px;
+    height: 13px;
+    transform: translateX(-50%) scaleY(0.18);
+    border-radius: 0 0 20px 20px;
+    background: #5a3446;
+    box-shadow: inset 0 -2px 0 rgba(255, 255, 255, 0.25);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    pointer-events: none;
+    display: none;
+  }
+
+  #avatar-frame.speaking.has-image #mouth {
+    display: block;
+    opacity: 0.92;
+    animation: talk 0.24s ease-in-out infinite alternate;
+  }
+
+  #emotion-badge {
+    --emotion-color: #7ad7f0;
+    position: absolute;
+    top: 12px;
+    right: 2px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 132px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #f4f9ff;
+    background: rgba(8, 13, 24, 0.76);
+    border: 1px solid var(--emotion-color);
+    box-shadow: 0 0 16px rgba(0, 0, 0, 0.32);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    transition: border-color 0.3s, color 0.3s;
+  }
+
+  #emotion-badge .emotion-dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--emotion-color);
+    box-shadow: 0 0 10px var(--emotion-color);
+  }
+
+  #emotion-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #nameplate {
+    position: absolute;
+    left: 50%;
+    bottom: 2px;
+    transform: translateX(-50%);
+    padding: 4px 16px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: #eaf6ff;
+    background: rgba(8, 13, 24, 0.72);
+    border: 1px solid rgba(122, 215, 255, 0.38);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    white-space: nowrap;
+  }
+
+  /* ---------------- 对话气泡 ---------------- */
+
+  #bubble {
+    --accent: #7ad7ff;
+    position: absolute;
+    left: 356px;
+    right: 378px;
+    bottom: 76px;
+    padding: 15px 20px 17px;
+    border-radius: 20px;
+    background: linear-gradient(150deg, rgba(18, 28, 48, 0.86), rgba(9, 14, 26, 0.80));
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-left: 6px solid var(--accent);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42), 0 0 22px rgba(122, 215, 255, 0.10);
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    opacity: 0;
+    transform: translateY(12px) scale(0.985);
+    transition: opacity 0.24s ease, transform 0.24s ease;
+  }
+
+  #bubble.visible { opacity: 1; transform: none; }
+
+  #bubble::before {
+    content: "";
+    position: absolute;
+    left: -24px;
+    bottom: 30px;
+    width: 0;
+    height: 0;
+    border-top: 13px solid transparent;
+    border-bottom: 13px solid transparent;
+    border-right: 20px solid rgba(16, 25, 44, 0.88);
+    filter: drop-shadow(-2px 0 0 rgba(255, 255, 255, 0.10));
+  }
+
+  .bubble-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 7px;
+    min-height: 20px;
+  }
+
+  .bubble-kind {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 9px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #08111f;
+    background: var(--accent);
+    box-shadow: 0 0 12px rgba(122, 215, 255, 0.28);
+  }
+
+  .bubble-emotion {
+    font-size: 11px;
+    color: var(--muted-strong);
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  #bubble-text {
+    font-size: 25px;
+    line-height: 1.52;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: #f6faff;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.36);
+    min-height: 1.5em;
+    max-height: 4.56em;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  #bubble-text.typing::after {
+    content: "";
+    display: inline-block;
+    width: 2px;
+    height: 0.95em;
+    margin-left: 3px;
+    vertical-align: -0.08em;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: caret 0.85s steps(1) infinite;
+  }
+
+  /* ---------------- 动效 ---------------- */
+
+  @keyframes bob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-9px); }
+  }
+
+  @keyframes sway {
+    0%, 100% { transform: rotate(-1.1deg) translateY(0); }
+    50% { transform: rotate(1.1deg) translateY(-4px); }
+  }
+
+  @keyframes blink {
+    0%, 91%, 100% { transform: scaleY(1); }
+    94% { transform: scaleY(0.08); }
+  }
+
+  @keyframes talk {
+    from { transform: translateX(-50%) scaleY(0.18) scaleX(0.82); }
+    to { transform: translateX(-50%) scaleY(1) scaleX(1); }
+  }
+
+  @keyframes ph-talk {
+    from { transform: scaleY(0.35) scaleX(0.85); }
+    to { transform: scaleY(1.35) scaleX(1); }
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.82); }
+  }
+
+  @keyframes caret {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #avatar-bob, #avatar-placeholder, #avatar-placeholder .eyes, #mouth { animation: none !important; }
+    #bubble { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+
+  <!-- 右侧信息面板 -->
+  <aside id="side-panel" aria-label="直播信息面板">
+    <div class="panel-head">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <div class="brand-title">BetterGI 虚拟主播</div>
+          <div class="brand-sub">实时叠加层</div>
+        </div>
+      </div>
+      <div id="conn-pill" class="pill conn connecting">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="conn-text">连接中…</span>
+      </div>
+    </div>
+    <div id="conn-detail" hidden></div>
+
+    <section id="guidance-card" class="card">
+      <div class="card-title">
+        <span>当前指导</span>
+        <span id="guidance-source" class="tag" hidden></span>
+      </div>
+      <div id="guidance-text" class="empty">暂无指导</div>
+    </section>
+
+    <div class="stat-grid">
+      <div class="stat">
+        <span class="stat-label">直播</span>
+        <span id="live-stat" class="stat-value muted">未连接</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">动作</span>
+        <span id="action-stat" class="stat-value muted">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">画面</span>
+        <span id="frame-stat" class="stat-value muted">—</span>
+      </div>
+    </div>
+    <div id="frame-detail" class="stat-detail">等待实时会话</div>
+    <div id="action-counters" class="stat-detail">已执行 0 · 丢弃 0</div>
+
+    <section class="card">
+      <div class="card-title"><span>当前按键</span><span id="queue-depth" class="tag">0 块</span></div>
+      <div id="keys" class="keys-row"><span class="key empty">无</span></div>
+    </section>
+
+    <section class="feed-section">
+      <div class="card-title"><span>解说动态</span><span id="session-id" class="tag" hidden></span></div>
+      <div id="feed" aria-live="polite">
+        <div class="feed-empty">等待解说…</div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- 头像 -->
+  <div id="avatar-zone">
+    <div id="avatar-bob">
+      <div id="avatar-frame">
+        <img id="avatar-img" alt="" hidden>
+        <svg id="avatar-placeholder" viewBox="0 0 260 320" role="img" aria-label="虚拟主播占位形象">
+          <defs>
+            <linearGradient id="bodyGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#a9ecff"/>
+              <stop offset="0.55" stop-color="#7aa8ff"/>
+              <stop offset="1" stop-color="#b388ff"/>
+            </linearGradient>
+            <linearGradient id="hairGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#f4fbff"/>
+              <stop offset="1" stop-color="#bcd8ff"/>
+            </linearGradient>
+            <radialGradient id="glowGrad" cx="50%" cy="45%" r="55%">
+              <stop offset="0" stop-color="#7ad7ff" stop-opacity="0.42"/>
+              <stop offset="1" stop-color="#7ad7ff" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <ellipse cx="130" cy="300" rx="78" ry="12" fill="rgba(8,14,26,0.35)"/>
+          <circle cx="130" cy="152" r="122" fill="url(#glowGrad)"/>
+          <path d="M130 44 C130 27 142 20 152 24" stroke="#d7ecff" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <circle cx="155" cy="22" r="7" fill="#ffe066"/>
+          <path d="M62 292 C58 240 78 208 130 208 C182 208 202 240 198 292 Z" fill="url(#bodyGrad)" opacity="0.96"/>
+          <path d="M92 292 C96 252 108 232 130 230 C152 232 164 252 168 292 Z" fill="#0f1b33" opacity="0.30"/>
+          <ellipse cx="130" cy="156" rx="72" ry="76" fill="url(#bodyGrad)"/>
+          <path d="M58 152 C58 94 90 62 130 62 C170 62 202 94 202 152 C202 158 200 166 197 172 C193 142 182 122 168 114 C152 132 132 138 108 136 C92 134 80 140 72 154 C66 164 63 172 63 172 C60 166 58 159 58 152 Z" fill="url(#hairGrad)"/>
+          <path d="M78 118 C94 96 118 88 142 94 C160 98 176 110 184 128 C166 120 150 118 136 122 C118 127 98 128 78 118 Z" fill="#f7fcff" opacity="0.85"/>
+          <g class="eyes" fill="#17233b">
+            <ellipse cx="104" cy="160" rx="9" ry="13"/>
+            <ellipse cx="156" cy="160" rx="9" ry="13"/>
+          </g>
+          <g fill="#ffffff">
+            <circle cx="107" cy="155" r="3.2"/>
+            <circle cx="159" cy="155" r="3.2"/>
+          </g>
+          <ellipse cx="88" cy="184" rx="12" ry="7" fill="#ff9fc4" opacity="0.55"/>
+          <ellipse cx="172" cy="184" rx="12" ry="7" fill="#ff9fc4" opacity="0.55"/>
+          <path class="ph-mouth" d="M122 190 Q130 196 138 190" stroke="#5a3446" stroke-width="4" fill="none" stroke-linecap="round"/>
+          <path d="M62 176 l4 8 9 1 -7 6 2 9 -8 -4 -8 4 2 -9 -7 -6 9 -1 z" fill="#ffe066" opacity="0.9" transform="translate(12 46) scale(0.8)"/>
+        </svg>
+        <div id="mouth" aria-hidden="true"></div>
+        <div id="emotion-badge">
+          <span class="emotion-dot" aria-hidden="true"></span>
+          <span id="emotion-text">平静</span>
+        </div>
+        <div id="nameplate">小荧</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 解说气泡 -->
+  <div id="bubble" role="status" aria-live="polite">
+    <div class="bubble-meta">
+      <span id="bubble-kind" class="bubble-kind">反应</span>
+      <span id="bubble-emotion" class="bubble-emotion" hidden></span>
+    </div>
+    <div id="bubble-text"></div>
+  </div>
+
+</div>
+
+<!-- 可选配置文件：与 index.html 放在同一目录，缺失时静默跳过。 -->
+<script src="config.js" onerror="this.remove()"></script>
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+     配置
+     ============================================================ */
+
+  var DEFAULT_ACCENTS = {
+    reaction: '#ff6b9d',
+    plan: '#4fc3f7',
+    emotion: '#ffd166',
+    lore: '#b388ff',
+    chat: '#7cf5c0',
+    result: '#ffa94d',
+    guidance: '#9bd7ff'
+  };
+
+  var KIND_LABELS = {
+    reaction: '反应',
+    plan: '计划',
+    emotion: '情绪',
+    lore: '世界观',
+    chat: '互动',
+    result: '复盘',
+    guidance: '指导'
+  };
+
+  var EMOTION_LABELS = {
+    calm: '平静',
+    excited: '兴奋',
+    surprised: '惊讶',
+    happy: '开心',
+    sad: '难过',
+    angry: '生气',
+    curious: '好奇',
+    nervous: '紧张',
+    proud: '自豪',
+    thinking: '思考',
+    amused: '有趣',
+    worried: '担忧',
+    determined: '坚定',
+    tired: '疲惫',
+    neutral: '平静'
+  };
+
+  var EMOTION_COLORS = {
+    calm: '#7ad7f0',
+    excited: '#ffb703',
+    surprised: '#ff6b6b',
+    happy: '#ffd166',
+    sad: '#7aa2ff',
+    angry: '#ff5c5c',
+    curious: '#b388ff',
+    nervous: '#ff9f68',
+    proud: '#ffd166',
+    thinking: '#9aa7b8',
+    amused: '#7cf5c0',
+    worried: '#ff9f68',
+    determined: '#ff8fa3',
+    tired: '#8f9bb3',
+    neutral: '#7ad7f0'
+  };
+
+  var KEY_LABELS = {
+    One: 'F1', Two: 'F2', Three: 'F3', Four: 'F4', Five: 'F5', Six: 'F6',
+    Seven: 'F7', Eight: 'F8', Nine: 'F9', Ten: 'F10', Eleven: 'F11', Twelve: 'F12',
+    zero: '0', one: '1', two: '2', three: '3', four: '4',
+    five: '5', six: '6', seven: '7', eight: '8', nine: '9'
+  };
+
+  // 常见占位符不会被当作真实令牌使用。
+  var TOKEN_PLACEHOLDERS = ['', 'replace_me', 'change_me', 'your_token', '<token>', 'token'];
+
+  var DEFAULTS = {
+    wsUrl: 'ws://127.0.0.1:30648/ws/v1/agent/live',
+    token: '',
+    avatarImage: '',
+    displayName: '小荧',
+    accentColors: {},
+    maxCommentaryLines: 8
+  };
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function readConfig() {
+    var supplied = (window.VTUBER_CONFIG && typeof window.VTUBER_CONFIG === 'object')
+      ? window.VTUBER_CONFIG : {};
+    var cfg = {};
+    Object.keys(DEFAULTS).forEach(function (key) { cfg[key] = supplied[key] !== undefined ? supplied[key] : DEFAULTS[key]; });
+
+    cfg.accentColors = {};
+    Object.keys(DEFAULT_ACCENTS).forEach(function (key) {
+      cfg.accentColors[key] = DEFAULT_ACCENTS[key];
+    });
+    if (supplied.accentColors && typeof supplied.accentColors === 'object') {
+      Object.keys(supplied.accentColors).forEach(function (key) {
+        if (typeof supplied.accentColors[key] === 'string') cfg.accentColors[key] = supplied.accentColors[key];
+      });
+    }
+
+    cfg.wsUrl = String(cfg.wsUrl || DEFAULTS.wsUrl).trim();
+    cfg.token = String(cfg.token || '').trim();
+    cfg.avatarImage = String(cfg.avatarImage || '').trim();
+    cfg.displayName = String(cfg.displayName || DEFAULTS.displayName).trim() || DEFAULTS.displayName;
+    cfg.maxCommentaryLines = clamp(parseInt(cfg.maxCommentaryLines, 10) || 8, 3, 30);
+    return cfg;
+  }
+
+  var CFG = readConfig();
+
+  /* ============================================================
+     DOM
+     ============================================================ */
+
+  function $(id) { return document.getElementById(id); }
+
+  var el = {
+    stage: $('stage'),
+    connPill: $('conn-pill'),
+    connText: $('conn-text'),
+    connDetail: $('conn-detail'),
+    guidanceCard: $('guidance-card'),
+    guidanceText: $('guidance-text'),
+    guidanceSource: $('guidance-source'),
+    liveStat: $('live-stat'),
+    actionStat: $('action-stat'),
+    frameStat: $('frame-stat'),
+    frameDetail: $('frame-detail'),
+    actionCounters: $('action-counters'),
+    queueDepth: $('queue-depth'),
+    keys: $('keys'),
+    feed: $('feed'),
+    sessionId: $('session-id'),
+    avatarZone: $('avatar-zone'),
+    avatarBob: $('avatar-bob'),
+    avatarFrame: $('avatar-frame'),
+    avatarImg: $('avatar-img'),
+    avatarPlaceholder: $('avatar-placeholder'),
+    emotionBadge: $('emotion-badge'),
+    emotionText: $('emotion-text'),
+    nameplate: $('nameplate'),
+    bubble: $('bubble'),
+    bubbleKind: $('bubble-kind'),
+    bubbleEmotion: $('bubble-emotion'),
+    bubbleText: $('bubble-text')
+  };
+
+  /* ============================================================
+     令牌与地址
+     优先级：URL 查询参数 token / access_token > localStorage > config.js
+     令牌绝不写入日志或界面。
+     ============================================================ */
+
+  function isPlaceholderToken(value) {
+    var normalized = String(value || '').trim().toLowerCase();
+    return TOKEN_PLACEHOLDERS.indexOf(normalized) >= 0;
+  }
+
+  function queryToken() {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      return params.get('token') || params.get('access_token') || '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function storedToken() {
+    try {
+      return window.localStorage.getItem('vtuber_token') || '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function resolveToken() {
+    var token = queryToken();
+    if (!isPlaceholderToken(token)) return token.trim();
+    token = storedToken();
+    if (!isPlaceholderToken(token)) return token.trim();
+    token = CFG.token;
+    if (!isPlaceholderToken(token)) return token.trim();
+    return '';
+  }
+
+  function buildSocketUrl(token) {
+    var url;
+    try {
+      url = new URL(CFG.wsUrl);
+    } catch (err) {
+      return null;
+    }
+    if (token) url.searchParams.set('access_token', token);
+    return url.toString();
+  }
+
+  /* ============================================================
+     状态
+     ============================================================ */
+
+  var state = {
+    socket: null,
+    token: '',
+    connected: false,
+    live: false,
+    reconnectAttempt: 0,
+    reconnectTimer: null,
+    pingTimer: null,
+    stalenessTimer: null,
+    lastFrameAt: 0,
+    frameWidth: 0,
+    frameHeight: 0,
+    fps: 0,
+    sessionId: '',
+    starved: false,
+    seenCommentary: Object.create(null),
+    seenOrder: []
+  };
+
+  var lastGuidance = '';
+  var lastFrameUiAt = 0;
+
+  /* ============================================================
+     通用渲染
+     ============================================================ */
+
+  function accentFor(kind) {
+    return CFG.accentColors[kind] || DEFAULT_ACCENTS[kind] || DEFAULT_ACCENTS.guidance;
+  }
+
+  function normalizeKind(kind) {
+    var key = String(kind || '').trim().toLowerCase();
+    return KIND_LABELS[key] && key !== 'guidance' ? key : 'reaction';
+  }
+
+  function prettyKey(key) {
+    var raw = String(key || '');
+    return KEY_LABELS[raw] || raw;
+  }
+
+  function setConnection(mode, text, detail) {
+    el.connPill.className = 'pill conn ' + mode;
+    el.connText.textContent = text;
+    if (detail) {
+      el.connDetail.textContent = detail;
+      el.connDetail.hidden = false;
+    } else {
+      el.connDetail.textContent = '';
+      el.connDetail.hidden = true;
+    }
+    document.body.classList.toggle('is-offline', mode === 'offline' || mode === 'unconfigured');
+  }
+
+  function updateLiveChip() {
+    if (!state.connected) {
+      el.liveStat.textContent = '连接中断';
+      el.liveStat.className = 'stat-value danger';
+      return;
+    }
+    if (state.live) {
+      el.liveStat.textContent = '直播中';
+      el.liveStat.className = 'stat-value ok';
+    } else {
+      el.liveStat.textContent = '会话未开始';
+      el.liveStat.className = 'stat-value muted';
+    }
+  }
+
+  function updateFrameChip() {
+    if (state.frameWidth && state.frameHeight) {
+      el.frameStat.textContent = state.frameWidth + '×' + state.frameHeight;
+    } else {
+      el.frameStat.textContent = state.connected ? '等待画面' : '—';
+    }
+    el.frameStat.className = 'stat-value ' + (state.connected ? 'ok' : 'muted');
+    var parts = [];
+    if (state.fps) parts.push(state.fps + ' 帧/秒');
+    if (state.frameWidth && state.frameHeight) parts.push(state.frameWidth + '×' + state.frameHeight);
+    if (state.sessionId) parts.push('会话 ' + state.sessionId);
+    el.frameDetail.textContent = parts.length ? parts.join(' · ') : '等待实时会话';
+  }
+
+  function setGuidance(text, source) {
+    var value = String(text == null ? '' : text).trim();
+    if (value === lastGuidance) return;
+    lastGuidance = value;
+    el.guidanceText.textContent = value || '暂无指导';
+    el.guidanceText.classList.toggle('empty', !value);
+    if (source) {
+      el.guidanceSource.textContent = String(source);
+      el.guidanceSource.hidden = false;
+    } else {
+      el.guidanceSource.textContent = '';
+      el.guidanceSource.hidden = true;
+    }
+    el.guidanceCard.classList.remove('flash');
+    // 触发一次重绘，让高亮动画重新播放。
+    void el.guidanceCard.offsetWidth;
+    el.guidanceCard.classList.add('flash');
+  }
+
+  function setEmotionBadge(emotion) {
+    var key = String(emotion || '').trim().toLowerCase();
+    var label = EMOTION_LABELS[key] || (key ? key : '平静');
+    var color = EMOTION_COLORS[key] || '#7ad7f0';
+    el.emotionBadge.style.setProperty('--emotion-color', color);
+    el.emotionText.textContent = label;
+  }
+
+  function resetEmotionSoon() {
+    window.setTimeout(function () {
+      if (!speech.current) setEmotionBadge('calm');
+    }, 4200);
+  }
+
+  /* ============================================================
+     解说队列与打字机
+     ============================================================ */
+
+  var speech = {
+    queue: [],
+    current: null,
+    typeTimer: null,
+    holdTimer: null,
+    fadeTimer: null
+  };
+
+  function rememberCommentary(seq) {
+    if (typeof seq !== 'number' || !isFinite(seq)) return true;
+    if (state.seenCommentary[seq]) return false;
+    state.seenCommentary[seq] = true;
+    state.seenOrder.push(seq);
+    if (state.seenOrder.length > 800) {
+      var oldest = state.seenOrder.shift();
+      delete state.seenCommentary[oldest];
+    }
+    return true;
+  }
+
+  function addFeedItem(item) {
+    var empty = el.feed.querySelector('.feed-empty');
+    if (empty) empty.remove();
+
+    var row = document.createElement('div');
+    row.className = 'feed-item';
+    row.style.setProperty('--accent', item.accent);
+
+    var meta = document.createElement('div');
+    meta.className = 'feed-meta';
+
+    var kind = document.createElement('span');
+    kind.className = 'feed-kind';
+    kind.textContent = KIND_LABELS[item.kind] || '解说';
+
+    var emotion = document.createElement('span');
+    emotion.textContent = item.emotion ? (EMOTION_LABELS[item.emotion] || item.emotion) : '';
+
+    var time = document.createElement('span');
+    time.className = 'feed-time';
+    time.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+    meta.appendChild(kind);
+    if (emotion.textContent) meta.appendChild(emotion);
+    meta.appendChild(time);
+
+    var text = document.createElement('div');
+    text.className = 'feed-text';
+    text.textContent = item.text;
+
+    row.appendChild(meta);
+    row.appendChild(text);
+    el.feed.insertBefore(row, el.feed.firstChild);
+
+    while (el.feed.children.length > CFG.maxCommentaryLines) {
+      el.feed.removeChild(el.feed.lastChild);
+    }
+  }
+
+  function showBubble(item) {
+    el.bubble.style.setProperty('--accent', item.accent);
+    el.bubbleKind.textContent = KIND_LABELS[item.kind] || '解说';
+    el.bubbleKind.style.setProperty('--accent', item.accent);
+    el.bubbleEmotion.textContent = item.emotion
+      ? (EMOTION_LABELS[item.emotion] || item.emotion)
+      : '';
+    el.bubbleEmotion.hidden = !item.emotion;
+    setEmotionBadge(item.emotion || 'calm');
+    el.bubble.classList.add('visible');
+  }
+
+  function setSpeaking(on) {
+    el.avatarFrame.classList.toggle('speaking', !!on);
+  }
+
+  function clearSpeechTimers() {
+    window.clearTimeout(speech.typeTimer);
+    window.clearTimeout(speech.holdTimer);
+    window.clearTimeout(speech.fadeTimer);
+    speech.typeTimer = null;
+    speech.holdTimer = null;
+    speech.fadeTimer = null;
+  }
+
+  function playNextSpeech() {
+    clearSpeechTimers();
+    var item = speech.queue.shift();
+    if (!item) {
+      speech.current = null;
+      setSpeaking(false);
+      resetEmotionSoon();
+      return;
+    }
+
+    speech.current = item;
+    showBubble(item);
+    setSpeaking(true);
+
+    var chars = Array.from(item.text);
+    var index = 0;
+    var speed = clamp(Math.round(1800 / Math.max(1, chars.length)), 16, 42);
+
+    el.bubbleText.textContent = '';
+    el.bubbleText.classList.add('typing');
+
+    function step() {
+      if (speech.current !== item) return;
+      index += 1;
+      el.bubbleText.textContent = chars.slice(0, index).join('');
+      if (index < chars.length) {
+        speech.typeTimer = window.setTimeout(step, speed);
+        return;
+      }
+      el.bubbleText.classList.remove('typing');
+      setSpeaking(false);
+      var hold = clamp(900 + chars.length * 55, 2200, 5200);
+      speech.holdTimer = window.setTimeout(function () {
+        el.bubble.classList.remove('visible');
+        setSpeaking(false);
+        speech.fadeTimer = window.setTimeout(function () {
+          if (speech.current === item) {
+            speech.current = null;
+            playNextSpeech();
+          }
+        }, 260);
+      }, hold);
+    }
+
+    speech.typeTimer = window.setTimeout(step, speed);
+  }
+
+  function enqueueCommentary(msg) {
+    var text = String(msg.text == null ? '' : msg.text).replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    if (!rememberCommentary(msg.seq)) return;
+
+    var kind = normalizeKind(msg.kind);
+    var emotion = String(msg.emotion || '').trim().toLowerCase();
+    var item = {
+      text: text,
+      kind: kind,
+      emotion: emotion,
+      accent: accentFor(kind)
+    };
+
+    addFeedItem(item);
+    speech.queue.push(item);
+    while (speech.queue.length > 8) speech.queue.shift();
+    if (!speech.current) playNextSpeech();
+  }
+
+  /* ============================================================
+     服务端消息
+     ============================================================ */
+
+  function handleHello(msg) {
+    var sessionId = String(msg.sessionId || '');
+
+    // 新会话的 seq 会从头开始；切换会话时清空去重记录与旧动态，避免误判重复。
+    if (state.sessionId && sessionId && sessionId !== state.sessionId) {
+      state.seenCommentary = Object.create(null);
+      state.seenOrder = [];
+      speech.queue.length = 0;
+      el.feed.replaceChildren();
+      var waiting = document.createElement('div');
+      waiting.className = 'feed-empty';
+      waiting.textContent = '等待解说…';
+      el.feed.appendChild(waiting);
+    }
+
+    state.connected = true;
+    state.live = true;
+    state.sessionId = sessionId;
+    state.fps = Number(msg.fps) || 0;
+    state.frameWidth = Number(msg.frameWidth || msg.width) || state.frameWidth;
+    state.frameHeight = Number(msg.frameHeight || msg.height) || state.frameHeight;
+    if (state.sessionId) {
+      el.sessionId.textContent = '会话 ' + state.sessionId;
+      el.sessionId.hidden = false;
+    } else {
+      el.sessionId.hidden = true;
+    }
+    setConnection('online', '已连接');
+    updateLiveChip();
+    updateFrameChip();
+  }
+
+  function handleFrame(msg) {
+    state.connected = true;
+    state.lastFrameAt = Date.now();
+    if (Number(msg.fps)) state.fps = Number(msg.fps);
+    if (Number(msg.width || msg.frameWidth)) state.frameWidth = Number(msg.width || msg.frameWidth);
+    if (Number(msg.height || msg.frameHeight)) state.frameHeight = Number(msg.height || msg.frameHeight);
+
+    if (msg.guidance) setGuidance(msg.guidance);
+
+    var now = Date.now();
+    if (now - lastFrameUiAt > 500) {
+      lastFrameUiAt = now;
+      updateFrameChip();
+      if (msg.runtime) {
+        var runtime = msg.runtime;
+        var detail = [];
+        if (state.fps) detail.push(state.fps + ' 帧/秒');
+        if (state.frameWidth && state.frameHeight) detail.push(state.frameWidth + '×' + state.frameHeight);
+        if (runtime.isMinimized) detail.push('游戏已最小化');
+        else if (runtime.isForeground === false) detail.push('游戏不在前台');
+        else if (runtime.isForeground) detail.push('游戏在前台');
+        if (state.sessionId) detail.push('会话 ' + state.sessionId);
+        el.frameDetail.textContent = detail.join(' · ');
+      }
+    }
+  }
+
+  function handleActionState(msg) {
+    var keys = Array.isArray(msg.keys) ? msg.keys.slice(0, 12) : [];
+    el.keys.replaceChildren();
+    if (keys.length) {
+      keys.forEach(function (key) {
+        var chip = document.createElement('span');
+        chip.className = 'key';
+        chip.textContent = prettyKey(key);
+        el.keys.appendChild(chip);
+      });
+    } else {
+      var empty = document.createElement('span');
+      empty.className = 'key empty';
+      empty.textContent = '无';
+      el.keys.appendChild(empty);
+    }
+
+    state.starved = !!msg.starved;
+    if (state.starved) {
+      el.actionStat.textContent = '动作饥饿';
+      el.actionStat.className = 'stat-value warn';
+    } else {
+      el.actionStat.textContent = '动作充足';
+      el.actionStat.className = 'stat-value ok';
+    }
+
+    var depth = Number(msg.queueDepth);
+    el.queueDepth.textContent = isFinite(depth) ? depth + ' 块' : '—';
+
+    var applied = Number(msg.applied);
+    var dropped = Number(msg.dropped);
+    if (isFinite(applied) || isFinite(dropped)) {
+      el.actionCounters.textContent = '已执行 ' + (isFinite(applied) ? applied : 0)
+        + ' · 丢弃 ' + (isFinite(dropped) ? dropped : 0);
+    }
+  }
+
+  function handleMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    switch (msg.type) {
+      case 'hello':
+        handleHello(msg);
+        break;
+      case 'frame':
+        handleFrame(msg);
+        break;
+      case 'guidance':
+        setGuidance(msg.text, msg.source);
+        break;
+      case 'commentary':
+        // 内部思考只写入会话文件，不在直播叠加层显示。
+        if (msg.kind === 'thought' || (msg.meta && msg.meta.internal)) break;
+        enqueueCommentary(msg);
+        break;
+      case 'action_state':
+        handleActionState(msg);
+        break;
+      case 'live.stopped':
+        state.live = false;
+        setConnection('stopped', '会话已停止', '可在 BetterGI 中重新启动实时会话');
+        updateLiveChip();
+        break;
+      case 'pong':
+        break;
+      case 'error':
+        // 不展示令牌或原始请求信息。
+        setConnection('offline', '服务端错误', String(msg.message || msg.code || '未知错误'));
+        break;
+      default:
+        break;
+    }
+  }
+
+  /* ============================================================
+     连接与重连
+     ============================================================ */
+
+  function stopPing() {
+    if (state.pingTimer) {
+      window.clearInterval(state.pingTimer);
+      state.pingTimer = null;
+    }
+  }
+
+  function startPing() {
+    stopPing();
+    state.pingTimer = window.setInterval(function () {
+      if (state.socket && state.socket.readyState === 1) {
+        try {
+          state.socket.send(JSON.stringify({ type: 'ping' }));
+        } catch (err) {
+          // 忽略；下一次 onclose 会触发重连。
+        }
+      }
+    }, 25000);
+  }
+
+  function scheduleReconnect() {
+    if (state.reconnectTimer) return;
+    var attempt = state.reconnectAttempt;
+    state.reconnectAttempt += 1;
+    var base = Math.min(15000, 1000 * Math.pow(1.8, attempt));
+    var delay = Math.max(800, Math.round(base * (0.8 + Math.random() * 0.4)));
+    setConnection('offline', '已断开', '第 ' + (attempt + 1) + ' 次重连将在 '
+      + (delay / 1000).toFixed(1) + ' 秒后开始');
+    updateLiveChip();
+    state.reconnectTimer = window.setTimeout(function () {
+      state.reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
+  function connect() {
+    if (state.socket && (state.socket.readyState === 0 || state.socket.readyState === 1)) return;
+    if (state.reconnectTimer) {
+      window.clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+
+    state.token = resolveToken();
+    if (!state.token) {
+      setConnection('unconfigured', '未配置令牌',
+        '请在 OBS 地址后追加 ?token=…，或在 config.js 中填写 token');
+      updateLiveChip();
+      return;
+    }
+
+    var url = buildSocketUrl(state.token);
+    if (!url) {
+      setConnection('unconfigured', '地址无效', '请检查 config.js 中的 wsUrl');
+      return;
+    }
+
+    setConnection('connecting', '连接中…');
+    var socket;
+    try {
+      socket = new WebSocket(url);
+    } catch (err) {
+      scheduleReconnect();
+      return;
+    }
+    state.socket = socket;
+
+    socket.onopen = function () {
+      if (state.socket !== socket) return;
+      state.connected = true;
+      state.reconnectAttempt = 0;
+      setConnection('online', '已连接');
+      updateLiveChip();
+      startPing();
+    };
+
+    socket.onmessage = function (event) {
+      if (state.socket !== socket) return;
+      var msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch (err) {
+        return;
+      }
+      handleMessage(msg);
+    };
+
+    socket.onerror = function () {
+      // 错误详情可能包含地址；不记录、不展示令牌。
+      if (state.socket === socket) {
+        setConnection('offline', '连接异常', '正在尝试重新连接');
+      }
+    };
+
+    socket.onclose = function () {
+      stopPing();
+      if (state.socket === socket) state.socket = null;
+      state.connected = false;
+      updateLiveChip();
+      scheduleReconnect();
+    };
+  }
+
+  /* ============================================================
+     初始化
+     ============================================================ */
+
+  function initAvatar() {
+    el.nameplate.textContent = CFG.displayName;
+    document.title = CFG.displayName + ' · BetterGI 虚拟主播';
+    if (!CFG.avatarImage) {
+      el.avatarImg.hidden = true;
+      el.avatarPlaceholder.hidden = false;
+      el.avatarFrame.classList.remove('has-image');
+      el.avatarFrame.classList.add('has-placeholder');
+      return;
+    }
+    el.avatarImg.alt = CFG.displayName;
+    el.avatarFrame.classList.remove('has-image');
+    el.avatarFrame.classList.add('has-placeholder');
+    el.avatarImg.onload = function () {
+      el.avatarImg.hidden = false;
+      el.avatarPlaceholder.hidden = true;
+      el.avatarFrame.classList.add('has-image');
+      el.avatarFrame.classList.remove('has-placeholder');
+    };
+    el.avatarImg.onerror = function () {
+      el.avatarImg.hidden = true;
+      el.avatarPlaceholder.hidden = false;
+      el.avatarFrame.classList.remove('has-image');
+      el.avatarFrame.classList.add('has-placeholder');
+    };
+    el.avatarImg.src = CFG.avatarImage;
+  }
+
+  function init() {
+    initAvatar();
+    setEmotionBadge('calm');
+
+    state.stalenessTimer = window.setInterval(function () {
+      if (!state.connected) return;
+      if (!state.lastFrameAt) {
+        el.frameStat.textContent = '等待画面';
+        el.frameStat.className = 'stat-value warn';
+        return;
+      }
+      var age = (Date.now() - state.lastFrameAt) / 1000;
+      if (age > 4) {
+        el.frameStat.textContent = '画面中断 ' + Math.round(age) + 's';
+        el.frameStat.className = 'stat-value danger';
+        el.frameDetail.textContent = '超过 4 秒未收到画面帧';
+      }
+    }, 1000);
+
+    connect();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  window.addEventListener('beforeunload', function () {
+    stopPing();
+    if (state.stalenessTimer) window.clearInterval(state.stalenessTimer);
+    if (state.reconnectTimer) window.clearTimeout(state.reconnectTimer);
+    if (state.socket) {
+      try { state.socket.close(); } catch (err) { /* 忽略 */ }
+    }
+  });
+})();
+</script>
+</body>
+</html>

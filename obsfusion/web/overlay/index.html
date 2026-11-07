@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ObsFusion Overlay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/shared/base.css" />
+<style>
+  html, body { background: transparent !important; overflow: hidden; }
+  .of-stage {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(var(--of-scale, 1));
+    width: 1920px; height: 1080px; transform-origin: center center; overflow: hidden;
+    background: transparent; --accent: #e8b05a;
+  }
+  .of-media { position: absolute; inset: 0; z-index: 1; }
+  .of-media video, .of-media img { width: 100%; height: 100%; display: block; object-fit: cover; opacity: 1; }
+  .of-media[data-fit="contain"] video { object-fit: contain; }
+  .of-scrim { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+  .of-safearea { position: absolute; inset: 5%; z-index: 90; border: 1px dashed rgba(232,176,90,.32); display: none; pointer-events: none; }
+  .of-stage.debug .of-safearea { display: block; }
+  .of-bug {
+    position: absolute; left: 64px; top: 56px; z-index: 40; display: flex; align-items: center; gap: 14px;
+    font-family: var(--of-sans); letter-spacing: .04em; color: rgba(233,236,242,.86);
+    transition: opacity .5s var(--of-ease);
+  }
+  .of-bug .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 16px var(--accent); }
+  .of-bug .kicker { font-size: 15px; text-transform: uppercase; color: rgba(233,236,242,.55); letter-spacing: .24em; }
+  .of-bug .name { font-size: 22px; font-weight: 600; }
+  .of-ticker {
+    position: absolute; left: 64px; bottom: 44px; z-index: 40; font-family: var(--of-mono);
+    font-size: 13px; letter-spacing: .18em; color: rgba(233,236,242,.38); text-transform: uppercase;
+  }
+  .of-layer { position: absolute; inset: 0; pointer-events: none; }
+  .of-layer[data-z="60"] { z-index: 60; }
+
+  /* ---- 字幕 ---- */
+  .of-sub { position: absolute; z-index: 30; display: flex; flex-direction: column; gap: 8px; align-items: center; width: max-content; max-width: 72%;
+    opacity: 0; filter: blur(6px); transform: translateY(14px); transition: opacity .42s var(--of-ease-out), transform .5s var(--of-ease-out), filter .4s var(--of-ease-out); pointer-events: none; }
+  .of-sub.is-on { opacity: 1; filter: blur(0); transform: translateY(0); }
+  /* 退场：只做淡出，且立即退出排版（visibility），避免同锚点的下一条字幕与之叠字 */
+  .of-sub.is-leaving { opacity: 0 !important; filter: blur(3px) !important; pointer-events: none; visibility: hidden;
+    transition: opacity .28s linear, filter .28s linear !important; }
+  .of-sub .speaker { font-family: var(--of-mono); font-size: 0.32em; letter-spacing: .34em; text-transform: uppercase; color: var(--accent); opacity: .9; }
+  .of-sub .line {
+    position: relative; display: block; width: max-content; max-width: 100%; font-family: var(--of-sans); font-weight: 600;
+    line-height: 1.3; letter-spacing: .012em; color: #f7f5ef; white-space: pre-wrap; text-align: center;
+    text-shadow: 0 4px 26px rgba(0,0,0,.72), 0 1px 2px rgba(0,0,0,.85);
+  }
+  .of-sub .line::after {
+    content: ""; position: absolute; left: 8%; right: 8%; bottom: -14px; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(232,176,90,.55), transparent); opacity: 0; transition: opacity .6s var(--of-ease);
+  }
+  .of-sub.is-on .line::after { opacity: 1; }
+  /* 卡拉OK：单层文字 + 渐变裁剪，避免复制层与底层错位重影 */
+  .of-sub .line.is-karaoke {
+    background-image: linear-gradient(90deg, var(--accent) var(--p, 0%), #f7f5ef var(--p, 0%));
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: transparent;
+    /* text-shadow 会在透明字形内部露出黑底，必须关掉；改由 filter 的 drop-shadow 提供投影 */
+    text-shadow: none;
+    filter: drop-shadow(0 4px 18px rgba(0,0,0,.72)) drop-shadow(0 1px 2px rgba(0,0,0,.85));
+  }
+  .of-sub .karaoke { display: none; }
+  .of-sub .karaoke span { color: var(--accent);
+    clip-path: inset(0 calc(100% - var(--p, 0%)) 0 0); transition: clip-path .12s linear; }
+  .of-sub[data-style="title"] .line { font-family: var(--of-serif); font-size: 1.25em; font-weight: 700; letter-spacing: .02em; }
+  .of-sub[data-style="caption"] .line { font-family: var(--of-mono); font-weight: 500; }
+  .of-sub[data-style="quote"] .line { font-family: var(--of-serif); font-style: italic; font-weight: 500; }
+  .of-sub[data-style="quote"]::before { content: ""; position: absolute; left: -46px; top: 6px; bottom: 6px; width: 2px; background: linear-gradient(var(--accent), transparent); }
+  .of-sub .panel {
+    padding: 14px 30px 16px; border-radius: 14px; background: transparent; transition: background .4s var(--of-ease), backdrop-filter .4s var(--of-ease);
+  }
+  .of-sub[data-style="caption"] .panel { background: rgba(6,8,12,.55); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,.07); }
+  .of-sub[data-style="title"] .panel { padding: 20px 40px; }
+
+  .of-progress { position: absolute; left: 0; bottom: 0; height: 3px; width: 100%; z-index: 45; background: rgba(255,255,255,.05); }
+  .of-progress i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, rgba(232,176,90,.25), var(--accent)); box-shadow: 0 0 18px rgba(232,176,90,.5); }
+  .of-state { position: absolute; right: 64px; top: 56px; z-index: 40; font-family: var(--of-mono); font-size: 13px; letter-spacing: .24em; color: rgba(233,236,242,.45); text-transform: uppercase; }
+  .of-state b { color: var(--accent); font-weight: 600; }
+  .of-hint { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); z-index: 80; display: none; text-align: center;
+    font-family: var(--of-mono); font-size: 18px; letter-spacing: .1em; color: rgba(233,236,242,.6); line-height: 2; }
+  .of-stage.is-idle .of-hint { display: block; animation: of-fade 1.2s var(--of-ease-out); }
+  @keyframes of-fade { from { opacity: 0; transform: translate(-50%,-46%);} to { opacity: 1; transform: translate(-50%,-50%);} }
+</style>
+</head>
+<body class="of-body">
+<div class="of-stage" id="stage">
+  <div class="of-media" id="media"></div>
+  <div class="of-scrim" id="scrim"></div>
+  <div class="of-bug" id="bug"><span class="dot"></span><span><div class="kicker" id="bugKicker">ObsFusion</div><div class="name" id="bugName">DEMO</div></span></div>
+  <div class="of-state" id="stateLabel">IDLE</div>
+  <div class="of-ticker" id="ticker">waiting for signal</div>
+  <div class="of-sub" id="sub" data-style="subtitle">
+    <div class="speaker" id="subSpeaker" hidden></div>
+    <div class="panel"><div class="line" id="subLine"></div><div class="karaoke" id="subKaraoke"><span id="subKaraokeText"></span></div></div>
+  </div>
+  <div class="of-safearea"></div>
+  <div class="of-progress"><i id="progress"></i></div>
+  <div class="of-hint">ObsFusion 叠加层<br /><span style="font-size:14px;color:rgba(233,236,242,.35)">在控制台点击 ▶ 开始播放</span></div>
+</div>
+<style>
+  /* 弹幕层样式兜底：扩展某个时刻没加载上也不该出现裸文本溢出色块 */
+  .of-danmaku-layer{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:60;}
+  .of-danmaku-item{position:absolute;white-space:nowrap;font-weight:600;text-shadow:0 2px 12px rgba(0,0,0,.8);}
+</style>
+<script src="/shared/runtime.js"></script>
+<script src="/overlay/overlay.js"></script>
+</body>
+</html>

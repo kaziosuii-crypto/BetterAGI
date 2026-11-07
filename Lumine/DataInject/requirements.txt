@@ -1,0 +1,17 @@
+lxml
+aiohttp
+mwparserfromhell
+tqdm
+webdataset
+lxml-html-clean
+python-magic
+nemo_curator
+dask-cuda
+distributed
+sentencepiece
+beautifulsoup4
+fasttext-wheel
+ftfy
+boto3
+openai>=1.0.0
+loguru

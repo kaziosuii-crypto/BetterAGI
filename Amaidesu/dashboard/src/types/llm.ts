@@ -1,0 +1,273 @@
+/**
+ * LLM 相关类型定义
+ */
+
+// 模型用量统计
+export interface LLMUsageStats {
+  model_name: string;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  total_calls: number;
+  total_cost: number;
+  /** 缓存命中 token；0 可能代表"未上报"而非真实零命中（落库口径把未上报记 0） */
+  cache_hit_tokens: number;
+  /** 缓存未命中 token；0 可能代表"未上报"而非真实零命中 */
+  cache_miss_tokens: number;
+  /** 缓存命中率（0-1，hit/(hit+miss)）；null 表示上游从未上报缓存用量 */
+  cache_hit_rate: number | null;
+  first_call_time: number | null;
+  last_call_time: number | null;
+  last_updated: number | null;
+  /** 上下文窗口 token 总量（来自 [[llm_models]]）；0 = 未配置，前端据此隐藏水位 */
+  context_window: number;
+  /** 最近一次调用的输入 token（上下文水位分子）；无记录时 null */
+  last_call_prompt_tokens: number | null;
+}
+
+// 总费用摘要
+export interface LLMUsageSummary {
+  total_cost: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  total_calls: number;
+  /** 缓存命中 token；0 可能代表"未上报"而非真实零命中 */
+  cache_hit_tokens: number;
+  /** 缓存未命中 token；0 可能代表"未上报"而非真实零命中 */
+  cache_miss_tokens: number;
+  /** 缓存命中率（0-1）；null 表示上游从未上报缓存用量 */
+  cache_hit_rate: number | null;
+  model_count: number;
+}
+
+// 用量趋势：单日聚合点（后端已补零对齐连续时间轴）
+export interface LLMUsageTrendPoint {
+  /** 本地日期 YYYY-MM-DD */
+  date: string;
+  /** 当日本地零点的毫秒时间戳 */
+  timestamp_ms: number;
+  total_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  /** 缓存命中率（0-1）；null 表示当日无缓存用量上报 */
+  cache_hit_rate: number | null;
+}
+
+// 用量趋势：单日单模型聚合点（仅有数据的日子）
+export interface LLMUsageTrendModelPoint {
+  date: string;
+  model_name: string;
+  total_calls: number;
+  total_tokens: number;
+  cost: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  cache_hit_rate: number | null;
+}
+
+// 用量趋势响应（GET /llm/usage/trends?days=N）
+export interface LLMUsageTrendsResponse {
+  days: number;
+  points: LLMUsageTrendPoint[];
+  model_points: LLMUsageTrendModelPoint[];
+}
+
+// 上下文分段内明细行（一条工具 / 一组同角色消息）
+export interface LLMContextSectionItem {
+  name: string;
+  tokens: number;
+}
+
+// 上下文分段（messages / mcp_tools / system_tools / skills / system 之一；旧记录可能是 tools）
+export interface LLMContextSection {
+  key: string;
+  /** 校准后展示值 */
+  tokens: number;
+  /** 本地估算原值（校准前） */
+  raw_tokens: number;
+  /** 条目数（消息条数 / 工具条数 / 技能片段与正文条数） */
+  count: number;
+  items: LLMContextSectionItem[];
+}
+
+// 单模型最近一次调用的上下文分段占用（GET /llm/context-breakdown）
+export interface LLMContextBreakdown {
+  model_name: string;
+  profile_name: string;
+  request_id: string;
+  timestamp_ms: number | null;
+  /** 0 = 未配置，前端隐藏水位与剩余 */
+  context_window: number;
+  /** API 回报的输入 token 精确总数（分段展示的校准基准） */
+  api_prompt_tokens: number;
+  /** 分段是否经过 API 总数校准（false = 展示原始估算值） */
+  calibrated: boolean;
+  sections: LLMContextSection[];
+  /** 窗口剩余；未配置窗口时 null */
+  free_tokens: number | null;
+}
+
+/** 一条平台额度：套餐限额窗口（limit）或账户余额（balance） */
+export interface LLMQuotaWindow {
+  kind: 'limit' | 'balance';
+  /** 展示名（Session / Weekly / Balance / Credits ...） */
+  label: string;
+  /** 已用百分比 0-100；平台未给出时 null（不画进度条） */
+  used_percent: number | null;
+  /** 下次重置时刻（Unix 毫秒）；无重置周期时 null */
+  resets_at_ms: number | null;
+  /** 剩余金额（余额类）；限额窗口为 null */
+  amount: number | null;
+  currency: string | null;
+}
+
+/** 模型所属 provider 的平台额度快照（上下文面板 Usage 区） */
+export interface LLMProviderQuota {
+  provider_name: string;
+  platform: string;
+  platform_label: string;
+  /** 计费方式（Token Plan / Pay-as-you-go / ...） */
+  plan_label: string;
+  windows: LLMQuotaWindow[];
+  fetched_at_ms: number;
+}
+
+// Token 用量详情
+export interface LLMTokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+// 请求历史记录
+/** 历史列表行摘要；完整参数与响应正文经 /llm/history/{id} 详情获取 */
+export interface LLMRequestHistorySummary {
+  request_id: string;
+  /** 请求时刻（Unix 毫秒） */
+  timestamp_ms: number;
+  /** LLM 用途 profile 名（planner/replyer/vision/minecraft/simulator/...） */
+  profile_name: string;
+  model_name: string;
+  prompt_preview: string;
+  response_preview: string;
+  usage: LLMTokenUsage | null;
+  cost: number;
+  success: boolean;
+  error: string | null;
+  latency_ms: number;
+  /** 缓存命中 token；与未中均为 0 表示上游未上报（≠零命中） */
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  /** 思考 token（OpenAI completion_tokens_details.reasoning_tokens）；null = 上游未上报 */
+  reasoning_tokens: number | null;
+  /** 上游原始 usage 字典（JSON 字符串），详情展开 JSON 查看 */
+  usage_raw_json: string | null;
+  /** 本次请求注入的截图数（写侧统计落库）；0 不渲染徽标 */
+  image_count: number;
+}
+
+/** 单条请求历史完整记录（GET /llm/history/{id} 详情） */
+export interface LLMRequestHistory {
+  request_id: string;
+  /** 请求时刻（Unix 毫秒） */
+  timestamp_ms: number;
+  /** LLM 用途 profile 名（planner/replyer/vision/minecraft/simulator/...） */
+  profile_name: string;
+  model_name: string;
+  request_params: Record<string, unknown>;
+  response_content: string | null;
+  reasoning_content: string | null;
+  tool_calls: Array<Record<string, unknown>> | null;
+  usage: LLMTokenUsage | null;
+  cost: number;
+  success: boolean;
+  error: string | null;
+  latency_ms: number;
+  /** 缓存命中 token；与未中均为 0 表示上游未上报（≠零命中） */
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  /** 思考 token（OpenAI completion_tokens_details.reasoning_tokens）；null = 上游未上报 */
+  reasoning_tokens: number | null;
+  /** 上游原始 usage 字典（JSON 字符串），详情展开 JSON 查看 */
+  usage_raw_json: string | null;
+}
+
+// 历史查询参数（start_time/end_time 为 Unix 毫秒）
+export interface LLMHistoryQueryParams {
+  page?: number;
+  page_size?: number;
+  model_name?: string;
+  /** 用途 profile 名筛选 */
+  profile_name?: string;
+  start_time?: number;
+  end_time?: number;
+  success_only?: boolean;
+}
+
+// 历史列表响应
+export interface LLMHistoryResponse {
+  items: LLMRequestHistorySummary[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+/**
+ * LLM 用量聚合统计（GET /api/v1/llm/history/statistics）。
+ *
+ * 可按时间窗口过滤：start_time/end_time 为 Unix epoch 毫秒（缺省 = 全量）。
+ * 用于首页"今日成本"卡片——只统计当天 00:00 本地以来的调用与花费。
+ */
+export interface LLMHistoryStatistics {
+  total_requests: number;
+  successful_requests: number;
+  failed_requests: number;
+  /** 0-1（成功请求 / 总请求）；首页渲染为百分比 */
+  success_rate: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  total_cost: number;
+  avg_latency_ms: number;
+  model_stats: Record<
+    string,
+    {
+      count: number;
+      total_tokens: number;
+      total_cost: number;
+      /** 0 可能代表"未上报"而非真实零命中（落库口径把未上报记 0） */
+      cache_hit_tokens: number;
+      cache_miss_tokens: number;
+      /** 缓存命中率（0-1）；null 表示窗口内无缓存用量上报 */
+      cache_hit_rate: number | null;
+    }
+  >;
+  /** 缓存命中 token 总量；0 可能代表"未上报"而非真实零命中 */
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  /** 缓存命中率（0-1）；null 表示窗口内无缓存用量上报 */
+  cache_hit_rate: number | null;
+  client_stats: Record<string, number>;
+  /** 统计窗口起止；全量统计时两端均为 null */
+  time_range: { start: number | null; end: number | null };
+}
+
+/** 批量统计端点的单条统计（仅 usage/model 列，不含正文） */
+export interface LLMRequestStatsItem {
+  model_name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+}
+
+/** POST /llm/history/stats 响应：id → 统计；未命中的 id 不在映射中 */
+export interface LLMRequestStatsBatch {
+  stats: Record<string, LLMRequestStatsItem>;
+}

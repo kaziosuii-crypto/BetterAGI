@@ -1,0 +1,67 @@
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# User-specific files (MonoDevelop/Xamarin Studio)
+*.userprefs
+
+# Build results
+Build/
+!Build/
+Build/*
+!Build/BetterGenshinImpact.I18nSync/
+!Build/BetterGenshinImpact.I18nSync/**
+!Build/Scripts/
+Build/Scripts/*
+!Build/Scripts/i18n-sync.ps1
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# Mine
+/Tmp/
+
+# AI temporary design docs
+Docs/tmp/*
+!Docs/tmp/README.md
+/packages/
+node_modules/
+github_actions_cache/
+
+*.zip
+
+# Rider（仅跟踪解决方案图标，供其他设备显示；其余保持忽略）
+.idea/*
+!.idea/.idea.BetterGenshinImpact/
+.idea/.idea.BetterGenshinImpact/*
+!.idea/.idea.BetterGenshinImpact/.idea/
+.idea/.idea.BetterGenshinImpact/.idea/*
+!.idea/.idea.BetterGenshinImpact/.idea/icon.svg
+
+__pycache__/
+
+
+# Trae
+.trae/*
+!.trae/rules/
+!.trae/rules/**
+!.trae/skills/
+!.trae/skills/**
+
+# Claude
+.claude/*
+
+# 智能体会话运行时数据
+/User/AgentSessions/
+
+integrations/lumine/bridge_config.json

@@ -1,0 +1,5 @@
+# dsh-betteragi bundle patch.
+# 只插入一个 host 侧入口；插件自身读取 BetterGI 的本地 HTTP 接口。
+- insert:
+    - id: betteragi
+      name: dsh-betteragi

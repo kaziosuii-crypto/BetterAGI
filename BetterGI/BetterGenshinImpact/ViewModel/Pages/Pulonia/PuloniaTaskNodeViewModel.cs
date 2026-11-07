@@ -1,0 +1,422 @@
+using System;
+using System.Collections.ObjectModel;
+using BetterGenshinImpact.Pulonia.Executors;
+using BetterGenshinImpact.Pulonia.Models;
+using BetterGenshinImpact.Pulonia.Services;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+
+namespace BetterGenshinImpact.ViewModel.Pages.Pulonia;
+
+/// <summary>
+/// 包装一个可编辑任务节点，负责树显示属性和节点级编辑命令。
+/// </summary>
+public partial class PuloniaTaskNodeViewModel : ObservableObject
+{
+    /// <summary>
+    /// 节点所属的编辑文档。
+    /// </summary>
+    private readonly PuloniaTaskPlanDocumentViewModel _document;
+
+    /// <summary>
+    /// 当前包装的持久化模型。
+    /// </summary>
+    private readonly PuloniaTask _model;
+
+    /// <summary>
+    /// 父节点；根节点为 null。
+    /// </summary>
+    private PuloniaTaskNodeViewModel? _parent;
+
+    /// <summary>
+    /// 子节点包装集合，与模型 Children 保持相同顺序。
+    /// </summary>
+    public ObservableCollection<PuloniaTaskNodeViewModel> Children { get; } = [];
+
+    /// <summary>
+    /// 持久化节点模型，仅向同一编辑模块开放。
+    /// </summary>
+    internal PuloniaTask Model => _model;
+
+    /// <summary>
+    /// 节点所属的编辑文档。
+    /// </summary>
+    internal PuloniaTaskPlanDocumentViewModel Document => _document;
+
+    /// <summary>
+    /// 父节点；根节点为 null。
+    /// </summary>
+    public PuloniaTaskNodeViewModel? Parent => _parent;
+
+    /// <summary>
+    /// 稳定节点 ID。
+    /// </summary>
+    public string Id => _model.Id;
+
+    /// <summary>
+    /// 持久化任务类型。
+    /// </summary>
+    public string TaskType => _model.TaskType;
+
+    /// <summary>
+    /// 用户可见的任务类型名称。
+    /// </summary>
+    public string TypeDisplayName => _model.Source?.Kind switch
+    {
+        "plan" => "计划引用",
+        "directory" => "目录引用",
+        _ => _model.TaskType switch
+        {
+            "group" => "分组",
+            "pathing" => "地图追踪",
+            "javascript" => "JS 脚本",
+            "keymouse" => "录制回放",
+            "shell" => "Shell",
+            "csharp" => "进程内 C#",
+            _ when PuloniaSoloTaskExecutor.IsSoloTaskType(_model.TaskType) => "独立任务",
+            _ => _model.TaskType
+        }
+    };
+
+    /// <summary>
+    /// 当前节点是否可以从本机内容更新并固定任务使用版本。
+    /// </summary>
+    public bool CanUpdateResourceVersion => _model.TaskType is "pathing" or "javascript" or "keymouse"
+                                            || _model is { TaskType: "group", Source.Kind: "directory" };
+
+    /// <summary>最近读取的磁盘资源版本，仅用于更新提示，不自动写回计划。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasResourceUpdate), nameof(HasResourceNotice), nameof(ResourceUpdateText), nameof(ResourceUpdateToolTip))]
+    private string? _currentResourceVersion;
+
+    /// <summary>最近检查的来源提交，与资源指纹分开记录以防更新期间仅依赖发生变化。</summary>
+    public string? CurrentRepositoryRevision { get; set; }
+
+    /// <summary>任务当前使用资源正文声明的版本号，仅用于界面展示。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ResourceUpdateText), nameof(ResourceUpdateToolTip), nameof(ResourceVersionText))]
+    private string? _approvedDeclaredVersion;
+
+    /// <summary>本机仓库当前资源正文声明的版本号，仅用于界面展示。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ResourceUpdateText), nameof(ResourceUpdateToolTip))]
+    private string? _currentDeclaredVersion;
+
+    /// <summary>资源读取错误；读取失败不能被当成新版本供用户更新。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasResourceNotice), nameof(ResourceUpdateText), nameof(ResourceUpdateToolTip))]
+    private string? _resourceCheckError;
+
+    /// <summary>计划引用中的资源更新数，引用节点也需要可见更新提示。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasResourceUpdate), nameof(HasResourceNotice))]
+    private int _referencedResourceUpdateCount;
+
+    /// <summary>资源版本不同或尚未固定，等待用户更新任务资源。</summary>
+    public bool HasResourceUpdate => ReferencedResourceUpdateCount > 0 || (CanUpdateResourceVersion && CurrentResourceVersion is not null
+        && CurrentResourceVersion != (_model.Source?.Kind == "directory" ? _model.Source.Version : _model.ResourceVersion));
+
+    /// <summary>树名称后是否显示资源更新或读取错误标签。</summary>
+    public bool HasResourceNotice => HasResourceUpdate || ResourceCheckError is not null;
+
+    /// <summary>小标签的状态文本，不以颜色作为唯一提示。</summary>
+    public string ResourceUpdateText => ResourceCheckError is not null
+        ? ResourceCheckError.StartsWith("来源中已移除：", StringComparison.Ordinal) ? "来源中已移除"
+        : _model.Resource is not null || _model.Source?.Resource is not null ? "检查失败" : "资源不可用"
+        : ReferencedResourceUpdateCount > 0 ? $"{ReferencedResourceUpdateCount} 项有更新"
+        : HasDeclaredVersionChange ? $"有更新 {FormatDeclaredVersion(ApprovedDeclaredVersion)} → {FormatDeclaredVersion(CurrentDeclaredVersion)}"
+        : "有更新";
+
+    /// <summary>标签的具体原因，文件更新必须用户确认后才影响新运行。</summary>
+    public string ResourceUpdateToolTip => ResourceCheckError
+        ?? (ReferencedResourceUpdateCount > 0
+            ? $"引用计划中有 {ReferencedResourceUpdateCount} 项任务资源可更新。"
+            : HasDeclaredVersionChange
+                ? $"任务使用版本 {ApprovedDeclaredVersion}，本机仓库版本 {CurrentDeclaredVersion}。可右键更新此任务资源，或在计划卡片上更新整个计划。"
+                : "本机仓库内容与任务使用版本不同；可右键更新此任务资源，或在计划卡片上更新整个计划。");
+
+    /// <summary>声明版本仅在两端都有值且文字不同时显示箭头，不参与更新判断。</summary>
+    private bool HasDeclaredVersionChange => HasResourceUpdate
+        && !string.IsNullOrWhiteSpace(ApprovedDeclaredVersion)
+        && !string.IsNullOrWhiteSpace(CurrentDeclaredVersion)
+        && !string.Equals(ApprovedDeclaredVersion, CurrentDeclaredVersion, StringComparison.Ordinal);
+
+    /// <summary>把仓库声明版本限制为适合任务树标签的长度，完整值仍通过悬停展示。</summary>
+    private static string FormatDeclaredVersion(string? version)
+        => version is { Length: > 14 } ? version[..13] + "…" : version ?? string.Empty;
+
+    /// <summary>
+    /// 当前固定的资源版本摘要。
+    /// </summary>
+    public string ResourceVersionText
+    {
+        get
+        {
+            var version = _model.Source?.Kind == "directory"
+                ? _model.Source.Version
+                : _model.ResourceVersion;
+            if (!string.IsNullOrWhiteSpace(ApprovedDeclaredVersion)) return ApprovedDeclaredVersion;
+            return string.IsNullOrWhiteSpace(version) ? "未固定" : "已固定";
+        }
+    }
+
+    /// <summary>
+    /// 节点名称；失焦提交时作为一次可撤销编辑。
+    /// </summary>
+    public string Name
+    {
+        get => _model.Name;
+        set
+        {
+            if (_model.Name == value)
+                return;
+            _document.ApplyMutation(() => _model.Name = value, this);
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 节点资源定位；允许暂时无效并在保存时统一校验。
+    /// </summary>
+    public string? Path
+    {
+        get => _model.Resource?.ScopeKey ?? _model.Path;
+        set
+        {
+            if (_model.Resource is not null || _model.Path == value)
+                return;
+            // 路径修改后旧路径的检查结果不再有效，等待页面重新检查。
+            CurrentResourceVersion = null;
+            ApprovedDeclaredVersion = null;
+            CurrentDeclaredVersion = null;
+            ResourceCheckError = null;
+            _document.ApplyMutation(() => _model.Path = value, this);
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 资源路径改变后清除旧路径的检查结果，等待页面重新检查。
+    /// </summary>
+    internal void ResetResourceCheck()
+    {
+        CurrentResourceVersion = null;
+        ApprovedDeclaredVersion = null;
+        CurrentDeclaredVersion = null;
+        ResourceCheckError = null;
+    }
+
+    /// <summary>
+    /// 文档一次性提交配置弹窗的修改后，刷新名称、路径、执行次数和启用状态的绑定。
+    /// </summary>
+    internal void NotifySettingsApplied()
+    {
+        OnPropertyChanged(nameof(Name));
+        OnPropertyChanged(nameof(Path));
+        OnPropertyChanged(nameof(RepeatCount));
+        NotifyEffectiveEnabledChangedRecursively();
+    }
+
+    /// <summary>
+    /// 资源版本更新后通知侧栏和命令状态重新读取。
+    /// </summary>
+    internal void NotifyResourceVersionChanged()
+    {
+        OnPropertyChanged(nameof(ResourceVersionText));
+        OnPropertyChanged(nameof(CanUpdateResourceVersion));
+        OnPropertyChanged(nameof(HasResourceUpdate));
+        OnPropertyChanged(nameof(HasResourceNotice));
+        OnPropertyChanged(nameof(ResourceUpdateText));
+        OnPropertyChanged(nameof(ResourceUpdateToolTip));
+    }
+
+    /// <summary>
+    /// 节点自身启用状态；修改父组不会覆盖子节点保存的选择。
+    /// </summary>
+    public bool IsEnabled
+    {
+        get => _model.IsEnabled;
+        set
+        {
+            if (_model.IsEnabled == value)
+                return;
+            _document.ApplyMutation(() => _model.IsEnabled = value, this);
+            OnPropertyChanged();
+            NotifyEffectiveEnabledChangedRecursively();
+        }
+    }
+
+    /// <summary>
+    /// 同时考虑全部父节点后的实际启用状态。
+    /// </summary>
+    public bool IsEffectivelyEnabled => _model.IsEnabled && (_parent?.IsEffectivelyEnabled ?? true);
+
+    /// <summary>
+    /// 节点是否因父级关闭而暂停，不改变自身选择。
+    /// </summary>
+    public bool IsDisabledByParent => _model.IsEnabled && !(_parent?.IsEffectivelyEnabled ?? true);
+
+    /// <summary>
+    /// 树视图展开状态；保存在编辑器界面状态中，不写入计划，也不进入撤销或运行快照。
+    /// </summary>
+    public bool IsExpanded
+    {
+        get => _document.IsNodeExpanded(Id);
+        set
+        {
+            if (IsExpanded == value)
+                return;
+            _document.SetNodeExpanded(Id, value);
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 是否为不可删除、不可拖动的计划根节点。
+    /// </summary>
+    public bool IsRoot => _parent is null;
+
+    /// <summary>
+    /// 当前节点是否是允许配置执行次数的可见分组。
+    /// </summary>
+    public bool CanConfigureRepeat => _model.TaskType == "group" && !IsRoot;
+
+    /// <summary>
+    /// 分组完整执行子任务列表的次数；一次执行不写入冗余持久化字段。
+    /// </summary>
+    public int RepeatCount
+    {
+        get => _model.RepeatCount ?? 1;
+        set
+        {
+            var constrainedValue = System.Math.Clamp(value, 1, PuloniaTaskValidator.MaxTreeNodes);
+            int? storedValue = constrainedValue == 1 ? null : constrainedValue;
+            if (_model.RepeatCount == storedValue)
+                return;
+            _document.ApplyMutation(() => _model.RepeatCount = storedValue, this);
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 是否是具体能力节点。
+    /// </summary>
+    public bool IsLeaf => _model.TaskType != "group";
+
+    /// <summary>
+    /// 是否可以直接接收新子节点。
+    /// </summary>
+    public bool CanAcceptChildren => _model.TaskType == "group" && _model.Source is null;
+
+    /// <summary>
+    /// 当前节点是否包含可批量启用的直接或间接子节点。
+    /// </summary>
+    public bool HasChildren => Children.Count > 0;
+
+    /// <summary>
+    /// 建立节点包装并递归包装已有子节点。
+    /// </summary>
+    internal PuloniaTaskNodeViewModel(PuloniaTaskPlanDocumentViewModel document, PuloniaTask model,
+        PuloniaTaskNodeViewModel? parent)
+    {
+        _document = document;
+        _model = model;
+        _parent = parent;
+        foreach (var child in model.Children)
+            Children.Add(new PuloniaTaskNodeViewModel(document, child, this));
+    }
+
+    /// <summary>
+    /// 更新父节点，仅供移动和恢复树结构时调用。
+    /// </summary>
+    internal void SetParent(PuloniaTaskNodeViewModel? parent)
+    {
+        _parent = parent;
+        OnPropertyChanged(nameof(Parent));
+        OnPropertyChanged(nameof(IsRoot));
+        OnPropertyChanged(nameof(CanConfigureRepeat));
+        NotifyEffectiveEnabledChangedRecursively();
+    }
+
+    /// <summary>
+    /// 通知当前节点和全部后代重新计算继承后的启用状态。
+    /// </summary>
+    internal void NotifyEffectiveEnabledChangedRecursively()
+    {
+        OnPropertyChanged(nameof(IsEnabled));
+        OnPropertyChanged(nameof(IsEffectivelyEnabled));
+        OnPropertyChanged(nameof(IsDisabledByParent));
+        foreach (var child in Children)
+            child.NotifyEffectiveEnabledChangedRecursively();
+    }
+
+    /// <summary>
+    /// 通知界面重新计算当前节点是否还能接收子节点。
+    /// </summary>
+    internal void NotifyCanAcceptChildrenChanged()
+    {
+        OnPropertyChanged(nameof(CanAcceptChildren));
+        OnPropertyChanged(nameof(HasChildren));
+    }
+
+    /// <summary>
+    /// 引用来源变化后刷新由来源种类决定的节点显示和容器能力。
+    /// </summary>
+    internal void NotifySourceChanged()
+    {
+        // 来源类型或目录定位改变后，旧来源的版本和引用计数都不能继续显示。
+        CurrentResourceVersion = null;
+        ApprovedDeclaredVersion = null;
+        CurrentDeclaredVersion = null;
+        ResourceCheckError = null;
+        ReferencedResourceUpdateCount = 0;
+        NotifyResourceVersionChanged();
+        OnPropertyChanged(nameof(TypeDisplayName));
+        OnPropertyChanged(nameof(CanAcceptChildren));
+    }
+
+    /// <summary>
+    /// 通知界面刷新由计划重命名同步修改的根节点名称。
+    /// </summary>
+    internal void NotifyNameChanged()
+    {
+        OnPropertyChanged(nameof(Name));
+    }
+
+    /// <summary>
+    /// 判断指定节点是否位于当前节点的后代中，用于阻止拖拽环路。
+    /// </summary>
+    internal bool ContainsDescendant(PuloniaTaskNodeViewModel candidate)
+    {
+        for (var current = candidate.Parent; current is not null; current = current.Parent)
+        {
+            if (ReferenceEquals(current, this))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 复制当前子树到进程内剪贴板。
+    /// </summary>
+    [RelayCommand]
+    private void Copy() => _document.CopyNode(this);
+
+    /// <summary>
+    /// 删除当前节点；根节点不会执行删除。
+    /// </summary>
+    [RelayCommand]
+    private void Delete() => _document.RemoveNode(this);
+
+    /// <summary>
+    /// 将当前节点设为参数编辑器选中项。
+    /// </summary>
+    [RelayCommand]
+    private void Select() => _document.SelectedNode = this;
+
+    /// <summary>
+    /// 显式启用当前分组的全部后代，与父组自身开关相互独立。
+    /// </summary>
+    [RelayCommand]
+    private void EnableAllChildren() => _document.EnableAllChildren(this);
+}

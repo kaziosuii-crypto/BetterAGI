@@ -1,0 +1,4 @@
+# AutoDL Lumine player server runtime dependency.
+# vLLM and huggingface_hub are installed separately on the AutoDL GPU image:
+#   pip install vllm huggingface_hub
+aiohttp>=3.9

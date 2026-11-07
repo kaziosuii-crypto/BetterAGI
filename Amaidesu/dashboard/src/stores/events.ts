@@ -1,0 +1,184 @@
+import { defineStore } from 'pinia';
+import { ref, shallowRef } from 'vue';
+import { useWebSocketStore } from './websocket';
+import { createWindowedBuffer } from '@/composables/useWindowedBuffer';
+import { eventsApi } from '@/api';
+import { PROTOCOL } from '@/types/events';
+import type { WebSocketMessage, WsMessageType } from '@/types';
+
+const MAX_EVENTS = 1000;
+/** 历史浏览窗口上限（约 2 页）：渲染面积有界，超出沿页进方向裁剪对侧 */
+const MAX_WINDOW_EVENTS = 1000;
+const PAGE_SIZE = 500;
+/** 游标持久化键：记录最后收到的事件 id，刷新/重连后按此补缺口 */
+const CURSOR_KEY = 'amaidesu-events-cursor';
+
+/** 合法游标 id：后端事件 id（uuid4）或数字；合成前缀（stub-/live-）不入游标 */
+const CURSOR_ID_RE = /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** 事件面板条目：在 WebSocketMessage 基础上附加去重 id */
+interface LoggedEvent extends WebSocketMessage {
+  id: string;
+}
+
+/** 合并历史与当前条目：按 id 去重（历史优先）、时间升序、限长保尾 */
+function mergeEvents(history: LoggedEvent[], current: LoggedEvent[]): LoggedEvent[] {
+  const byId = new Map<string, LoggedEvent>();
+  for (const event of [...current, ...history]) {
+    byId.set(event.id, event);
+  }
+  return [...byId.values()].sort((a, b) => a.timestamp_ms - b.timestamp_ms).slice(-MAX_EVENTS);
+}
+
+/**
+ * 后端 events.history 载荷 / REST 回填条目（EventRecord 转储）→ LoggedEvent。
+ * 按最小形状（id/type/timestamp_ms/data）校验，过滤异常条目，替代裸类型断言。
+ */
+function toLoggedEvent(value: unknown): LoggedEvent | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.id !== 'string' || record.id === '') return null;
+  if (typeof record.type !== 'string') return null;
+  if (typeof record.timestamp_ms !== 'number' || !Number.isFinite(record.timestamp_ms)) return null;
+  return {
+    type: record.type as WsMessageType,
+    timestamp_ms: record.timestamp_ms,
+    data: (typeof record.data === 'object' && record.data !== null ? record.data : {}) as Record<
+      string,
+      unknown
+    >,
+    id: record.id,
+  };
+}
+
+/** 未知条目数组 → LoggedEvent 列表（逐条校验，丢弃不合规项） */
+function toLoggedEvents(value: unknown): LoggedEvent[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(toLoggedEvent).filter((event): event is LoggedEvent => event !== null);
+}
+
+function loadCursor(): string {
+  try {
+    return localStorage.getItem(CURSOR_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveCursor(id: string): void {
+  try {
+    localStorage.setItem(CURSOR_KEY, id);
+  } catch {
+    /* 存储不可用时游标退化为会话内有效 */
+  }
+}
+
+export const useEventsStore = defineStore('events', () => {
+  const events = shallowRef<LoggedEvent[]>([]);
+  /** 断线/刷新续传游标（最后收到的事件 id） */
+  const cursor = ref<string>(loadCursor());
+  const backfillDone = ref(false);
+  // 浏览窗口机械（状态 refs + 翻页/跳转/回实时）由共享工厂承载，
+  // 响应字段名归一（has_more → hasOlder 等）与参数组装在 fetchPage 适配层
+  const buffer = createWindowedBuffer<LoggedEvent>({
+    pageSize: PAGE_SIZE,
+    maxWindow: MAX_WINDOW_EVENTS,
+    entryKey: event => event.id,
+    entryTime: event => event.timestamp_ms,
+    liveList: () => events.value,
+    fetchPage: async ({ direction, fromMs }) => {
+      if (direction === 'older') {
+        const response = await eventsApi.list({
+          before_timestamp_ms: fromMs,
+          limit: PAGE_SIZE,
+        });
+        return {
+          items: toLoggedEvents(response.data.events),
+          hasOlder: response.data.has_more,
+          hasNewer: response.data.has_more_newer ?? false,
+        };
+      }
+      const response = await eventsApi.list({ start_ms: fromMs, take: 'oldest', limit: PAGE_SIZE });
+      return {
+        items: toLoggedEvents(response.data.events),
+        hasOlder: response.data.has_more,
+        // 后端未报 has_more_newer 时按页满推断是否还有更新内容
+        hasNewer: response.data.has_more_newer ?? response.data.events.length >= PAGE_SIZE,
+      };
+    },
+  });
+  const windowEvents = buffer.window;
+  const windowHasOlder = buffer.hasOlder;
+  const windowHasNewer = buffer.hasNewer;
+  const windowLoading = buffer.loading;
+
+  /** 断线/刷新续传游标（最后收到的事件 id）；合成条目不入游标 */
+  function advanceCursor(id?: string): void {
+    if (!id || !CURSOR_ID_RE.test(id)) return;
+    cursor.value = id;
+    saveCursor(id);
+  }
+
+  function handleMessage(message: WebSocketMessage) {
+    // 观测流（kind="stream"，如 thinking.delta）不入事件通道——独立缓冲，防污染事件历史与游标
+    if (message.kind === 'stream') return;
+    // 后端初始历史：与当前条目合并（幂等，任意到达顺序，避免替换吞掉已到达的实时事件）
+    if (message.type === PROTOCOL.eventsHistory) {
+      const history = toLoggedEvents(message.data.events);
+      events.value = mergeEvents(history, events.value);
+      return;
+    }
+    // 只有总线事件进事件缓冲：日志通道（kind="log"）与握手帧（kind="transport"）
+    // 在 WS 协议层已被标记，事件页不再消费
+    if (message.kind !== 'event') return;
+    // 常规实时事件：附加去重 id 后合并（限长）；后端已带 id 时直接使用（与历史同源）
+    const id = message.id ?? `live-${crypto.randomUUID()}`;
+    events.value = mergeEvents([], [...events.value, { ...message, id }]);
+    if (message.id) advanceCursor(message.id);
+  }
+
+  useWebSocketStore().subscribe(handleMessage);
+
+  /**
+   * 游标回填：刷新/重连后按游标拉取事件缺口（REST），与 WS 历史合并去重。
+   * 无游标（首次访问）时跳过——WS 连接时的 events.history 已覆盖最近窗口。
+   */
+  async function backfill(): Promise<void> {
+    if (backfillDone.value) return;
+    backfillDone.value = true;
+    // 合成条目不是后端事件，不能当续传游标
+    if (!cursor.value || !CURSOR_ID_RE.test(cursor.value)) return;
+    try {
+      const response = await eventsApi.list({ since_id: cursor.value, limit: MAX_EVENTS });
+      const gap = toLoggedEvents(response.data.events);
+      if (gap.length > 0) {
+        events.value = mergeEvents(gap, events.value);
+        advanceCursor(gap[gap.length - 1]?.id);
+      }
+    } catch {
+      // 回填失败静默：WS events.history 兜底，不阻断页面
+    }
+  }
+
+  function clearEvents() {
+    events.value = [];
+    buffer.exitWindow();
+  }
+
+  // 启动即回填（fire-and-forget）：有游标则补缺口，无游标由 WS events.history 兜底
+
+  return {
+    events,
+    cursor,
+    windowEvents,
+    windowHasOlder,
+    windowHasNewer,
+    windowLoading,
+    clearEvents,
+    backfill,
+    fetchOlder: buffer.fetchOlder,
+    fetchNewer: buffer.fetchNewer,
+    jumpTo: buffer.jumpTo,
+    exitWindow: buffer.exitWindow,
+  };
+});

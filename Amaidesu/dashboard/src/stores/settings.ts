@@ -1,0 +1,282 @@
+/**
+ * Settings 状态管理
+ */
+
+import { defineStore } from 'pinia';
+import { ref, computed } from 'vue';
+import type {
+  ConfigSchemaResponse,
+  ConfigGroupSchema,
+  ConfigUpdateResponse,
+  ConfigFieldSchema,
+  PendingChange,
+} from '@/types/settings';
+import { attributeValidationError } from '@/utils/saveError';
+import api from '@/api';
+
+/**
+ * 按点分路径在树中恢复一个值（不可变：沿途对象浅拷贝，不改传入树）。
+ * value 为 undefined 时删除该叶子（原配置不存在该路径的回滚形态）。
+ */
+export function restoreNestedValue(
+  obj: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): Record<string, unknown> {
+  const keys = key.split('.');
+  const root = { ...obj };
+  let current = root;
+
+  for (let i = 0; i < keys.length - 1; i++) {
+    const k = keys[i];
+    const child = current[k];
+    if (!child || typeof child !== 'object') {
+      current[k] = {};
+    } else {
+      current[k] = { ...(child as Record<string, unknown>) };
+    }
+    current = current[k] as Record<string, unknown>;
+  }
+
+  const leaf = keys[keys.length - 1];
+  if (value === undefined) {
+    delete current[leaf];
+  } else {
+    current[leaf] = value;
+  }
+  return root;
+}
+
+export const useSettingsStore = defineStore('settings', () => {
+  // 状态
+  const schema = ref<ConfigSchemaResponse | null>(null);
+  const currentValues = ref<Record<string, unknown>>({});
+  const originalValues = ref<Record<string, unknown>>({});
+  const pendingChanges = ref<PendingChange[]>([]);
+  const loading = ref(false);
+  const saving = ref(false);
+  const error = ref<string | null>(null);
+  /** 已落盘但需重启才生效（infra 文件热生效除外）；用户「稍后重启」后由横幅常驻提示 */
+  const pendingRestart = ref(false);
+
+  // 计算属性
+  const groups = computed((): ConfigGroupSchema[] => {
+    return schema.value?.groups ?? [];
+  });
+
+  const hasChanges = computed(() => {
+    return pendingChanges.value.length > 0;
+  });
+
+  const changeCount = computed(() => {
+    return pendingChanges.value.length;
+  });
+
+  // 动作
+  async function fetchSchema() {
+    loading.value = true;
+    error.value = null;
+
+    try {
+      const response = await api.get<ConfigSchemaResponse>('/config/schema');
+      schema.value = response.data;
+
+      // 初始化当前值（嵌套结构，递归包含子字段，与 getFieldValue 的点分遍历匹配）
+      const values: Record<string, unknown> = {};
+      for (const group of schema.value.groups) {
+        flattenFields(group.fields, values);
+      }
+      currentValues.value = values;
+      originalValues.value = JSON.parse(JSON.stringify(values));
+    } catch (e) {
+      console.error('Failed to fetch config schema:', e);
+      error.value = '获取配置 Schema 失败';
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  async function saveChanges(): Promise<ConfigUpdateResponse> {
+    if (pendingChanges.value.length === 0) {
+      return { success: true, message: '没有需要保存的变更' };
+    }
+
+    saving.value = true;
+    error.value = null;
+
+    try {
+      // 批量端点原子语义：要么全部成功落盘，要么任一校验失败整批回退（后端保证）。
+      // 失败两种形态：前置校验逐 key 错误 → HTTP 200 + success:false + errors[]；
+      // Schema 校验拒绝 → HTTP 422 + detail 单条中文消息（catch 分支归属 key）。
+      const response = await api.post<{
+        success: boolean;
+        message: string;
+        requires_restart?: boolean;
+        results?: { key: string; success: boolean }[];
+        errors?: { key: string; message: string }[];
+      }>('/config/batch', {
+        changes: pendingChanges.value.map(c => ({ key: c.key, value: c.newValue })),
+      });
+      const data = response.data;
+
+      if (data.success) {
+        for (const change of pendingChanges.value) {
+          setNestedValue(originalValues.value, change.key, change.newValue);
+        }
+        pendingChanges.value = [];
+        const requiresRestart = !!data.requires_restart;
+        pendingRestart.value = requiresRestart;
+        return {
+          success: true,
+          message: data.message || '配置已保存',
+          requires_restart: requiresRestart,
+        };
+      }
+
+      // 失败：保留 pendingChanges 不清空，让用户继续编辑；后端已保证磁盘零写入
+      return {
+        success: false,
+        message: data.message || '保存配置失败',
+        requires_restart: false,
+        errors: data.errors ?? [],
+      };
+    } catch (e) {
+      console.error('Failed to save changes:', e);
+      // Schema 校验拒绝（HTTP 422）：detail 为单条中文消息，归属到待保存变更的 key
+      const axErr = e as { response?: { status?: number; data?: { detail?: string } } };
+      const detail = axErr.response?.data?.detail;
+      if (axErr.response?.status === 422 && typeof detail === 'string') {
+        const errors = attributeValidationError(detail, pendingChanges.value);
+        return {
+          success: false,
+          message: errors[0]?.message ?? detail,
+          requires_restart: false,
+          errors,
+        };
+      }
+      error.value = '保存配置失败';
+      return { success: false, message: '保存配置失败' };
+    } finally {
+      saving.value = false;
+    }
+  }
+
+  function discardChanges() {
+    // 重置当前值为原始值
+    currentValues.value = JSON.parse(JSON.stringify(originalValues.value));
+    pendingChanges.value = [];
+  }
+
+  function updateCurrentValues(values: Record<string, unknown>) {
+    currentValues.value = values;
+  }
+
+  function updatePendingChanges(changes: PendingChange[]) {
+    pendingChanges.value = changes;
+  }
+
+  /** 按点分路径读原始值（路径缺失返回 undefined） */
+  function originalValueAt(key: string): unknown {
+    let current: unknown = originalValues.value;
+    for (const k of key.split('.')) {
+      if (current && typeof current === 'object' && k in current) {
+        current = (current as Record<string, unknown>)[k];
+      } else {
+        return undefined;
+      }
+    }
+    return current;
+  }
+
+  /**
+   * 单字段变更状态机：新值等于原始值时撤销该条记录，否则按 key upsert。
+   * Settings 页的字段编辑统一入口（原两视图各持一份逐字实现）。
+   */
+  function applyFieldChange(field: ConfigFieldSchema, newValue: unknown, oldValue: unknown) {
+    const existingIndex = pendingChanges.value.findIndex(c => c.key === field.key);
+    if (JSON.stringify(newValue) === JSON.stringify(oldValue)) {
+      if (existingIndex >= 0) {
+        const next = [...pendingChanges.value];
+        next.splice(existingIndex, 1);
+        pendingChanges.value = next;
+      }
+      return;
+    }
+    const change: PendingChange = { key: field.key, oldValue, newValue, field };
+    if (existingIndex >= 0) {
+      const next = [...pendingChanges.value];
+      next[existingIndex] = change;
+      pendingChanges.value = next;
+    } else {
+      pendingChanges.value = [...pendingChanges.value, change];
+    }
+  }
+
+  /** 逐项撤销：从待保存清单移除该条，并把当前值恢复为原始值（嵌套路径，沿途浅拷贝） */
+  function revertChange(key: string) {
+    const index = pendingChanges.value.findIndex(c => c.key === key);
+    if (index < 0) return;
+    const next = [...pendingChanges.value];
+    next.splice(index, 1);
+    pendingChanges.value = next;
+    currentValues.value = restoreNestedValue(
+      currentValues.value as Record<string, unknown>,
+      key,
+      originalValueAt(key),
+    );
+  }
+
+  // 辅助函数
+  // 递归展开 fields（含 children），用嵌套结构存入 values
+  function flattenFields(
+    fields: import('@/types/settings').ConfigFieldSchema[],
+    values: Record<string, unknown>,
+  ) {
+    for (const field of fields) {
+      setNestedValue(values, field.key, field.value ?? field.default);
+      if (field.children && field.children.length > 0) {
+        flattenFields(field.children, values);
+      }
+    }
+  }
+
+  function setNestedValue(obj: Record<string, unknown>, key: string, value: unknown) {
+    const keys = key.split('.');
+    let current: Record<string, unknown> = obj;
+
+    for (let i = 0; i < keys.length - 1; i++) {
+      const k = keys[i];
+      if (!current[k] || typeof current[k] !== 'object') {
+        current[k] = {};
+      }
+      current = current[k] as Record<string, unknown>;
+    }
+
+    current[keys[keys.length - 1]] = value;
+  }
+
+  return {
+    // 状态
+    schema,
+    currentValues,
+    originalValues,
+    pendingChanges,
+    loading,
+    saving,
+    error,
+    pendingRestart,
+    // 计算属性
+    groups,
+    hasChanges,
+    changeCount,
+    // 动作
+    fetchSchema,
+    saveChanges,
+    discardChanges,
+    updateCurrentValues,
+    updatePendingChanges,
+    originalValueAt,
+    applyFieldChange,
+    revertChange,
+  };
+});

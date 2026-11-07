@@ -1,0 +1,291 @@
+"""Tools 配置 Schema 定义
+
+定义 ``config/tools.toml`` 的 Pydantic 聚合模型。
+
+段树结构（TOML 视角）::
+
+    # 异步任务基建（执行委派原语：poll/wait 节拍）
+    [tools.tasks]
+    poll_interval_ms = 2000
+    wait_timeout_ms = 1800000
+
+    # 演播室分类
+    [tools.studio.obs]
+    enabled = true
+    config = {...}
+
+    # 视觉基础模块（工具出口：look_at_screen）
+    [tools.vision]
+    enabled = true
+    config = {...}
+
+    # 通用 MCP 外部工具源通道
+    [tools.mcp]
+    enabled = true
+    config.servers = {...}
+
+    # web 分类（联网信息获取；每个提供者 = 一个 enabled 开关）
+    [tools.web.search]
+    enabled = false
+    config = {...}
+
+    # 工具熔断器健康监控
+    [tools.health]
+    enabled = true
+    failure_threshold = 3
+    probe_interval_ms = 30000
+
+设计原则：
+- 工具提供者为「开关单元」：一个 OBS / 一个 MCP server = 一个 enabled 开关。
+  开 = 其全部工具进入可见集；关 = 全部消失。开关控制权归属人类（配置 + Web UI）。
+- 感知已迁出至 ``collectors.toml``（``[collectors]`` 段）；输出已迁出至
+  ``infra.toml``（``[tts]``/``[subtitle]``/``[dashboard.subtitle_widget]`` 等段）；
+  虚拟形象已迁出为独立文件 ``avatar.toml``（``[avatar.platform.*]``）。
+  本文件只承载工具域开关与异步任务基建。
+- 组件字段由具体 Tool Provider 的 ConfigSchema 验证；本文件为聚合容器与元数据。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from pydantic import ConfigDict, Field
+
+from src.modules.config.file_meta import FileMetaConfig
+from src.modules.config.schemas.base import BaseConfig
+from src.modules.vision.look_at_screen import LookAtScreenProvider
+
+
+# ---------------------------------------------------------------------------
+# 工具提供者开关（单一事实源：每个提供者一个开关单元）
+# ---------------------------------------------------------------------------
+
+
+class ToolProviderConfig(BaseConfig):
+    """工具提供者开关基类（提供者级 enabled + config）
+
+    Attributes:
+        enabled: 是否启用该提供者（开 = 其工具全部可见）
+        config: 提供者具体配置。动态键段（studio 分类下的成员）由
+            加载管线按 ``registry.TOOL_PROVIDER_SCHEMAS`` 分发校验与默认值
+            补全（静态命名段如 vision 走 typed 引用，见 VisionProviderConfig）
+    """
+
+    enabled: bool = Field(default=True, title="是否启用", description="是否启用该工具提供者（开=其工具全部可见）")
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        title="提供者配置",
+        description="提供者具体配置（加载期按工具提供者注册表校验与补全默认值）",
+    )
+
+
+class StudioProviderConfig(ToolProviderConfig):
+    """演播室分类的提供者开关（``[tools.studio.obs]`` 等动态段）"""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class VisionProviderConfig(ToolProviderConfig):
+    """视觉基础模块（工具出口 look_at_screen；被调才看，快照型）
+
+    ``config`` 直接复用 ``LookAtScreenProvider.ConfigSchema``——provider
+    包内的 schema 是默认值与字段权威的唯一事实源，配置层只持有引用，
+    保证漂移写回自动补齐 ``monitor_index`` / ``default_region`` /
+    显示器与默认截屏区域等字段。
+
+    段本体走 BaseConfig 默认 forbid：enabled/config 之外的键进冗余
+    报告并随全域硬错拦截（段本体无"任意键"合法用途）。
+    """
+
+    config: LookAtScreenProvider.ConfigSchema = Field(
+        default_factory=LookAtScreenProvider.ConfigSchema,
+        title="视觉配置",
+        description="视觉提供者配置（直接复用 LookAtScreenProvider.ConfigSchema）",
+    )
+
+
+class McpProviderConfig(ToolProviderConfig):
+    """通用 MCP 外部工具源分类（modules/mcp 通道；config.servers 声明 server 连接）。
+
+    该通道只承载**通用** MCP——任何 Agent（主播 / 游戏）都可经 ToolRegistry
+    看到并调用，定位是 Claude Code 风格的全局工具源。Agent 私有 MCP
+    （仅服务于特定 Agent 的工具集，如 minecraft 专属）不走本段，
+    而是写在 agents.toml 各 Agent 自己的段（位置即归属）：``[agents.<name>.mcp]``。
+    装配即声明；调度与基建由全局 ToolRegistry + McpToolProvider 统一承担。
+    段本体走 BaseConfig 默认 forbid（同 VisionProviderConfig）。
+    """
+
+
+class WebProviderConfig(ToolProviderConfig):
+    """web 分类（工具出口 web_search / web_fetch_url；联网信息获取）
+
+    ``[tools.web.search]`` 等动态段：每个提供者 = 一个开关单元，
+    开 = 其全部工具进入可见集。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ToolsTasksConfig(BaseConfig):
+    """异步任务基建配置（``[tools.tasks]`` 段）
+
+    提供执行委派原语的节拍配置：
+    - ``poll_interval_ms``：跟踪循环轮询节拍（毫秒）
+    - ``wait_timeout_ms``：等待任务完成的最长时长（毫秒）
+
+    段定义与运行期消费分离：本任务负责段定义；端到端消费断言随工具线任务合流
+    由其覆盖（本任务交付即定义完成，消费侧硬错残留由工具线在合流日清理）。
+    """
+
+    poll_interval_ms: int = Field(
+        default=2000,
+        ge=100,
+        title="轮询间隔",
+        description="异步任务跟踪循环轮询间隔（毫秒）",
+        json_schema_extra={"x-ui-advanced": True},
+    )
+    wait_timeout_ms: int = Field(
+        default=1_800_000,
+        ge=1000,
+        title="等待超时",
+        description="异步任务最长等待时长（毫秒）",
+        json_schema_extra={"x-ui-advanced": True},
+    )
+
+
+class ToolsHealthConfig(BaseConfig):
+    """工具熔断器健康监控配置（``[tools.health]`` 段）
+
+    控制 ToolRegistry 的连续失败熔断行为与 ToolHealthMonitor 探活节拍：
+    - ``enabled``：是否装配 ToolHealthMonitor（false 时只保留 registry 侧熔断判定，monitor 不启动）
+    - ``failure_threshold``：连续失败次数达阈值即熔断摘除（``<= 0`` 关闭熔断）
+    - ``probe_interval_ms``：monitor 对熔断工具的探活节拍毫秒；同样用作
+      "熔断后最小驻留时长"——monitor 在 dwell 时间未到时不会尝试恢复
+    """
+
+    enabled: bool = Field(
+        default=True,
+        title="是否启用",
+        description="是否启用工具探活循环（关闭后工具连续失败只熔断、不再自动探测恢复）",
+        json_schema_extra={"x-ui-advanced": True},
+    )
+    failure_threshold: int = Field(
+        default=3,
+        title="熔断阈值",
+        description="工具连续失败多少次后停止调用它（0 或负数 = 永不停止）",
+        json_schema_extra={"x-ui-advanced": True},
+    )
+    probe_interval_ms: int = Field(
+        default=30000,
+        gt=0,
+        title="探活间隔",
+        description="熔断后隔多久试一次工具是否恢复（毫秒）；也是熔断后的最短等待时长",
+        json_schema_extra={"x-ui-advanced": True},
+    )
+
+
+# ---------------------------------------------------------------------------
+# [tools] 段聚合
+# ---------------------------------------------------------------------------
+
+
+class ToolsConfig(BaseConfig):
+    """[tools] 段聚合
+
+    包含工具提供者开关（studio/vision/mcp/web）+ 异步任务基建 +
+    工具熔断器配置 + disabled_tools 平铺列表。使用 ``extra="forbid"`` 拒绝未知子段。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 异步任务基建节拍（段定义归本文件；消费侧由工具线任务合流覆盖）
+    tasks: ToolsTasksConfig = Field(
+        default_factory=ToolsTasksConfig,
+        title="异步任务基建",
+        description="异步任务基建节拍（poll_interval_ms / wait_timeout_ms）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+
+    # 工具提供者开关（单一事实源；动态子段：studio.<name> / web.<name>）
+    # 禁 None 政策：段缺省 = 空容器 / 关态实例，全量写出可往返
+    studio: Dict[str, StudioProviderConfig] = Field(
+        default_factory=dict,
+        title="演播室分类",
+        description="演播室分类（obs 等，enabled 控制各演播工具）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+    vision: VisionProviderConfig = Field(
+        default_factory=lambda: VisionProviderConfig(enabled=False),
+        title="视觉模块",
+        description="视觉基础模块（工具出口 look_at_screen；enabled=true 时组合根注入 Pillow 后端；缺省关态）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+    mcp: McpProviderConfig = Field(
+        default_factory=McpProviderConfig,
+        title="MCP 工具源",
+        description="通用 MCP 外部工具源（config.servers 声明连接；enabled=true 时注册其工具）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+    web: Dict[str, WebProviderConfig] = Field(
+        default_factory=dict,
+        title="Web 工具",
+        description="web 分类（联网搜索等，enabled 控制各提供者工具）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+
+    # 工具熔断器健康监控（ToolRegistry 熔断 + ToolHealthMonitor 探活）
+    health: ToolsHealthConfig = Field(
+        default_factory=ToolsHealthConfig,
+        title="健康监控",
+        description="工具熔断器健康监控（连续失败熔断 + 探活恢复）",
+        json_schema_extra={"x-ui-type": "object"},
+    )
+
+    # 停用的工具名列表：工具仍全量注册（工具页可见全集），但默认对 LLM 不可见
+    # 且调用被拒绝；由组合根在装配完成后应用到 ToolRegistry
+    disabled_tools: List[str] = Field(
+        default_factory=list,
+        title="停用工具名单",
+        description="停用的工具名列表（对 LLM 不可见且不可调用，重启后生效）",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 顶层根模型（对应 config/tools.toml）
+# ---------------------------------------------------------------------------
+
+
+class ToolsRootConfig(BaseConfig):
+    """Tools 配置根类
+
+    对应 ``config/tools.toml`` 文件。
+    """
+
+    __file_name__ = "tools.toml"
+    __section_label__ = "工具包"
+
+    meta: FileMetaConfig = Field(default_factory=FileMetaConfig, title="文件元数据", description="文件元数据")
+    tools: ToolsConfig = Field(
+        default_factory=ToolsConfig,
+        title="工具配置",
+        description="[tools] 段聚合（异步任务基建 + 各提供者分类配置 + disabled_tools）",
+    )
+
+
+__all__ = [
+    # 工具提供者开关基类
+    "ToolProviderConfig",
+    # 分类配置
+    "StudioProviderConfig",
+    "VisionProviderConfig",
+    "McpProviderConfig",
+    "WebProviderConfig",
+    # 异步任务基建
+    "ToolsTasksConfig",
+    # 工具熔断器健康监控
+    "ToolsHealthConfig",
+    # 聚合
+    "ToolsConfig",
+    # 顶层根模型
+    "ToolsRootConfig",
+]

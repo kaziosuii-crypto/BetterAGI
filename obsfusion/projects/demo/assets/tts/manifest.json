@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "cues": {
+    "c1": {
+      "file": "c1.wav",
+      "duration": 4.513,
+      "hash": "65453e72250ee1842fa46ff5420792c18be4d02c",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:05:02.335Z",
+      "bytes": 199072
+    },
+    "c2": {
+      "file": "c2.wav",
+      "duration": 5.848,
+      "hash": "b23bccebfd30aae005a55f00600048757dae2c9b",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:06:58.695Z",
+      "bytes": 257932
+    },
+    "c3": {
+      "file": "c3.wav",
+      "duration": 2.934,
+      "hash": "8e6ef5638a46cb18210d5ae4e24bb7d1e48e815b",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:18:29.924Z",
+      "bytes": 129416
+    },
+    "c4": {
+      "file": "c4.wav",
+      "duration": 5.953,
+      "hash": "e03bff217e087553e710654af96280ed82bbfe3a",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:06:59.861Z",
+      "bytes": 262558
+    },
+    "c5": {
+      "file": "c5.wav",
+      "duration": 2.934,
+      "hash": "8e6ef5638a46cb18210d5ae4e24bb7d1e48e815b",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:18:44.046Z",
+      "bytes": 129416
+    },
+    "c6": {
+      "file": "c6.wav",
+      "duration": 6.048,
+      "hash": "7fa186fa52ec7f430c20864f8ed14574b0c356f5",
+      "voice": "Microsoft Huihui Desktop",
+      "at": "2026-11-04T09:07:01.088Z",
+      "bytes": 266748
+    }
+  },
+  "updatedAt": "2026-11-04T09:18:44.047Z"
+}

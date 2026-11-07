@@ -1,0 +1,10 @@
+{
+  "objects": {
+    "SereniteaPotIcon": {
+      "type": "TemplateMatch",
+      "template": "SereniteaPotIcon.png",
+      "roi": "rect(100 * s, 100 * s, 1190 * s, 860 * s)",
+      "draw": true
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "bettergiWs": "ws://127.0.0.1:30648/ws/v1/agent/live",
+  "bettergiToken": "REPLACE_WITH_BETTERGI_AGENT_TOKEN",
+  "lumineWs": "ws://127.0.0.1:8010/ws/player",
+  "lumineToken": "REPLACE_WITH_LUMINE_SERVER_TOKEN",
+  "fps": 5,
+  "record": null,
+  "recordFps": 10,
+  "reconnect": true,
+  "statsIntervalSeconds": 5
+}

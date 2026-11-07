@@ -1,0 +1,121 @@
+"""
+Agent 控制面 Schema
+
+定义 /api/v1/agents 控制面端点的请求与响应数据模型。
+"""
+
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel
+
+
+class AgentSummary(BaseModel):
+    """Agent 列表条目（运行态 + 配置态 enabled 标记）"""
+
+    name: str
+    description: str = ""
+    state: str
+    heartbeat_ms: int
+    is_alive: bool
+    restart_count: int
+    enabled: bool
+
+
+class AgentListResponse(BaseModel):
+    """Agent 列表响应"""
+
+    agents: list[AgentSummary] = []
+
+
+class AgentStateResponse(BaseModel):
+    """单个 Agent 运行状态响应"""
+
+    name: str
+    description: str = ""
+    state: str
+    heartbeat_ms: int
+    is_alive: bool
+    restart_count: int
+
+
+class AgentControlAction(str, Enum):
+    """Agent 框架级控制动作"""
+
+    PAUSE = "pause"
+    RESUME = "resume"
+    SHUTDOWN = "shutdown"
+    RESTART = "restart"
+
+
+class AgentControlRequest(BaseModel):
+    """Agent 控制请求体。
+
+    ``confirm``：shutdown / restart 属高风险动作（停机 / 重建实例），缺省
+    False，缺确认时端点以 400 拒绝；pause / resume 不要求。
+    """
+
+    action: str
+    confirm: bool = False
+
+
+class AgentControlResponse(BaseModel):
+    """Agent 控制响应"""
+
+    success: bool
+    action: str
+    name: str
+    message: str
+    state: Optional[str] = None
+
+
+class AgentPromptRequest(BaseModel):
+    """Agent 递话请求体（运营提醒/插话：纯文本留言，不派新任务）"""
+
+    content: str
+
+
+class AgentPromptResponse(BaseModel):
+    """Agent 递话响应"""
+
+    delivered: bool
+
+
+class AgentCancelTaskResponse(BaseModel):
+    """任务硬取消响应"""
+
+    cancelled: bool
+
+
+class AgentDelegateRequest(BaseModel):
+    """运营直派任务请求体（自然语言指令，派新活有账本）"""
+
+    instruction: str
+
+
+class AgentDelegateResponse(BaseModel):
+    """运营直派受理回执"""
+
+    accepted: bool
+    task_id: str
+    executor: str
+
+
+class MemoTodoItem(BaseModel):
+    """minecraft 待办条目（minecraft_todo 文档元素）"""
+
+    content: str
+    status: str = "pending"
+
+
+class AgentMemoResponse(BaseModel):
+    """Agent 备忘录/待办快照（只读观测；仅 GET，无任何写端点）。
+
+    ``todos`` / ``reports`` 仅 minecraft 目标返回（三元组）；主播只有
+    ``notebook``，两者为 None。
+    """
+
+    name: str
+    notebook: str = ""
+    todos: Optional[List[MemoTodoItem]] = None
+    reports: Optional[List[Dict[str, Any]]] = None

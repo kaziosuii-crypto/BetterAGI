@@ -1,0 +1,47 @@
+{
+  "game_id": "undertale",
+  "rules": [
+    {
+      "section": "interaction",
+      "text": "Pressing Z advances dialogue text and confirms menus. Enter also confirms.",
+      "confidence": 0.95,
+      "source": "learned"
+    },
+    {
+      "section": "interaction",
+      "text": "Dialogue and story text advance only when a confirm key is pressed; waiting forever does nothing.",
+      "confidence": 0.9,
+      "source": "learned"
+    },
+    {
+      "section": "menus",
+      "text": "Up/Down/Left/Right move the selection cursor in menus.",
+      "confidence": 0.85,
+      "source": "learned"
+    },
+    {
+      "section": "general",
+      "text": "Never press Esc in this game. The Esc key is not used here: it does not advance dialogue, does not open the menu and must never appear in the action output. Confirm with Z, go back with Backspace, open the menu with C.",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "general",
+      "text": "The only keys that exist in this game are the ones listed under Common Keys. Never emit Esc, Tab, Caps, Shift, Ctrl, Alt, Delete, Insert, Home, End, Pause, F1-F12, number keys or mouse buttons; if no key is needed, an empty group is correct.",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "menu",
+      "text": "The UNDERTALE title screen shows a large UNDERTALE logo and the line [PRESS Z OR ENTER]. Nothing moves on that screen: walking keys and the mouse do nothing there. Press Z (confirm) once to start the game; only after the intro, when the character stands in a room, do walking keys work.",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "movement",
+      "text": "Movement uses the arrow keys only: Up / Down / Left / Right. The letters W, A, S, D do nothing at all here - pressing W does not walk and does not move the character. To walk up, emit the group Up; to walk down emit Down.",
+      "confidence": 1.0,
+      "source": "manual"
+    }
+  ]
+}

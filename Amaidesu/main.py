@@ -1,0 +1,1590 @@
+"""Amaidesu 应用程序主入口。
+
+架构组合根：
+- LLMManager：统一 LLM 客户端池
+- EventBus：事件分发；启动时挂载事件拦截器
+- CollectorManager：管理 src/modules/collectors/ 下所有 Input Domain 组件
+- AgentManager：管理 src/agents/ 下所有 Agent（包括主播 StreamerAgent）
+- ToolRegistry：管理 src/modules/tools/ 下所有 Output Domain 组件
+- DashboardServer：WebUI（仅作为 observer，不参与决策/执行数据流）
+- LogStreamer + EventHistoryRecorder：日志 + 事件历史
+
+关闭顺序：CollectorManager.stop_all → SimulatorService.stop → AgentManager.stop_all → EventRecorder.stop → StorageLedger.stop → EventBus.cleanup → LLMManager.cleanup
+"""
+
+from __future__ import annotations
+
+import webbrowser
+import argparse
+import asyncio
+import contextlib
+import os
+import signal
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from loguru import logger as loguru_logger
+
+from src.modules.agents.companions import companion_names, register_companions
+from src.modules.agents.deps import AgentDeps
+from src.modules.agents.factory import instantiate_agent
+from src.modules.agents.manager import AgentManager
+from src.modules.avatar.lipsync.assembly import build_lipsync_analyzer
+from src.modules.collectors.factory import instantiate_collector
+from src.modules.collectors.manager import CollectorManager
+from src.modules.config.core_schemas import (
+    AgentSupervisorConfig,
+    DashboardConfig,
+    DiagnosticsConfig,
+    EventHistoryConfig,
+)
+from src.modules.config.service import ConfigService
+from src.modules.config.storage_schemas import ViewerIdentityConfig
+from src.modules.dashboard.server import DashboardServer
+from src.modules.dashboard.stream_preview import StreamPreviewHub
+from src.modules.diagnostics import DiagnosticsWriter, TtsDiagnosticsRecorder
+from src.modules.events import (
+    EventBus,
+    ensure_registry_consistency,
+    list_registered_events,
+    register_core_events,
+)
+from src.modules.events.event_history import EventHistoryService
+from src.modules.events.event_recorder import EventHistoryRecorder
+from src.modules.events.interceptors import (
+    RateLimitInterceptor,
+    SessionStampInterceptor,
+    SimilarFilterInterceptor,
+)
+from src.modules.events.names import CoreEvents
+from src.modules.events.payloads import CoreShutdownPayload, CoreStartupPayload
+from src.modules.llm.engine import LLMManager
+from src.modules.llm.request_history_manager import RequestHistoryManager
+from src.modules.logging import configure_from_config, get_logger
+from src.modules.logging.log_streamer import LogStreamer
+from src.modules.maibot_sync import (
+    HttpStatusSender,
+    LiveStatusReporter,
+    MaiBotSyncConfigSchema,
+    StorageTranscriptSource,
+)
+from src.modules.storage.bootstrap import build_database
+from src.modules.prompts import get_prompt_manager
+from src.modules.session import LiveSessionManager
+from src.modules.simulator import SimulatorService
+from src.modules.storage.database import SQLiteDatabase
+from src.modules.subtitle import build_subtitle_infrastructure
+from src.modules.subtitle.backends import DashboardBackend
+from src.modules.tts import TTSProvider, build_tts_infrastructure, derive_speech_config
+from src.modules.storage.storage_ledger import StorageLedger
+from src.modules.tools import TaskLedger, TaskTracker, ToolHealthMonitor, ToolRegistry
+from src.modules.tools.tasks import resolve_tasks_config
+from src.modules.tools.bootstrap import bind_core_tools
+from src.modules.vision.look_at_screen import LookAtScreenProvider, LlmVisionTextReader
+from src.modules.vision.mss_capture import MssScreenCapture
+from src.modules.utils.windows_dpi import setup_process_dpi_awareness
+
+logger = get_logger("Main")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# Agent 注册元数据：spec_provider（工具来源溯源）与描述，键 = 注册名。
+_AGENT_REGISTRATION_META: Dict[str, Tuple[str, str]] = {
+    "streamer": (
+        "streamer",
+        "直播主播决策主体：聚合弹幕 → Planner 决策 → Replyer 表达",
+    ),
+    "minecraft": ("minecraft", "游戏 AI 玩家代理（Minecraft / MaiCraftMod）"),
+    "text_adv": ("text_adv", "文字冒险游戏 Agent（视觉小说观察与上报）"),
+    "game_2048": ("game_2048", "2048 游戏 Agent（棋局宿主，主播按键驱动，无自动走子）"),
+}
+
+
+# ---------------------------------------------------------------------------
+# 命令行与日志
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="Amaidesu 应用程序")
+    parser.add_argument("--debug", action="store_true", help="启用 DEBUG 级别日志输出")
+    parser.add_argument(
+        "--filter",
+        nargs="+",
+        metavar="MODULE_NAME",
+        help="仅显示指定模块的 INFO/DEBUG 级别日志 (WARNING 及以上级别总是显示)",
+    )
+    parser.add_argument(
+        "--dev-webui",
+        action="store_true",
+        help="启用 WebUI 开发模式：自动启动 Vite 开发服务器（HMR 热更新），浏览器将打开 http://localhost:60315",
+    )
+    parser.add_argument(
+        "--dry",
+        action="store_true",
+        help="dry-run 模式：仅验证配置加载与组件构造（不订阅事件、不启动 LLM 调用）",
+    )
+    return parser.parse_args()
+
+
+def setup_logging_early(args: argparse.Namespace) -> None:
+    """早期日志配置，在导入阶段参与者之前调用。
+
+    使用默认的INFO级别，避免DEBUG日志过早输出。
+    完整的日志配置会在load_config后再次调用。
+    """
+    default_config = {"level": "INFO", "console_level": "INFO"}
+
+    if args.debug:
+        default_config["level"] = "DEBUG"
+        default_config["console_level"] = "DEBUG"
+
+    configure_from_config(default_config)
+
+
+def setup_logging(args: argparse.Namespace, logging_config: Optional[Dict[str, Any]] = None) -> None:
+    """根据命令行参数和配置文件配置日志。
+
+    Args:
+        args: 命令行参数
+        logging_config: 日志配置字典（从 ConfigService.get_section("logging") 获取）
+    """
+    final_config = {}
+
+    if logging_config:
+        final_config.update(logging_config)
+
+    if args.debug:
+        final_config["level"] = "DEBUG"
+        final_config["console_level"] = "DEBUG"
+
+    if args.filter:
+        filtered_modules = set(args.filter)
+
+        def filter_logic(record: Dict[str, Any]) -> bool:
+            if record["level"].no >= loguru_logger.level("WARNING").no:
+                return True
+            module_name = record["extra"].get("module")
+            return bool(module_name and module_name in filtered_modules)
+
+        final_config["filter"] = filter_logic
+
+    configure_from_config(final_config)
+
+    if args.debug:
+        logger.info(f"已启用 DEBUG 日志级别{f'，并激活模块过滤器: {list(args.filter)}' if args.filter else '。'}")
+    elif args.filter:
+        logger.info(f"日志过滤器已激活: {list(args.filter)} (INFO 级别)")
+
+    logger.info("启动 Amaidesu 应用程序...")
+
+
+# ---------------------------------------------------------------------------
+# 配置加载
+# ---------------------------------------------------------------------------
+
+
+def load_config() -> Tuple[ConfigService, Dict[str, Any], bool]:
+    """加载配置，失败时直接退出进程。返回 (config_service, config, was_created)。"""
+    config_service = ConfigService(base_dir=_BASE_DIR)
+    try:
+        config, was_created = config_service.initialize()
+        # 装配清单日志：7 文件树（按 disk 存在性 + 各文件 [meta].version）
+        # ——不仅核对 config dict，也核对磁盘 7 文件齐整性，便于 QA 断言
+        assembly_files = ("agents", "collectors", "tools", "avatar", "model", "storage", "infra")
+        config_dir = os.path.join(_BASE_DIR, "config")
+        disk_present = [name for name in assembly_files if os.path.exists(os.path.join(config_dir, f"{name}.toml"))]
+        logger.info(f"配置装配清单（v2 7-file tree）：磁盘文件 {len(disk_present)}/7 个 → {disk_present}")
+        return config_service, config, was_created
+    except Exception as e:
+        logger.exception(f"配置文件初始化失败: {e}")
+        logger.error("请检查 config/ 目录下的配置文件格式，或删除 config/ 目录重新生成。")
+        sys.exit(1)
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    """验证配置完整性，缺失必要配置时给出明确错误提示。
+
+    配置按 7 文件树划分：
+    agents / collectors / tools / avatar / model / storage / infra。
+    本函数只做"存在性 + 顶层类型"轻量检查；详细字段验证由各 ConfigSchema
+    在组件构造阶段自动完成（fail-fast 由 Pydantic 保证）。
+    """
+    if not isinstance(config, dict):
+        logger.error("配置根对象不是 dict（schema 漂移？）")
+        return
+
+    # infra.toml 段（tts / subtitle / events / interceptors / dashboard / logging / simulator）
+    # 不做硬性存在校验：infra.toml 缺失时各模块自然降级。
+
+    # model.toml 段（顶层无聚合键，llm_providers/llm_models/llm_profiles 散落，不强制）
+    # 不强制报错：model.toml 缺失时 LLM 调用会自然降级为 warning。
+
+    # agents.toml 段
+    agents_cfg = config.get("agents")
+    if not agents_cfg:
+        logger.warning("未检测到 [agents] 配置，Agent 功能将被禁用")
+    elif not isinstance(agents_cfg, dict):
+        logger.warning("[agents] 配置类型异常（期望 dict），Agent 功能将被禁用")
+
+    # tools.toml 段
+    tools_cfg = config.get("tools")
+    if not tools_cfg:
+        logger.warning("未检测到 [tools] 配置，Tool 功能将被禁用")
+    elif not isinstance(tools_cfg, dict):
+        logger.warning("[tools] 配置类型异常（期望 dict），Tool 功能将被禁用")
+
+    # collectors.toml 段（独立顶层 [collectors] 段）
+    collectors_cfg = config.get("collectors")
+    if not collectors_cfg:
+        logger.debug("未检测到 [collectors] 配置，采集器功能关闭")
+    elif not isinstance(collectors_cfg, dict):
+        logger.warning("[collectors] 配置类型异常（期望 dict）")
+
+    # storage.toml 段（顶层 [sqlite]）
+    sqlite_cfg = config.get("sqlite")
+    if not sqlite_cfg:
+        logger.debug("未检测到 [sqlite] 配置，使用默认 db_path")
+
+    # background 段已归位到 [agents.streamer.background]；此处不再单独校验
+
+    logger.info("配置验证通过（v2 6-file tree 存在性 + 类型检查）")
+
+
+def exit_if_config_created(was_created: bool) -> None:
+    """若配置文件为新创建，提示用户并退出。"""
+    if was_created:
+        box = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        logger.warning(box)
+        logger.warning("!! 配置文件已在 config/ 目录下自动生成。                    !!")
+        logger.warning("!! 请编辑 config/ 目录下的 .toml 文件，填写必要配置。       !!")
+        logger.warning("!! 修改完成后，请重新运行程序。                           !!")
+        logger.warning(box)
+        sys.exit(0)
+
+    logger.info("所有必要的配置文件已存在。继续正常启动...")
+
+
+# ---------------------------------------------------------------------------
+# 事件拦截器注册
+# ---------------------------------------------------------------------------
+
+
+def register_event_interceptors(event_bus: EventBus, config: Dict[str, Any], session_manager: Any = None) -> None:
+    """注册输入域事件拦截器。
+
+    - session_stamp：场次归属盖章（业务事件统一注入当前场次主键；框架级必挂）
+    - rate_limit：防刷屏/防突发
+    - similar_filter：相似文本合并
+    - 拦截器返回 ``None`` 即丢弃该事件
+    - 执行顺序由各拦截器的 ``priority`` 决定（净化类 100 先于盖章 200），
+      与此处注册顺序无关
+    """
+    if session_manager is not None:
+        event_bus.add_interceptor(SessionStampInterceptor(session_manager))
+        logger.info("SessionStampInterceptor 已注册（场次归属单点注入）")
+
+    interceptors_config = config.get("interceptors", {}) if isinstance(config, dict) else {}
+    rate_limit_cfg = interceptors_config.get("rate_limit", {}) if isinstance(interceptors_config, dict) else {}
+    if rate_limit_cfg.get("enabled", True):
+        event_bus.add_interceptor(
+            RateLimitInterceptor(
+                global_rate_limit=rate_limit_cfg.get("global_rate_limit", 100),
+                user_rate_limit=rate_limit_cfg.get("user_rate_limit", 10),
+                window_size=rate_limit_cfg.get("window_size", 60),
+            )
+        )
+        logger.info("RateLimitInterceptor 已注册（[interceptors.rate_limit]）")
+
+    similar_cfg = interceptors_config.get("similar_filter", {}) if isinstance(interceptors_config, dict) else {}
+    if similar_cfg.get("enabled", True):
+        event_bus.add_interceptor(
+            SimilarFilterInterceptor(
+                similarity_threshold=similar_cfg.get("similarity_threshold", 0.85),
+                time_window=similar_cfg.get("time_window", 5.0),
+                min_text_length=similar_cfg.get("min_text_length", 3),
+                cross_user_filter=similar_cfg.get("cross_user_filter", True),
+            )
+        )
+        logger.info("SimilarFilterInterceptor 已注册（[interceptors.similar_filter]）")
+
+
+# ---------------------------------------------------------------------------
+# 核心组件构造（组合根）
+# ---------------------------------------------------------------------------
+
+
+async def create_app_components(
+    config: Dict[str, Any],
+    config_service: ConfigService,
+    dev_webui: bool = False,
+    *,
+    simulator_auto_start: bool = True,
+    storage_ledger_auto_start: bool = True,
+    session_manager_auto_start: bool = True,
+    providers_auto_start: bool = True,
+    log_streamer_persist: bool = True,
+    log_streamer_persist_dir: Optional[str] = None,
+) -> Tuple[
+    EventBus,
+    LLMManager,
+    Optional["DashboardServer"],
+    Optional["EventHistoryRecorder"],
+    Optional["CollectorManager"],
+    Optional["AgentManager"],
+    Optional["SimulatorService"],
+    "SQLiteDatabase",
+    Optional["StorageLedger"],
+    "LiveSessionManager",
+    Optional[ToolRegistry],
+    Optional[ToolHealthMonitor],
+    Optional[TaskTracker],
+    Optional[TtsDiagnosticsRecorder],
+    Optional[LiveStatusReporter],
+]:
+    """组合根：构造并连接所有核心组件。
+
+    装配分两段（契约）：
+    - 第 ① 段 构造 + 接线：LLM 为基座，再装存储与记忆、EventBus 与拦截器与
+      场次管理、EventHistoryRecorder + StorageLedger（溯源链收口）、Collector、
+      ToolRegistry L2/L1 接线与审计——所有 ``event_bus.on`` 在此段就位；
+      本段不触发业务运行态（不得发 live.started 之类的边界事件）。
+    - 第 ② 段 启动/触发：``agent_manager.start_all()``（Agent 订阅生效）先行，
+      之后才允许触发类组件启动（SimulatorService.setup：replay 模式开播经
+      open_session 发 live.started），保证边界事件不漏订阅；最后挂
+      DashboardServer 作为 WebUI observer。
+
+    Args:
+        config: 完整配置字典
+        config_service: 配置服务实例
+        dev_webui: 是否启用 WebUI 开发模式
+        simulator_auto_start: 是否允许 SimulatorService 自动启动主循环。
+            ``--dry`` 模式传 False，避免产生 LLM 调用。
+        storage_ledger_auto_start: 是否启动 StorageLedger 订阅。
+            ``--dry`` 模式传 False，避免组合根冒烟时事件被处理（写入数据库）。
+            关闭链（``run_shutdown``）无论如何都会 ``stop()`` 一次，幂等安全。
+        session_manager_auto_start: 是否启动 LiveSessionManager（残留场次收口）。
+            ``--dry`` 模式传 False，避免冒烟写库。
+        log_streamer_persist: LogStreamer 是否落盘 JSONL（logs/webui/）。
+            ``--dry`` 与测试装配传 False，避免向真实 ``logs/webui/`` 写入运行数据。
+        log_streamer_persist_dir: LogStreamer 落盘目录（None 用默认）。
+            集成测试需要验证持久化时指向临时目录，实现与真实数据隔离。
+
+    Returns:
+        (event_bus, llm_service, dashboard_server,
+         event_recorder, collector_manager, agent_manager,
+         simulator_service, database, storage_ledger, session_manager,
+         tool_registry, health_monitor, task_tracker, tts_diagnostics_recorder,
+         maibot_sync_reporter)
+    """
+    # --- 存储（SQLiteDatabase：建表 + 迁移 + 自检）---
+    # 必须先于 LLMManager 构造：LLMManager 需要注入 store 做 llm_usage 落库
+    logger.info("初始化存储（SQLiteDatabase）...")
+    database = await build_database(config)
+    logger.info(f"存储已就绪（db={database.db_path}）")
+
+    # --- EventBus（先于 LLMManager：水位事件经构造器注入引擎）---
+    logger.info("初始化事件总线...")
+    event_bus = EventBus()
+
+    # --- 场次管理（先于 LLMManager：llm_usage 场次归属经构造器注入解析器）---
+
+    # LiveSessionManager：场次唯一事实源（开启/结束/删除/归属解析）。
+    # 启动不自动开新场次；无显式场次期间 ``resolve_pk()`` 返回 None，
+    # 下游 StorageLedger 据此跳过落库。platform 是装配期常量（本项目生产
+    # 平台为 B 站），主播发言行落库与 open_session 未显式指定时经此取值。
+    session_manager = LiveSessionManager(database.sessions, database.chat, event_bus, platform="bilibili")
+    if session_manager_auto_start:
+        await session_manager.start()
+
+    # --- 本地诊断记录落盘（LLM 正文/事件流/TTS 记录 → logs/ 平铺子目录）---
+    diagnostics_cfg_raw = config.get("diagnostics", {}) if isinstance(config, dict) else {}
+    diagnostics_config = (
+        DiagnosticsConfig(**diagnostics_cfg_raw) if isinstance(diagnostics_cfg_raw, dict) else DiagnosticsConfig()
+    )
+    diagnostics_writer: Optional[DiagnosticsWriter] = None
+    if diagnostics_config.enabled:
+        diagnostics_writer = DiagnosticsWriter(retention_days=diagnostics_config.retention_days)
+        diagnostics_writer.start()
+    else:
+        logger.info("[diagnostics].enabled=false，诊断正文不落盘（统计落库不受影响）")
+
+    # --- LLM 服务 ---
+    logger.info("初始化 LLM 服务...")
+    # 场次归属解析器：落库时取当前显式场次主键（无场次 → NULL = 场间消耗）
+    # 请求历史管理器：一份带 llm_repo 的共享实例同时传给引擎（写）与 Dashboard（读）
+    request_history_manager = RequestHistoryManager(llm_repo=database.llm)
+    llm_service = LLMManager(
+        llm_repo=database.llm,
+        live_session_resolver=lambda: session_manager.active_pk,
+        diagnostics_writer=diagnostics_writer,
+        request_history_manager=request_history_manager,
+    )
+    await llm_service.setup(config)
+    logger.info("已创建 LLM 服务实例")
+
+    # --- 上下文组装器配置归位至 [agents.streamer.context]；下游组装路径直接读 cfg.context ---
+    # CoreService 构造走内置默认。
+
+    # --- 启动期不进行任何上下文重新写入（每次启动 = 干净测试环境）---
+    # 跨场次记忆由主播 Agent 的场次回顾 / 观众画像承载，不在组合根做 live_chat 重新写入。
+    # 无显式场次期间消息仅在内存流转，落库路径依据 0 值跳过。
+
+    register_event_interceptors(event_bus, config, session_manager=session_manager)
+    logger.info("事件总线已初始化，事件拦截器已挂载")
+
+    # --- 事件历史（系统级）+ TTS 合成诊断记录 ---
+    event_recorder = await _start_event_recorder(event_bus, config, diagnostics_writer=diagnostics_writer)
+    logger.info("事件历史记录器已启动")
+    tts_diagnostics_recorder: Optional[TtsDiagnosticsRecorder] = None
+    if diagnostics_writer is not None:
+        tts_diagnostics_recorder = TtsDiagnosticsRecorder(event_bus=event_bus, writer=diagnostics_writer)
+        await tts_diagnostics_recorder.start()
+        logger.info("TTS 合成诊断记录已启动")
+
+    # --- StorageLedger（订阅 room.message.# 落业务表）---
+    # storage.toml [viewers]：新出现的观众 ID 按昵称自动关联老观众的时限
+    viewer_identity_config = ViewerIdentityConfig.from_dict(config.get("viewers") or {})
+    storage_ledger: Optional[StorageLedger] = await _start_storage_ledger(
+        event_bus,
+        database,
+        auto_start=storage_ledger_auto_start,
+        session_manager=session_manager,
+        name_match_window_ms=viewer_identity_config.name_match_window_days * 86_400_000,
+    )
+
+    # --- 直播近况与整场记录同步给 MaiBot（[maibot_sync]）---
+    # 第 ① 段只接线订阅：心跳随 live.started 才起，第 ② 段 Agent 启动补写回顾发出的
+    # streamer.recap.written 也能接住（整场记录随回顾一起补推）
+    maibot_sync_reporter = _build_maibot_sync_reporter(event_bus, config, database=database)
+
+    # --- CollectorManager ---
+    # 采集器配置位于 collectors.toml：根键 = enabled 名单 + 各采集器同名子段
+    # （该文件没有 [collectors] 包裹表，拍平视图里取不到"这一个文件的这一段"，
+    #  故按文件名取原始命名空间——用 get_section("collectors") 会拿到空 dict，
+    #  采集器一个都不会装配）
+    collector_manager: Optional["CollectorManager"] = None
+    collectors_config = config_service.get_file_section("collectors")
+    agents_for_companions = config.get("agents", {}) if isinstance(config, dict) else {}
+    if collectors_config or _enabled_agents_with_companions(agents_for_companions):
+        logger.info("初始化 CollectorManager（src/modules/collectors/）...")
+        collector_manager = CollectorManager()
+        await _register_collectors_from_config(
+            collector_manager,
+            collectors_config or {},
+            config_service,
+            event_bus,
+            llm_service=llm_service,
+        )
+        # 启用的 Agent 带的附属采集器（例如 Minecraft 的身体事件流、聊天流）随 Agent 一同装上，
+        # 和通用采集器一起由 start_all 启动；它们不在 collectors.toml 的名单里
+        _register_companion_collectors(collector_manager, agents_for_companions, event_bus)
+        await collector_manager.start_all()
+        logger.info(f"CollectorManager 已启动（{len(collector_manager)} 个 Collector）")
+
+    # --- SimulatorService（开发基础设施；第 ① 段只构造，setup 在第 ② 段）---
+    # 默认 enabled=false 生产零装配；构造需存储仓储（人设/礼物/世界窗口）
+    # + LLMManager（generate 模式）+ EventBus + 场次管理。
+    # setup/启动推迟到第 ② 段（Agent 订阅之后）：replay 模式 start() 经
+    # open_session 发 live.started，属业务运行态触发，第 ① 段不得做。
+    simulator_service: Optional["SimulatorService"] = None
+    simulator_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+    if isinstance(simulator_cfg, dict) and simulator_cfg.get("enabled", False):
+        logger.info("构造 SimulatorService（src/modules/simulator/，启动在第 ② 段）...")
+        simulator_service = SimulatorService(
+            event_bus=event_bus,
+            sim_repo=database.sim,
+            chat_repo=database.chat,
+            services_by_type={type(llm_service): llm_service},
+            session_manager=session_manager,
+        )
+    else:
+        logger.debug("[simulator].enabled=false，零装配 SimulatorService")
+
+    # --- 核心配置预读：TTS 基础设施段 [tts] ---
+    #  AgentManager 注册 StreamerAgent 时需要 speech_config（max_queue /
+    #  render_timeout_ms / enabled），TTS 引擎装配由 build_tts_infrastructure
+    #  按 [tts].provider 选择；两处都消费同一段，提前预读避免重复取值。
+    tts_section = config.get("tts", {}) if isinstance(config, dict) else {}
+    if not isinstance(tts_section, dict):
+        tts_section = {}
+    tts_enabled = bool(tts_section.get("enabled", False))
+    tts_provider = str(tts_section.get("provider", "edge_tts") or "edge_tts")
+    if tts_enabled:
+        logger.info(f"[tts] 基础设施启用：provider='{tts_provider}'（引擎将直接注入 StreamerAgent）")
+    else:
+        logger.info("[tts] 基础设施关闭：TTS 引擎不构造")
+
+    # --- 核心配置预读：字幕基础设施段 [subtitle] ---
+    #  AgentManager 注册 StreamerAgent 时需要 subtitle_service（注入后
+    #  编排层驱动字幕显示）；配置源为 infra.toml [subtitle]。
+    subtitle_section = config.get("subtitle", {}) if isinstance(config, dict) else {}
+    if not isinstance(subtitle_section, dict):
+        subtitle_section = {}
+    logger.info(
+        f"[subtitle] 基础设施段预读完毕（keys={list(subtitle_section.keys()) if subtitle_section else '<空，使用默认>'}）"
+    )
+
+    # 字幕基础设施实例——提到 agents_config 分支之外构建，Dashboard
+    # 也消费同一引用（widget 字幕由 DashboardBackend 桥接），保证
+    # 两处指向同一可变对象。
+    subtitle_service = build_subtitle_infrastructure(subtitle_section)
+
+    # --- AgentManager + StreamerAgent ---
+    agent_manager: Optional["AgentManager"] = None
+    # 无 [agents] 段时不进装配分支，但后续 provider 启动段仍会引用，须预置
+    tool_registry: Optional[ToolRegistry] = None
+    thinking_hub: Optional[StreamPreviewHub] = None
+    # Dashboard 装配段同样引用任务跟踪器与 TTS 引擎：无 [agents] 段时两者都不构造，以 None 交给 Dashboard
+    task_tracker: Optional[TaskTracker] = None
+    tts_engine: Optional[TTSProvider] = None
+    agents_config = config.get("agents", {}) if isinstance(config, dict) else {}
+    if agents_config:
+        logger.info("初始化 AgentManager（src/agents/）...")
+        # 挂载 EventBus：工具调用完成后广播 tool.result.<name>（Dashboard 溯源消费）；
+        # 熔断器连续失败阈值由 [tools.health].failure_threshold 控制（<=0 关闭熔断）
+        tools_health_cfg = (config.get("tools") or {}).get("health", {}) if isinstance(config, dict) else {}
+        if not isinstance(tools_health_cfg, dict):
+            tools_health_cfg = {}
+        # 注意不可用 `or 3` 兜底：会把用户显式配置的 0（关闭熔断）吞成 3
+        failure_threshold = int(tools_health_cfg.get("failure_threshold", 3))
+        tool_registry = ToolRegistry(event_bus=event_bus, failure_threshold=failure_threshold)
+        # Agent 守护（心跳巡检 + 自动重建）：配置来自 [agent_supervisor] 段（infra.toml）
+        supervisor_section = config.get("agent_supervisor", {}) if isinstance(config, dict) else {}
+        if not isinstance(supervisor_section, dict):
+            supervisor_section = {}
+        supervisor_config = AgentSupervisorConfig.from_dict(supervisor_section)
+        # 仓储随构造注入成员：Dashboard 动态启用 Agent 时 enable_agent
+        # 回退到这些成员（与 tool_registry 同一回退模式），
+        # 保证动态启用的 StreamerAgent 与启动装配拿到同一批仓储
+        agent_manager = AgentManager(
+            tool_registry=tool_registry,
+            rundown_repo=database.rundowns,
+            # 流程单持久化两仓储（崩溃恢复 + 变更事实）
+            rundown_instance_repo=database.rundown_instances,
+            rundown_transition_repo=database.rundown_transitions,
+            chat_repo=database.chat,
+            sessions_repo=database.sessions,
+            topic_repo=database.topics,
+            viewer_repo=database.viewers,
+            # 主播记忆两仓储 + 游戏事件查询（场次回顾原料）
+            viewer_profile_repo=database.viewer_profiles,
+            recap_repo=database.recaps,
+            event_repo=database.events,
+            supervisor_config=supervisor_config,
+        )
+
+        # 口型分析器（avatar 共享件，调参 [avatar.lipsync]；拍平后顶层键 lipsync）：
+        # 在 TTS 装配前构造，
+        # 作为音频分接经构造链注入播放器；enabled=False / 配置非法时为 None（不分接）。
+        lipsync_analyzer = build_lipsync_analyzer(config.get("lipsync", {}) if isinstance(config, dict) else {})
+
+        # TTS 引擎实例（基础设施，不经 ToolRegistry）：按 [tts] 段装配；
+        # 失败 / 关闭时返回 None，StreamerAgent 走 TTS 关闭路径。口型分析器经
+        # 构造链注入播放器分接（播放器对所有 sink 调用 fail-soft）；
+        # LLMManager 经签名透传（仅 omni_tts 引擎消费）。
+        tts_engine = build_tts_infrastructure(
+            tts_section, event_bus=event_bus, audio_sink=lipsync_analyzer, llm_service=llm_service
+        )
+
+        # 字幕源择流（装配期取事实，两种模式互斥）：TTS 引擎在位 → 字幕跟随
+        # 播放事件（started/failed 显示、finished 清空），编排层不再派发直出；
+        # 无引擎（禁用或构建失败）→ 保持派发直出（现状路径）。
+        subtitle_follows_playback = tts_engine is not None
+        if subtitle_follows_playback:
+            from src.modules.subtitle.playback_follower import bind_playback_subtitle
+
+            _playback_subtitle_handlers = bind_playback_subtitle(event_bus, subtitle_service, logger)
+            logger.info("字幕源已择流：跟随 TTS 播放事件（tts.utterance.*）")
+        else:
+            logger.info("字幕源已择流：编排层派发直出（无 TTS 引擎）")
+
+        # 思考流旁路 hub（ADR-008；观察面专用）：Agent 装配先于 dashboard 启动，
+        # ws 通道延迟绑定（dashboard 就绪后 attach_ws）；未绑定期间 delta 丢弃。
+        # 配置从 [agents.streamer.thinking_stream] 子段读取（嵌套结构）。
+        _streamer_sub = agents_config.get("streamer", {}) if isinstance(agents_config, dict) else {}
+        _thinking_sub = _streamer_sub.get("thinking_stream", {}) if isinstance(_streamer_sub, dict) else {}
+        thinking_hub = StreamPreviewHub(
+            flush_interval_ms=int(_thinking_sub.get("flush_interval_ms", 100) or 100),
+            buffer_max=int(_thinking_sub.get("buffer_max", 400) or 400),
+        )
+
+        # --- 通用任务基建（[tools.tasks] 段读取，缺省用默认节拍；ADR-013）---
+        # 记录表挂事件总线（task.changed 广播）；跟踪循环与 Agent 生命周期同步启停。
+        _tools_cfg_tmp = (config.get("tools") or {}) if isinstance(config, dict) else {}
+        task_ledger = TaskLedger(event_bus=event_bus)
+        tasks_poll_ms, tasks_wait_ms = resolve_tasks_config(
+            _tools_cfg_tmp if isinstance(_tools_cfg_tmp, dict) else None,
+        )
+        task_tracker = TaskTracker(
+            tool_registry,
+            task_ledger,
+            poll_interval_ms=tasks_poll_ms,
+            wait_timeout_ms=tasks_wait_ms,
+        )
+        task_tracker.start()
+        logger.info(f"任务跟踪循环已启动（poll_interval_ms={tasks_poll_ms}, wait_timeout_ms={tasks_wait_ms}）")
+
+        # speech_config 推导（组合根职责）：兜底与 Schema 默认一致
+        # （render_timeout_ms 防引擎卡死的上限语义；wait_playback* 发言等
+        # 播放的背压语义，0 = 不限时的约定同上）
+        _speech_cfg = derive_speech_config(tts_section)
+        await _register_agents_from_config(
+            agent_manager,
+            agents_config,
+            config_service,
+            deps=AgentDeps(
+                llm_manager=llm_service,
+                prompt_manager=get_prompt_manager(),
+                event_bus=event_bus,
+                tool_registry=tool_registry,
+                thinking_sink=thinking_hub,
+                speech_config=_speech_cfg,
+                tts_engine=tts_engine,
+                # 有 TTS 时字幕走播放事件跟随器，编排层不再直出（互斥择流）
+                subtitle_service=None if subtitle_follows_playback else subtitle_service,
+                session_manager=session_manager,
+                # 仓储四件（对话历史/流程单/场次状态/话题快照的读侧面）；
+                # chat_repo 缺失 = StreamerAgent 历史读取整体短路
+                rundown_repo=database.rundowns,
+                rundown_instance_repo=database.rundown_instances,
+                rundown_transition_repo=database.rundown_transitions,
+                chat_repo=database.chat,
+                sessions_repo=database.sessions,
+                topic_repo=database.topics,
+                viewer_repo=database.viewers,
+                # 主播记忆两仓储 + 游戏事件查询（场次回顾原料）
+                viewer_profile_repo=database.viewer_profiles,
+                recap_repo=database.recaps,
+                event_repo=database.events,
+                # 组合根无独立 context 组装配置来源：显式 None（Planner 走内置默认）
+                context_assembler_config=None,
+                task_tracker=task_tracker,
+                task_ledger=task_ledger,
+            ),
+        )
+
+        # --- 核心域工具（avatar 平台名单 / studio 域开关，L2 Provider）---
+        # 在 agent_manager.start_all() 之前完成 → StreamerAgent._on_start()
+        # 调用 _register_tools() 时 registry 已就绪，可与 L2 工具同台。
+        # 配置：bind_core_tools 读取 [tools] 段的域开关（studio.obs 等）与
+        # avatar.toml 的平台启用名单（[avatar.platform].enabled），名单/开关
+        # 命中才装配该提供者。TTS/字幕装配由核心 [tts]/[subtitle] 段驱动
+        # （见各自 build 入口），不在本段。
+        tools_cfg = (config.get("tools") or {}) if isinstance(config, dict) else {}
+        tools_section = tools_cfg if isinstance(tools_cfg, dict) else {}
+        avatar_platform = (config.get("platform") or {}) if isinstance(config, dict) else {}
+
+        core_report = bind_core_tools(
+            tool_registry,
+            tools_section,
+            event_bus=event_bus,
+            lipsync_analyzer=lipsync_analyzer,
+            avatar_platform=avatar_platform,
+            # 平台自带的字幕显示面（VRChat 头顶聊天框）登记为同一个字幕服务的后端，跟随已选定的字幕源
+            subtitle_service=subtitle_service,
+        )
+        from src.modules.tools.bootstrap import CORE_MEMBER_COUNT
+
+        core_succeeded = sum(1 for c in core_report.values() if c > 0)
+        core_failed = [name for name, count in core_report.items() if count == 0]
+        core_skipped = CORE_MEMBER_COUNT - len(core_report)
+        skipped_note = f"，跳过（未配置）{core_skipped} 个" if core_skipped else ""
+        failed_note = f"，失败包: {core_failed}" if core_failed else ""
+        logger.info(
+            f"核心工具包已绑定: 成功 {core_succeeded}/{len(core_report)}（尝试装配数）"
+            f"{skipped_note}，合计新增 {sum(core_report.values())} 个工具" + failed_note
+        )
+
+        # --- 视觉基础模块工具 look_at_screen（L2 DI：组合根注入 mss 截屏后端）---
+        # bootstrap 明文不接管 DI 工具（见 bootstrap.py 注释），由组合根按 [tools.vision] 开关装配
+        vision_cfg = tools_section.get("vision", {}) if isinstance(tools_section, dict) else {}
+        if isinstance(vision_cfg, dict) and vision_cfg.get("enabled", False):
+            vision_config = vision_cfg.get("config", {}) if isinstance(vision_cfg.get("config"), dict) else {}
+            # 显式 ["*"]：读屏是公共工具（text_adv 的观察循环经 RegistryVisionReader 调用），
+            # 不吃"默认仅主播"的 fail-closed 名单
+            tool_registry.register_provider(
+                LookAtScreenProvider(
+                    config=vision_config,
+                    screen_capture=MssScreenCapture(),
+                    text_reader=LlmVisionTextReader(
+                        llm_manager=llm_service,
+                        prompt_manager=get_prompt_manager(),
+                    ),
+                    llm_manager=llm_service,
+                ),
+                visible_to={"vision_look_at_screen": ["*"]},
+            )
+            logger.info("look_at_screen 已注册（mss 截屏后端 + VLM reader，视觉调用方按需跳过 VLM）")
+
+        # --- 通用 MCP 外部工具源（[tools.mcp] 段驱动；可选能力，失败不阻断启动）---
+        # 必须在 start_all() 之前装配：任何启动阶段查询工具清单的消费方
+        # 需看到已注册的 MCP 工具。配置示例：
+        #   [tools.mcp]  enabled = true
+        #   [tools.mcp.config.servers.my_server]  url = "http://127.0.0.1:8766/mcp"
+        mcp_pack = tools_section.get("mcp", {}) if isinstance(tools_section, dict) else {}
+        if isinstance(mcp_pack, dict) and mcp_pack.get("enabled", False):
+            mcp_cfg = mcp_pack.get("config", {}) if isinstance(mcp_pack.get("config"), dict) else {}
+            try:
+                # 延迟 import：fastmcp 为可选重型依赖（避免启动强制加载）
+                from src.modules.mcp import bind_mcp_tools
+
+                mcp_report = await bind_mcp_tools(tool_registry, mcp_cfg)
+                ok_count = sum(1 for s in mcp_report.values() if s["ok"])
+                server_count = len(mcp_report)
+                logger.info(f"MCP 外部工具源装配完成: 成功 {ok_count}/{server_count} 个 server")
+                for sname, sinfo in mcp_report.items():
+                    if not sinfo["ok"]:
+                        logger.warning(f"MCP server '{sname}' 装配失败: {sinfo['error']}")
+            except Exception as exc:  # noqa: BLE001 - MCP 装配失败不阻断启动
+                logger.warning(f"MCP 外部工具源装配异常（跳过）: {type(exc).__name__}: {exc}")
+        elif isinstance(mcp_pack, dict) and "servers" in (mcp_pack.get("config") or {}):
+            logger.warning("[tools.mcp].enabled=false 但配置了 servers —— MCP 工具未装配")
+
+        agents_enabled = ((config.get("agents") or {}).get("enabled") or []) if isinstance(config, dict) else []
+        if "text_adv" in agents_enabled:
+            # 感知能力装配检查：读屏依赖 vision_look_at_screen 注册，帧采集依赖 mss 可用；
+            # 缺任一环则观察循环与工具的感知都走空快照降级路径
+            if "vision_look_at_screen" not in tool_registry:
+                logger.warning(
+                    "文字冒险 Agent 已启用但感知读屏未装配"
+                    "（vision_look_at_screen 未注册，[tools.vision].enabled=false？）"
+                    "——读屏将走空快照降级路径"
+                )
+            if not MssScreenCapture().list_monitors():
+                logger.warning("文字冒险 Agent 已启用但帧采集未装配（mss 不可用）——帧采集将走空快照降级路径")
+
+        # --- 工具级停用（[tools].disabled_tools 列表；在全部装配完成后应用）---
+        # 停用的工具保留在注册表中（工具页可见全集），但对 LLM 不可见且调用被拒绝
+        disabled_raw = tools_section.get("disabled_tools") if isinstance(tools_section, dict) else []
+        disabled_names = [n for n in disabled_raw if isinstance(n, str)] if isinstance(disabled_raw, list) else []
+        if disabled_names:
+            applied = tool_registry.apply_disabled(disabled_names)
+            logger.info(f"已按 [tools].disabled_tools 停用 {applied} 个工具（重启前配置为唯一事实源）")
+
+        # --- 工具熔断器探活（[tools.health]；装配期启动 monitor，shutdown 关闭）---
+        # monitor 必须先于 agents 启动：agents 已经在跑的情况下熔断工具的恢复不能
+        # 滞后；started=True 后在 [agents] 任何使用 registry 的调用都能看到探活结果。
+        health_monitor: Optional[ToolHealthMonitor] = None
+        if bool(tools_health_cfg.get("enabled", True)):
+            probe_interval_ms = int(tools_health_cfg.get("probe_interval_ms", 30000) or 30000)
+            health_monitor = ToolHealthMonitor(
+                tool_registry,
+                event_bus,
+                probe_interval_ms=probe_interval_ms,
+            )
+            health_monitor.start()
+            logger.info(
+                f"ToolHealthMonitor 已启动（probe_interval_ms={probe_interval_ms}, "
+                f"failure_threshold={failure_threshold}）"
+            )
+        else:
+            logger.info("[tools.health].enabled=false：仅保留 ToolRegistry 熔断判定，跳过探活循环")
+
+        # --- 框架 Agent 控制与委派原语（provider=framework；含 delegate/task_status）---
+        if tool_registry is not None:
+            from src.modules.agents.control import build_agent_control_provider
+
+            framework_provider = build_agent_control_provider(agent_manager, task_ledger, event_bus=event_bus)
+            framework_count = tool_registry.register_provider(framework_provider)
+            logger.info(f"framework 工具已注册（控制+委派，新增 {framework_count} 个）")
+
+        await agent_manager.start_all()
+        # 守护循环在所有 Agent 启动后开启（巡检只看活跃 Agent）
+        agent_manager.start_supervisor()
+        logger.info(f"AgentManager 已启动（{len(agent_manager)} 个 Agent）")
+
+    # --- 装配第 ② 段：启动/触发（进入本段前所有 event_bus.on 已就位）---
+    # 契约：第 ① 段只构造与接线，不改变业务运行态；触发类组件在此段启动，
+    # 保证边界事件（live.started 等）发出时订阅方已就位。
+    # SimulatorService.setup 最后一步是 auto_start：replay 模式开播经
+    # open_session 发 live.started，必须晚于上面 start_all() 的订阅生效。
+    if simulator_service is not None:
+        await simulator_service.setup(
+            config_service,
+            auto_start=simulator_auto_start,
+        )
+        if simulator_service.is_running:
+            logger.info("SimulatorService 已启动（[simulator].enabled=true）")
+        else:
+            logger.info("SimulatorService 已装配（enabled=true 但未启动，见 auto_start）")
+
+    # --- ToolRegistry 工具审计：所有 Agent 声明的工具是否都已注册实现 ---
+    if agent_manager is not None and agent_manager.tool_registry is not None:
+        registry = agent_manager.tool_registry
+        logger.info(f"ToolRegistry 就绪（{len(registry)} 个工具已注册）")
+        missing = agent_manager.audit_tools(registry)
+        if missing:
+            logger.warning(f"审计发现 {len(missing)} 个已声明但缺失实现的工具: {missing}")
+        else:
+            logger.info("工具审计通过：所有 Agent 声明的工具均已在 ToolRegistry 中找到实现")
+
+    # --- Provider 生命周期启动（连接型 Provider 建立外部连接）---
+    # 逐个调用 setup（VTS 建连 + 断线重连循环 + idle 动画等）；MCP 等自管理
+    # 生命周期者由 registry 内部跳过。dry 模式仅构造不启动（与其余
+    # auto_start 参数语义一致）。单 Provider 失败已隔离，不阻断启动。
+    if tool_registry is not None and providers_auto_start:
+        await tool_registry.start_providers()
+
+    # --- DashboardServer ---
+    # LogStreamer 仅在有消费者（Dashboard 日志页）时装配：dashboard 关闭时
+    # 它只剩落盘副作用（无 WS 广播出口），照建不误正是测试污染 logs/webui 的
+    # 入口之一。persist 开关与落盘目录由调用方决定（--dry/测试装配传 False）。
+    dashboard_server: Optional["DashboardServer"] = None
+    log_streamer: Optional[LogStreamer] = None
+    dashboard_config = config.get("dashboard", {}) if isinstance(config, dict) else {}
+    if dashboard_config.get("enabled", True):
+        log_streamer = await _start_log_streamer(
+            persist=log_streamer_persist,
+            persist_dir=log_streamer_persist_dir,
+        )
+        dashboard_server = await _start_dashboard(
+            dashboard_config,
+            dev_webui,
+            event_bus,
+            config_service,
+            collector_manager,
+            agent_manager,
+            llm_service,
+            log_streamer,
+            simulator_service,
+            event_recorder,
+            session_manager,
+            llm_repo=database.llm,
+            rundown_repo=database.rundowns,
+            # 场次复盘聚合/导出的数据源：game_events 计数与 db 快照副本路径
+            event_repo=database.events,
+            storage_db_path=database.db_path,
+            # 复盘总结面板读 session_recaps；流程单执行面板读变更事实行
+            recap_repo=database.recaps,
+            rundown_transition_repo=database.rundown_transitions,
+            # 观众域查询接口：列表 / 档案 / 对话 / 贡献聚合直查存储层
+            viewer_repo=database.viewers,
+            chat_repo=database.chat,
+            # 观众画像仓储：/api/v1/memory/* 管理接口与主播 Agent 共用同一张表
+            viewer_profile_repo=database.viewer_profiles,
+            # 观众身份人工处理：待确认页、合并与取消关联
+            viewer_identity_repo=database.viewer_identity,
+            # 任务卡快照与运营委派的数据源（通用任务基建）
+            task_tracker=task_tracker,
+            # 请求历史管理器：与引擎写入侧同源的共享实例
+            request_history_manager=request_history_manager,
+            # 基础设施直测面：/api/v1/debug/subtitle|tts 端点的数据源
+            subtitle_service=subtitle_service,
+            tts_engine=tts_engine,
+        )
+
+    # Dashboard 字幕后端注册：StreamerAgent 与 Dashboard 共享同一
+    # subtitle_service 引用，新 Backend 注册后 show/clear 自动广播到 widget。
+    # 仅当 [subtitle].backends 显式包含 "dashboard" 时注册——纯 tk_gui
+    # 配置不应拉起 Dashboard 广播链路。
+    if dashboard_server is not None and dashboard_server.widget_service is not None:
+        subtitle_backends = (
+            subtitle_section.get("backends", ["tk_gui"]) if isinstance(subtitle_section, dict) else ["tk_gui"]
+        )
+        if not isinstance(subtitle_backends, list):
+            subtitle_backends = ["tk_gui"]
+        if "dashboard" in subtitle_backends:
+            subtitle_service.register_backend(DashboardBackend(dashboard_server.widget_service))
+            logger.info("DashboardBackend 已注册到 subtitle_service")
+
+    # 思考流旁路 hub 绑定 WS 通道（Agent 装配先于 dashboard 启动，见构造处）
+    if thinking_hub is not None and dashboard_server is not None and dashboard_server.ws_handler is not None:
+        thinking_hub.attach_ws(dashboard_server.ws_handler)
+        logger.info("StreamPreviewHub 已绑定 dashboard WS 通道")
+
+    # --- 组件装配完成 ---
+    return (
+        event_bus,
+        llm_service,
+        dashboard_server,
+        event_recorder,
+        collector_manager,
+        agent_manager,
+        simulator_service,
+        database,
+        storage_ledger,
+        session_manager,
+        tool_registry if agents_config else None,
+        health_monitor if agents_config else None,
+        task_tracker if agents_config else None,
+        tts_diagnostics_recorder,
+        maibot_sync_reporter,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 子启动器（保持 create_app_components 函数短小）
+# ---------------------------------------------------------------------------
+
+
+async def _start_event_recorder(
+    event_bus: EventBus, config: Dict[str, Any], *, diagnostics_writer: Optional[DiagnosticsWriter] = None
+):
+    """启动事件历史记录器（系统级，与 Dashboard 解耦）。"""
+    events_config = config.get("events", {}) if isinstance(config, dict) else {}
+    typed_events_config = EventHistoryConfig(**events_config)
+    try:
+        service = EventHistoryService(max_events=typed_events_config.history_size)
+        recorder = EventHistoryRecorder(
+            event_bus=event_bus, event_history=service, diagnostics_writer=diagnostics_writer
+        )
+        await recorder.start()
+        logger.info(f"事件历史记录器已启动（size={typed_events_config.history_size}）")
+        return recorder
+    except Exception as e:
+        logger.warning(f"事件历史记录器启动失败: {e}")
+        return None
+
+
+async def _start_storage_ledger(
+    event_bus: EventBus,
+    database: SQLiteDatabase,
+    *,
+    auto_start: bool = True,
+    session_manager: Optional["LiveSessionManager"] = None,
+    name_match_window_ms: Optional[int] = None,
+) -> Optional[StorageLedger]:
+    """构造 StorageLedger 并按 ``auto_start`` 决定是否订阅。
+
+    ``--dry`` 模式传 ``auto_start=False`` 仅构造不订阅，避免组合根冒烟
+    时落无关测试数据；``run_shutdown`` 仍然 stop 一次（leader 幂等）。
+
+    ``session_manager`` 注入后，主播发言（``streamer.speech``）与观众明细
+    按其解析的当前场次归属落 ``live_chat`` 等业务表；不注入则按无场次降级
+    跳过（与既有降级风格一致）。``name_match_window_ms`` 是新出现的观众 ID
+    按昵称自动关联老观众的时限，不传取默认值。
+    """
+    try:
+        ledger = StorageLedger(
+            event_bus=event_bus,
+            chat_repo=database.chat,
+            viewer_repo=database.viewers,
+            event_repo=database.events,
+            session_manager=session_manager,
+            name_match_window_ms=name_match_window_ms,
+        )
+        if auto_start:
+            await ledger.start()
+        logger.info(
+            f"StorageLedger 已构造（auto_start={auto_start}；场次归属经 LiveSessionManager 解析；"
+            "订阅 room.message.# → 业务表 + streamer.speech → live_chat.assistant）"
+        )
+        return ledger
+    except Exception as exc:
+        logger.warning(f"StorageLedger 构造/启动失败: {exc}")
+        return None
+
+
+def _build_maibot_sync_reporter(
+    event_bus: EventBus,
+    config: Dict[str, Any],
+    *,
+    database: Optional[SQLiteDatabase] = None,
+) -> Optional[LiveStatusReporter]:
+    """按 ``[maibot_sync]`` 装配直播近况上报器；未启用或缺地址/令牌时不装配。
+
+    ``send_transcript`` 开启且有数据库时，回顾写好后一并从库里读出整场记录推过去。
+    """
+    raw = config.get("maibot_sync", {}) if isinstance(config, dict) else {}
+    sync_config = MaiBotSyncConfigSchema(**raw) if isinstance(raw, dict) else MaiBotSyncConfigSchema()
+    if not sync_config.enabled:
+        logger.debug("[maibot_sync].enabled=false，不向 MaiBot 同步直播近况")
+        return None
+    if not sync_config.url or not sync_config.token:
+        logger.warning("[maibot_sync] 已启用但 url 或 token 未设置，不向 MaiBot 同步直播近况")
+        return None
+    transcript_source: Optional[StorageTranscriptSource] = None
+    if sync_config.send_transcript and database is not None:
+        transcript_source = StorageTranscriptSource(sessions=database.sessions, chat=database.chat)
+    reporter = LiveStatusReporter(
+        event_bus=event_bus,
+        sender=HttpStatusSender(
+            url=sync_config.url,
+            token=sync_config.token,
+            timeout_ms=sync_config.request_timeout_ms,
+        ),
+        heartbeat_interval_ms=sync_config.heartbeat_interval_ms,
+        transcript_source=transcript_source,
+    )
+    reporter.setup()
+    pushed = "开播 / 换环节 / 收播 / 场次回顾" + (" / 整场记录" if transcript_source is not None else "")
+    logger.info(f"直播近况同步已接线：{pushed} → {sync_config.url}")
+    return reporter
+
+
+async def _start_log_streamer(
+    persist: bool = True,
+    persist_dir: Optional[str] = None,
+) -> LogStreamer:
+    """启动 LogStreamer（用于 Dashboard 抓取实时日志）。
+
+    persist=False 不落盘（``--dry``/测试装配传 False，避免向真实 logs/webui/
+    写入运行数据）；persist_dir 透传落盘目录（None 用默认 logs/webui），
+    测试可指向临时目录实现隔离。
+    """
+    streamer = LogStreamer(
+        min_level="DEBUG",
+        persist=persist,
+        persist_dir=persist_dir or LogStreamer.DEFAULT_PERSIST_DIR,
+    )
+    await streamer.start()
+    return streamer
+
+
+async def _register_collectors_from_config(
+    manager,
+    config_section,
+    config_service,
+    event_bus=None,
+    llm_service=None,
+):
+    """根据 [collectors] 段注册 Collector 实例到 CollectorManager。
+
+    段结构（collectors.toml）：
+        enabled = ["bili_danmaku", "console_input", ...]
+        bili_danmaku = { ... }
+        console_input = { ... }
+
+    未在 SUPPORTED_COLLECTORS 中的名称：跳过注册并输出 warning，不抛异常
+    —— 用于支持配置残留段平滑过渡（例如已退役的采集器名留 enabled）。
+    """
+    enabled_list = config_section.get("enabled", []) or []
+    for collector_name in enabled_list:
+        sub_cfg = config_section.get(collector_name, {})
+        if not isinstance(sub_cfg, dict):
+            sub_cfg = {}
+        instance = instantiate_collector(
+            collector_name,
+            sub_cfg,
+            event_bus=event_bus,
+            llm_manager=llm_service,
+        )
+        if instance is None:
+            logger.warning(
+                f"Collector '{collector_name}' 未在 SUPPORTED_COLLECTORS 中注册，已从 enabled 列表跳过。"
+                f"如该采集器已退役，可从 config/collectors.toml 的 enabled 列表移除该名称。"
+            )
+            continue
+        manager.register(instance, description=sub_cfg.get("description", ""))
+
+
+def _enabled_agents_with_companions(agents_config: Dict[str, Any]) -> List[str]:
+    """启用的 Agent 里带附属采集器的那些（按启用名单顺序）。"""
+    enabled = agents_config.get("enabled") if isinstance(agents_config, dict) else None
+    return [name for name in (enabled or []) if isinstance(name, str) and companion_names(name)]
+
+
+def _register_companion_collectors(manager, agents_config: Dict[str, Any], event_bus=None) -> None:
+    """把每个启用的 Agent 的附属采集器登记进 CollectorManager（启动由调用方的 start_all 统一做）。
+
+    附属采集器只对所属 Agent 有意义：Agent 没启用就不装，免得对着连不上的游戏空转重试；
+    配置由 Agent 自己的配置段换算（见 ``src.modules.agents.companions``）。
+    """
+    for agent_name in _enabled_agents_with_companions(agents_config):
+        agent_section = agents_config.get(agent_name)
+        register_companions(
+            manager,
+            agent_name,
+            agent_section if isinstance(agent_section, dict) else {},
+            event_bus=event_bus,
+        )
+
+
+async def _register_agents_from_config(
+    manager,
+    config_section,
+    config_service,
+    deps: "AgentDeps",
+):
+    """根据 [agents] 段注册 Agent 实例到 AgentManager。
+
+    构造本身委托 ``factory.instantiate_agent``（与 Dashboard 动态启用
+    enable_agent 同一构造路径），本函数只负责遍历 enabled 列表并落注册
+    元数据；基础设施依赖经 ``deps``（``AgentDeps`` 值对象）整体透传给
+    工厂——调用方（组合根）负责按启动语义填齐，本函数不改写、不回退。
+
+    [agents] 段结构（扁平：每个 Agent 一份顶级子配置）：
+        enabled = ["streamer", "minecraft", "text_adv"]
+        [agents.streamer]  = { 完整子树（persona / context / background / ...） }
+        [agents.minecraft] = { max_steps = 50, mcp = {...} }
+        [agents.text_adv]  = { monitor_index, region, keys, stability_*, no_change_limit, auto_button_xy, game_window_title_keyword }
+    """
+    enabled_list = config_section.get("enabled", []) or []
+    for agent_name in enabled_list:
+        sub_cfg = config_section.get(agent_name, {})
+        if not isinstance(sub_cfg, dict):
+            sub_cfg = {}
+        meta = _AGENT_REGISTRATION_META.get(agent_name)
+        if meta is None:
+            logger.warning(f"未知的 Agent 类型: {agent_name}（升级 hook 应已过滤 maibot 等）")
+            continue
+        agent = instantiate_agent(agent_name, sub_cfg, deps=deps)
+        if agent is None:
+            logger.warning(f"Agent '{agent_name}' 实例化失败（工厂未返回实例）")
+            continue
+        spec_provider, description = meta
+        manager.register(agent, spec_provider=spec_provider, description=description)
+
+
+async def _start_dashboard(
+    dashboard_config: Dict[str, Any],
+    dev_webui: bool,
+    event_bus: EventBus,
+    config_service: ConfigService,
+    collector_manager: Optional["CollectorManager"] = None,
+    agent_manager: Optional["AgentManager"] = None,
+    llm_service=None,
+    log_streamer=None,
+    simulator_service: Optional["SimulatorService"] = None,
+    event_recorder: Optional["EventHistoryRecorder"] = None,
+    session_manager: Optional["LiveSessionManager"] = None,
+    llm_repo=None,
+    rundown_repo=None,
+    viewer_repo=None,
+    chat_repo=None,
+    viewer_profile_repo=None,
+    viewer_identity_repo=None,
+    event_repo=None,
+    recap_repo=None,
+    rundown_transition_repo=None,
+    storage_db_path=None,
+    task_tracker=None,
+    subtitle_service=None,
+    tts_engine=None,
+    request_history_manager=None,
+):
+    """启动 DashboardServer（仅作为 WebUI observer，不参与决策数据流）。"""
+    try:
+        dashboard_config = dict(dashboard_config)
+        dashboard_config["dev_mode"] = dev_webui
+        typed_dashboard_config = DashboardConfig(**dashboard_config)
+
+        dashboard_server = DashboardServer(
+            event_bus=event_bus,
+            config_service=config_service,
+            dashboard_config=typed_dashboard_config,
+            collector_manager=collector_manager,
+            agent_manager=agent_manager,
+            tool_registry=(agent_manager.tool_registry if agent_manager else None),
+            llm_manager=llm_service,
+            request_history_manager=request_history_manager,
+            prompt_manager=get_prompt_manager(),
+            log_streamer=log_streamer,
+            simulator_service=simulator_service,
+            session_manager=session_manager,
+            llm_repo=llm_repo,
+            # 流程单库仓库：Dashboard 编排页 CRUD 与主播 Agent 共用同一 SQLite 表
+            rundown_repo=rundown_repo,
+            # 观众域仓储：统计表（viewers）与明细三表（live_chat 族）
+            viewer_repo=viewer_repo,
+            chat_repo=chat_repo,
+            # 观众画像仓储：/api/v1/memory/* 管理接口与主播 Agent 共用同一张表
+            viewer_profile_repo=viewer_profile_repo,
+            # 观众身份人工处理：待确认页、合并与取消关联（/api/v1/viewers/pending|merge|keep|unlink）
+            viewer_identity_repo=viewer_identity_repo,
+            # 场次复盘面：game_events 计数仓储与 db 快照路径（/api/v1/review*）
+            event_repo=event_repo,
+            # 复盘总结面板读 session_recaps；流程单执行面板读变更事实行
+            recap_repo=recap_repo,
+            rundown_transition_repo=rundown_transition_repo,
+            storage_db_path=storage_db_path,
+            # 任务跟踪器：任务卡快照（GET /api/v1/tasks）与运营委派的数据源
+            task_tracker=task_tracker,
+            # 字幕服务与 TTS 引擎：/api/v1/debug 直测端点经此驱动真实基础设施
+            subtitle_service=subtitle_service,
+            tts_engine=tts_engine,
+            # 诊断落盘器：场次回看事件侧读 logs/events 诊断流的目录来源
+            # （所有权在 EventHistoryRecorder，这里共享引用）
+            diagnostics_writer=(event_recorder.diagnostics_writer if event_recorder else None),
+            # 事件历史服务所有权在 EventHistoryRecorder，这里共享引用供
+            # REST（/events、/traces）与 WS（events.history 推送）读取
+            event_history=(event_recorder.event_history if event_recorder else None),
+        )
+        await dashboard_server.start()
+        # 端口回退后配置值会偏离实际绑定端口，地址一律取服务器实况
+        logger.info(f"Dashboard 已启动: {dashboard_server.get_url()}")
+        if typed_dashboard_config.auto_open_browser:
+            if typed_dashboard_config.dev_mode:
+                dashboard_url = f"http://localhost:{typed_dashboard_config.vite_dev_port}"
+            else:
+                dashboard_url = dashboard_server.get_url()
+            webbrowser.open(dashboard_url)
+            logger.info(f"已自动打开浏览器: {dashboard_url}")
+        return dashboard_server
+    except ImportError as e:
+        logger.warning(f"Dashboard 模块导入失败（可能缺少依赖）: {e}")
+        logger.warning("Dashboard 功能将被禁用。请运行: uv add fastapi 'uvicorn[standard]'")
+        return None
+    except Exception as e:
+        logger.error(f"Dashboard 启动失败: {e}")
+        logger.warning("Dashboard 功能将被禁用")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 信号与关闭
+# ---------------------------------------------------------------------------
+
+
+def setup_signal_handlers(stop_event: asyncio.Event) -> Tuple[Optional[Any], Optional[Any]]:
+    """注册退出信号处理，返回原始处理器以便恢复。"""
+    shutdown_initiated = False
+
+    def handler(signum=None, frame=None):
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            logger.warning("已经在关闭中，忽略重复信号")
+            return
+        shutdown_initiated = True
+        logger.info("收到退出信号，开始关闭...")
+        stop_event.set()
+
+    original_sigint = signal.signal(signal.SIGINT, handler)
+    try:
+        original_sigterm = signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError):
+        original_sigterm = None
+    # Windows 任务管理器/taskkill 与新进程组投递的是 CTRL_BREAK（SIGBREAK），
+    # 与 SIGINT 同样走优雅关闭，避免外部终止绕过收尾链（不参与恢复——恢复仅测试用）
+    if hasattr(signal, "SIGBREAK"):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGBREAK, handler)
+
+    with contextlib.suppress(Exception):
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.add_signal_handler(sig, handler)
+    return original_sigint, original_sigterm
+
+
+def restore_signal_handlers(original_sigint: Optional[Any], original_sigterm: Optional[Any]) -> None:
+    """恢复原始信号处理器。"""
+    try:
+        signal.signal(signal.SIGINT, original_sigint)
+        if original_sigterm is not None:
+            signal.signal(signal.SIGTERM, original_sigterm)
+        logger.debug("信号处理器已恢复")
+    except Exception as e:
+        logger.debug(f"恢复信号处理器时出错: {e}")
+
+
+async def fallback_close_active_session(session_manager: Optional["LiveSessionManager"]) -> None:
+    """进程退出兜底收工：有进行中场次则复用正常收尾路径补账，无则静默通过。
+
+    ``run_shutdown`` 内的常规结账位于关闭链中段，二次 Ctrl+C 或某个关闭
+    步骤抛异常会把链路打断在结账之前——本兜底挂在 main() 的 finally 位，
+    对同一幂等入口 ``close_session`` 再调一次：正常退出时场次已结账，
+    返回 False 静默通过；异常中断时在此补写 ended_at_ms 并广播 live.ended。
+    自身任何异常只记日志，不得阻断退出。
+    """
+    if session_manager is None:
+        return
+    try:
+        closed = await session_manager.close_session(reason="进程退出兜底收工")
+    except Exception:
+        logger.exception("进程退出兜底收工失败，场次账目待下次启动收口")
+        return
+    if closed:
+        logger.warning("进程退出兜底收工：已补写进行中场次结束时刻并广播 live.ended")
+
+
+async def run_shutdown(
+    event_bus: EventBus,
+    llm_service: LLMManager,
+    dashboard_server: Optional["DashboardServer"],
+    event_recorder: Optional["EventHistoryRecorder"],
+    collector_manager: Optional["CollectorManager"],
+    agent_manager: Optional["AgentManager"],
+    simulator_service: Optional["SimulatorService"],
+    *,
+    database: Optional["SQLiteDatabase"] = None,
+    storage_ledger: Optional["StorageLedger"] = None,
+    session_manager: Optional["LiveSessionManager"] = None,
+    tool_registry: Optional[ToolRegistry] = None,
+    health_monitor: Optional[ToolHealthMonitor] = None,
+    task_tracker: Optional[TaskTracker] = None,
+    tts_diagnostics_recorder: Optional[TtsDiagnosticsRecorder] = None,
+    diagnostics_writer: Optional[DiagnosticsWriter] = None,
+    maibot_sync_reporter: Optional[LiveStatusReporter] = None,
+) -> None:
+    """按依赖关系反向关闭：先停数据生产者 CollectorManager，再停 SimulatorService 与 AgentManager，然后 Dashboard；场次结账在事件历史/总线拆除之前（live.ended 要被记录）；随后事件历史/StorageLedger（必须在 EventBus.cleanup 之前 off，否则 listener 解绑失败），再依次停 ToolHealthMonitor、关闭 MCP stdio 子进程（修停机泄漏），诊断落盘线程冲刷收尾，最后 EventBus/LLMManager 清理，SQLiteDatabase.close 收尾落盘。"""
+    _saw_cancelled = False
+
+    async def safe_log(coro, name: str):
+        nonlocal _saw_cancelled
+        try:
+            return await coro
+        except (Exception, asyncio.CancelledError) as e:
+            _saw_cancelled = _saw_cancelled or isinstance(e, asyncio.CancelledError)
+            # 异常消息可能为空（如 CancelledError），带上类型名与堆栈才有排查上下文
+            logger.error(f"{name} 失败: {type(e).__name__}: {e}", exc=True)
+
+    # 关闭起点广播：趁 EventHistoryRecorder 还在订阅，先落 core.shutdown；
+    # 发出失败只记日志，不得阻断关闭链
+    if event_bus is not None:
+        try:
+            await event_bus.emit(
+                CoreEvents.CORE_SHUTDOWN,
+                CoreShutdownPayload(event=CoreEvents.CORE_SHUTDOWN, message="Amaidesu 正在关闭"),
+                source="Main",
+            )
+        except Exception:
+            logger.warning("core.shutdown 事件发出失败（关闭流程继续）", exc=True)
+
+    if collector_manager is not None:
+        logger.info("正在停止 CollectorManager...")
+        await safe_log(collector_manager.stop_all(), "CollectorManager.stop_all")
+        await safe_log(collector_manager.cleanup_all(), "CollectorManager.cleanup_all")
+        logger.info("CollectorManager 已停止")
+
+    if simulator_service is not None:
+        logger.info("正在停止 SimulatorService...")
+        await safe_log(simulator_service.stop(), "SimulatorService.stop")
+        await safe_log(simulator_service.cleanup(), "SimulatorService.cleanup")
+        logger.info("SimulatorService 已停止")
+
+    if agent_manager is not None:
+        logger.info("正在停止 AgentManager...")
+        await safe_log(agent_manager.stop_supervisor(), "AgentManager.stop_supervisor")
+        await safe_log(agent_manager.stop_all(), "AgentManager.stop_all")
+        await safe_log(agent_manager.cleanup_all(), "AgentManager.cleanup_all")
+        logger.info("AgentManager 已停止")
+
+    if dashboard_server is not None:
+        logger.info("正在停止 Dashboard...")
+        try:
+            await dashboard_server.stop()
+            await dashboard_server.cleanup()
+        except (Exception, asyncio.CancelledError) as e:
+            _saw_cancelled = _saw_cancelled or isinstance(e, asyncio.CancelledError)
+            # 异常消息可能为空（如 CancelledError），带上类型名与堆栈才有排查上下文
+            logger.error(f"Dashboard 停止失败: {type(e).__name__}: {e}", exc=True)
+        logger.info("Dashboard 已停止")
+
+    # 场次结账先于事件历史/总线拆除：close_session 发出的 live.ended 必须
+    # 在事件历史记录器与 EventBus 还活着时广播，否则回看时间线缺下播标记
+    # （进行中场次在进程退出时收口：live.ended 事件 + 结束时间；空场次整行
+    # 丢弃；无显式场次时 close_session 返回 False 静默跳过）。
+    if session_manager is not None:
+        await safe_log(
+            session_manager.close_session(reason="进程退出"),
+            "live_sessions 场次结账",
+        )
+        await safe_log(session_manager.stop(), "LiveSessionManager.stop")
+
+    if event_recorder is not None:
+        logger.info("正在停止事件历史记录器...")
+        await safe_log(event_recorder.stop(), "EventHistoryRecorder")
+        if event_recorder.event_history is not None:
+            try:
+                event_recorder.event_history.cleanup()
+            except Exception as e:
+                logger.debug(f"event_history cleanup: {e}")
+        logger.info("事件历史记录器已停止")
+
+    # TTS 合成诊断记录摘除订阅；诊断落盘线程随后冲刷收尾（正文本体可能
+    # 尚在队列，停机前必须落盘——取证材料不可静默丢失）
+    if tts_diagnostics_recorder is not None:
+        await safe_log(tts_diagnostics_recorder.stop(), "TtsDiagnosticsRecorder")
+    if diagnostics_writer is None and event_recorder is not None:
+        diagnostics_writer = event_recorder.diagnostics_writer
+    if diagnostics_writer is not None:
+        diagnostics_writer.stop()
+        logger.info("诊断记录落盘线程已收工")
+
+    if storage_ledger is not None:
+        logger.info("正在停止 StorageLedger...")
+        await safe_log(storage_ledger.stop(), "StorageLedger")
+        logger.info("StorageLedger 已停止")
+
+    # 工具熔断器探活：先停 monitor 循环（不再触发新的 recover_tool），
+    # 再关闭 MCP stdio 子进程（修停机泄漏——``close_mcp_providers`` 此前
+    # 仅导出未被调用，MCP server 子进程会随 Python 进程一起被强杀）。
+    if task_tracker is not None:
+        await safe_log(task_tracker.stop(), "TaskTracker.stop")
+
+    if health_monitor is not None:
+        logger.info("正在停止 ToolHealthMonitor...")
+        await safe_log(health_monitor.stop(), "ToolHealthMonitor.stop")
+        logger.info("ToolHealthMonitor 已停止")
+
+    if tool_registry is not None:
+        # 先收尾连接型 Provider 生命周期（VTS 等断开外部连接、停后台循环），
+        # 再关闭 MCP stdio 子进程（MCP 自管理生命周期，由下方专责关闭）。
+        logger.info("正在停止工具 Provider 生命周期...")
+        await safe_log(tool_registry.stop_providers(), "ToolRegistry.stop_providers")
+        logger.info("正在关闭 MCP Provider（修停机泄漏）...")
+        # 函数体内 import：fastmcp 为可选重型依赖（避免停机路径强制加载）
+        from src.modules.mcp import close_mcp_providers
+
+        await safe_log(close_mcp_providers(tool_registry), "close_mcp_providers")
+
+    logger.info("等待待处理事件完成并清理 EventBus...")
+    if event_bus is not None:
+        await safe_log(event_bus.cleanup(), "EventBus.cleanup")
+        logger.info("EventBus 已清理")
+
+    # 直播近况上报器放在总线清理之后收尾：进程退出结账发出的 live.ended 由总线
+    # 等到处理完，"已下播"近况才推得出去；之后再退订、停心跳、关连接
+    if maibot_sync_reporter is not None:
+        await safe_log(maibot_sync_reporter.stop(), "LiveStatusReporter.stop")
+
+    logger.info("正在清理 LLMManager...")
+    if llm_service is not None:
+        await safe_log(llm_service.cleanup(), "LLMManager.cleanup")
+    logger.info("核心服务已关闭")
+
+    if database is not None:
+        logger.info("正在关闭 SQLiteDatabase...")
+        await safe_log(database.close(), "SQLiteDatabase.close")
+
+    logger.info("Amaidesu 应用程序已关闭。")
+
+    if _saw_cancelled:
+        raise asyncio.CancelledError()
+
+
+# ---------------------------------------------------------------------------
+# 主入口
+# ---------------------------------------------------------------------------
+
+
+async def main() -> None:
+    """应用程序主入口。"""
+    args = parse_args()
+    setup_logging_early(args)
+    # 须在任何窗口创建前声明 DPI 感知：Tk 只在第一个窗口创建时设置一次，
+    # 之前若已被别的组件定成别的口径，多显示器坐标就会与系统枚举分叉
+    setup_process_dpi_awareness()
+
+    config_service, config, was_created = load_config()
+    logging_config = config_service.get_section("logging", default={})
+    setup_logging(args, logging_config)
+    validate_config(config)
+    exit_if_config_created(was_created)
+
+    # 注册所有 @register_event 装饰器触发的 Payload 模块（必须在 EventBus 构造前）
+    register_core_events()
+    # 启动硬检查：注册集合必须与 CoreEvents 定义一致，契约漂移直接拒启
+    ensure_registry_consistency()
+    logger.info(f"核心事件注册完成，共 {len(list_registered_events())} 个事件")
+
+    (
+        event_bus,
+        llm_service,
+        dashboard_server,
+        event_recorder,
+        collector_manager,
+        agent_manager,
+        simulator_service,
+        database,
+        storage_ledger,
+        session_manager,
+        tool_registry,
+        health_monitor,
+        task_tracker,
+        tts_diagnostics_recorder,
+        maibot_sync_reporter,
+    ) = await create_app_components(
+        config,
+        config_service,
+        dev_webui=args.dev_webui,
+        simulator_auto_start=not args.dry,
+        storage_ledger_auto_start=not args.dry,
+        session_manager_auto_start=not args.dry,
+        providers_auto_start=not args.dry,
+        log_streamer_persist=not args.dry,
+    )
+
+    # 兜底位：以下任一路径异常退出（含关闭链中途被 KeyboardInterrupt 打断）
+    # 都要在 finally 里补一次场次结账；正常退出时 run_shutdown 已结账，兜底幂等静默通过
+    try:
+        # 启动完成广播：此时 EventHistoryRecorder 已就绪，core.startup 会进事件历史
+        await event_bus.emit(
+            CoreEvents.CORE_STARTUP,
+            CoreStartupPayload(event=CoreEvents.CORE_STARTUP, message="Amaidesu 组件装配完成"),
+            source="Main",
+        )
+
+        if args.dry:
+            logger.info("--dry 模式：仅验证组合根构造，组件已构造但不进入主循环")
+            logger.info("（此模式用于快速检查 wiring 是否完整，关闭后退出）")
+            await run_shutdown(
+                event_bus,
+                llm_service,
+                dashboard_server,
+                event_recorder,
+                collector_manager,
+                agent_manager,
+                simulator_service,
+                database=database,
+                storage_ledger=storage_ledger,
+                session_manager=session_manager,
+                tool_registry=tool_registry,
+                health_monitor=health_monitor,
+                task_tracker=task_tracker,
+                tts_diagnostics_recorder=tts_diagnostics_recorder,
+                maibot_sync_reporter=maibot_sync_reporter,
+            )
+            return
+
+        stop_event = asyncio.Event()
+        orig_sigint, orig_sigterm = setup_signal_handlers(stop_event)
+
+        # 事件循环心跳探测：sleep(1) 的唤醒间隔异常拉长，说明循环被同步
+        # 调用冻结（如阻塞式 HTTP/控制台写入），输入丢行类问题由此定位
+        async def event_loop_heartbeat() -> None:
+            last = time.perf_counter()
+            while True:
+                await asyncio.sleep(1)
+                now = time.perf_counter()
+                gap = now - last
+                last = now
+                if gap > 2.5:
+                    logger.warning(f"事件循环心跳间隔 {gap:.1f}s（存在同步阻塞调用冻结循环）")
+
+        heartbeat_task = asyncio.create_task(event_loop_heartbeat(), name="event-loop-heartbeat")
+
+        logger.info("应用程序正在运行。按 Ctrl+C 退出。")
+
+        try:
+            await stop_event.wait()
+            logger.info("收到关闭信号，开始执行清理...")
+        except KeyboardInterrupt:
+            logger.info("检测到 KeyboardInterrupt，开始清理...")
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+        restore_signal_handlers(orig_sigint, orig_sigterm)
+        await run_shutdown(
+            event_bus,
+            llm_service,
+            dashboard_server,
+            event_recorder,
+            collector_manager,
+            agent_manager,
+            simulator_service,
+            database=database,
+            storage_ledger=storage_ledger,
+            session_manager=session_manager,
+            tool_registry=tool_registry,
+            health_monitor=health_monitor,
+            task_tracker=task_tracker,
+            tts_diagnostics_recorder=tts_diagnostics_recorder,
+            maibot_sync_reporter=maibot_sync_reporter,
+        )
+    finally:
+        await fallback_close_active_session(session_manager)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("检测到 KeyboardInterrupt，强制退出。")

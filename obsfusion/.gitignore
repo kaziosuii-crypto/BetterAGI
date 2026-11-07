@@ -1,0 +1,7 @@
+node_modules/
+data/
+*.log
+projects/*/assets/tts/*.wav
+projects/*/media/*.mp4
+.DS_Store
+Thumbs.db

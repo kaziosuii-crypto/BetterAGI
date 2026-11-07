@@ -1,0 +1,197 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using BetterGenshinImpact.Core.Input;
+using BetterGenshinImpact.Core.Recognition;
+using BetterGenshinImpact.GameTask.AutoGeniusInvokation.Exception;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Model.Area;
+using BetterGenshinImpact.GameTask.Runtime;
+using Microsoft.Extensions.Logging;
+using OpenCvSharp;
+
+namespace BetterGenshinImpact.Core.BgiVision;
+
+public class BvPage
+{
+    private static readonly ILogger Logger = App.GetLogger<BvPage>();
+    private readonly CancellationToken _cancellationToken;
+
+    /// <summary>
+    /// 本页面绑定的运行环境，截图、等待与点击都作用在它上面
+    /// </summary>
+    private readonly GameRuntime _runtime;
+
+    /// <summary>
+    /// 本页面绑定的运行环境（供 BvFlow 等同目录组件使用）
+    /// </summary>
+    internal GameRuntime Runtime => _runtime;
+
+    public IKeyboardInput Keyboard => InputHub.Foreground.Keyboard;
+
+    public IMouseInput Mouse => InputHub.Foreground.Mouse;
+
+    /// <summary>
+    /// Default timeout for operations in milliseconds
+    /// </summary>
+    public int DefaultTimeout { get; set; } = 10000;
+
+    /// <summary>
+    /// Default retry interval in milliseconds
+    /// </summary>
+    public int DefaultRetryInterval { get; set; } = 1000;
+
+    /// <summary>
+    /// 创建绑定到指定运行环境的页面对象
+    /// </summary>
+    /// <param name="runtime">运行环境</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    public BvPage(GameRuntime runtime, CancellationToken cancellationToken = default)
+    {
+        _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
+        _cancellationToken = cancellationToken;
+    }
+
+    public BvFlow Flow()
+    {
+        return new BvFlow(this, DefaultTimeout, DefaultRetryInterval);
+    }
+
+    /// <summary>
+    /// 截图
+    /// </summary>
+    /// <returns></returns>
+    public ImageRegion Screenshot()
+    {
+        return _runtime.CaptureToRectArea();
+    }
+
+    /// <summary>
+    /// 等待
+    /// </summary>
+    /// <param name="milliseconds"></param>
+    /// <returns></returns>
+    public async Task<BvPage> Wait(int milliseconds)
+    {
+        await _runtime.Delay(milliseconds, _cancellationToken);
+        return this;
+    }
+
+    internal void ThrowIfCancellationRequested()
+    {
+        if (_cancellationToken.IsCancellationRequested)
+        {
+            throw new NormalEndException("取消自动任务");
+        }
+    }
+
+    /// <summary>
+    /// 定位图片位置
+    /// </summary>
+    /// <param name="image"></param>
+    /// <returns></returns>
+    public BvLocator Locator(BvImage image)
+    {
+        return new BvLocator(_runtime, image.ToRecognitionObject(), _cancellationToken);
+    }
+
+    /// <summary>
+    /// 定位文本位置
+    /// </summary>
+    /// <param name="text"></param>
+    /// <param name="rect"></param>
+    /// <returns></returns>
+    public BvLocator Locator(string text, Rect rect = default)
+    {
+        return Locator(new RecognitionObject
+        {
+            RecognitionType = RecognitionTypes.Ocr,
+            RegionOfInterest = rect,
+            Text = text
+        });
+    }
+
+
+    /// <summary>
+    /// 定位 RecognitionObject 代表的位置
+    /// </summary>
+    /// <param name="ro"></param>
+    /// <returns></returns>
+    public BvLocator Locator(RecognitionObject ro)
+    {
+        return new BvLocator(_runtime, ro, _cancellationToken);
+    }
+
+    public BvLocator GetByText(string text = "", Rect rect = default)
+    {
+        return Locator(text, rect);
+    }
+
+    public BvLocator GetByAnyText(object texts, Rect rect = default)
+    {
+        var matchTexts = ParseCollection<string>(texts, nameof(texts));
+        if (matchTexts.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new ArgumentException("候选文本不能包含空字符串或纯空白字符串", nameof(texts));
+        }
+
+        matchTexts = matchTexts.Distinct(StringComparer.Ordinal).ToList();
+        return new BvLocator(_runtime, new RecognitionObject
+        {
+            RecognitionType = RecognitionTypes.Ocr,
+            RegionOfInterest = rect
+        }, _cancellationToken, matchTexts);
+    }
+
+    public BvLocator GetByImage(BvImage image)
+    {
+        return Locator(image);
+    }
+
+
+    public List<Region> Ocr(Rect rect = default)
+    {
+        return Locator(string.Empty, rect).FindAll();
+    }
+
+
+    /// <summary>
+    /// 1080P 分辨率下点击坐标
+    /// </summary>
+    /// <param name="x"></param>
+    /// <param name="y"></param>
+    public void Click(double x, double y)
+    {
+        _runtime.GameRegion1080PPosClick(x, y);
+    }
+
+    internal static List<T> ParseCollection<T>(object values, string paramName)
+    {
+        ArgumentNullException.ThrowIfNull(values, paramName);
+        if (values is string || values is not IEnumerable enumerable)
+        {
+            throw new ArgumentException($"{paramName} 必须是集合或 JS Array", paramName);
+        }
+
+        List<T> result = [];
+        foreach (var value in enumerable)
+        {
+            if (value is not T typedValue)
+            {
+                throw new ArgumentException($"{paramName} 中的每个元素都必须是 {typeof(T).Name}", paramName);
+            }
+
+            result.Add(typedValue);
+        }
+
+        if (result.Count == 0)
+        {
+            throw new ArgumentException($"{paramName} 不能为空", paramName);
+        }
+
+        return result;
+    }
+}

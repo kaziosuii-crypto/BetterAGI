@@ -1,0 +1,143 @@
+# ====================================================================
+# BetterAGI .gitignore
+# 严密过滤：密钥凭据、超大模型权重、虚拟环境、编译产物与运行时临时缓存
+# ====================================================================
+
+# 1. 密钥、Token 与敏感凭据 (STRICT SECURITY - DO NOT COMMIT)
+.secrets/
+keys/
+*.pem
+*.key
+*.pfx
+*.crt
+*.keystore
+*_token.txt
+*_key.txt
+*.token
+tools/*_token.txt
+tools/*_key.txt
+.env
+.env.*
+!.env.example
+!*.example.json
+BetterGI/integrations/lumine/director_config.json
+BetterGI/integrations/lumine/bridge_config.json
+
+# 2. 虚拟环境、运行时环境与第三方依赖
+.venv/
+*/.venv/
+venv/
+*/venv/
+venv*/
+*/venv*/
+.dotnet/
+*/.dotnet/
+tools/sshvenv/
+node_modules/
+packages/
+
+# 3. 超大模型权重、离线轮子与二进制数据集 (HEAVY BINARIES)
+model.7z
+cosyvoice/model/
+openviking/models/
+openviking/data/
+svc/models/
+svc/wheels/
+Live2DModel/*.7z
+Live2DModel/*.zip
+Live2DModel/**/*.png
+Live2DModel/*.png
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.engine
+*.h5
+*.pkl
+*.joblib
+*.whl
+
+# 3.1 测试套件产生的大体积测试资产与测试工程
+BetterGI/Test/
+BetterGI/tests/
+BetterGI/integrations/tests/fixtures/
+
+
+# 4. 构建与编译生成物
+bin/
+obj/
+*/bin/
+*/obj/
+dist/
+build/
+out/
+*.exe
+*.dll
+*.pdb
+*.so
+*.dylib
+*.lib
+*.obj
+*.idb
+
+# 5. 压缩包与打包归档
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+archive/
+
+# 5.1 录制产物、媒体录像与生成的音频流
+sessions/
+*/sessions/
+tools/pipeline_smoke/sessions/
+*.wav
+*.mp3
+*.m4a
+!demo/**
+
+# 6. 缓存与运行期日志
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*/.pytest_cache/
+.ruff_cache/
+*/.ruff_cache/
+.mypy_cache/
+*/.mypy_cache/
+.coverage
+htmlcov/
+*.log
+logs/
+*/logs/
+*.log.*
+*.out
+*.err
+
+# 7. 历史与诊断临时目录
+_*
+_*/
+.git_upstream/
+*/.git_upstream/
+%SystemDrive%/
+
+# 8. IDE 与操作系统生成文件
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+.vscode/
+*.swp
+*~

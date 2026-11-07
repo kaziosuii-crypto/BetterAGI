@@ -1,0 +1,41 @@
+{
+  "game_id": "genshin-impact",
+  "rules": [
+    {
+      "section": "view",
+      "text": "第三人称越肩视角；角色始终在画面中央偏下。右上角小地图显示任务指引方向。",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "goal",
+      "text": "主线/支线任务：屏幕左侧跟踪任务目标，小地图上以金色感叹号或菱形标记目标点。",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "combat",
+      "text": "战斗中敌人头顶显示血量条；元素反应（火/水/雷/冰/风/岩/草）会产生额外伤害。",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "interact",
+      "text": "靠近可交互物体时，画面中会出现对应的按键提示（多数为 F）。看到提示再按，不要盲按。",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "menu",
+      "text": "对话/菜单/加载界面出现时，角色不可移动；此时按键只对 UI 生效，必须先看清在哪一层。",
+      "confidence": 1.0,
+      "source": "manual"
+    },
+    {
+      "section": "stamina",
+      "text": "冲刺、攀爬、游泳、滑翔消耗体力；体力环位于角色右侧，耗尽会掉落或溺水。",
+      "confidence": 1.0,
+      "source": "manual"
+    }
+  ]
+}

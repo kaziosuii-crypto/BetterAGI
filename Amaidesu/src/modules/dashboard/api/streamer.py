@@ -1,0 +1,242 @@
+"""Streamer 测试台 API（主播发言调试）
+
+提供主播 Agent 手动触发与状态观测端点，服务于直播控制台「主播决策测试」：
+
+- ``GET  /api/v1/streamer/status``         主播 Agent 状态 + 运行统计 + 配置摘要
+- ``POST /api/v1/streamer/test-decision``  手动驱动一次两阶段决策（Planner → Replyer）
+- ``POST /api/v1/streamer/trigger-proactive`` 真实限流链路的外部主动发言触发
+
+数据来源与边界
+--------------
+- 运行时态 → :class:`StreamerAgent` 公开门面（``debug_test_decision`` /
+  ``trigger_external_proactive`` / ``get_statistics``），不触碰 Agent 私有属性。
+- 配置只读展示 → ``server.config_service.main_config["agents"]["streamer"]``，
+  与流程单编排页 API 的读取方式一致。
+- ``test-decision`` 为同步长请求（两段 LLM，典型 10~30s）；仅限开发调试面使用。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Annotated, Any, Dict, Optional, Protocol, cast
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from src.modules.dashboard.api.common import resolve_streamer_agent
+from src.modules.dashboard.dependencies import get_dashboard_server
+from src.modules.dashboard.schemas.streamer import (
+    ProactiveToggleRequest,
+    ProactiveToggleResponse,
+    StreamerStatusResponse,
+    StreamerTestDecisionRequest,
+    StreamerTestDecisionResponse,
+    TriggerProactiveRequest,
+    TriggerProactiveResponse,
+)
+from src.modules.dashboard.services.config_adapter import apply_config_updates
+from src.modules.dashboard.utils.component_helper import config_dir as resolve_config_dir
+from src.modules.logging import get_logger
+
+if TYPE_CHECKING:
+    from src.modules.dashboard.server import DashboardServer
+
+
+router = APIRouter()
+logger = get_logger("StreamerAPI")
+
+ServerDep = Annotated["DashboardServer", Depends(get_dashboard_server)]
+
+
+class _DebugTestDecisionCallable(Protocol):
+    """StreamerAgent.debug_test_decision 的鸭子接口。
+
+    Dashboard 只依赖这一最小契约；agent_manager 返回的实例满足该契约即可被消费，
+    不强制继承 StreamerAgent（与流程单编排页 API 的门面依赖模式一致）。
+    """
+
+    async def __call__(
+        self,
+        *,
+        batch: Optional[list] = None,
+        forced: bool = False,
+        proactive: bool = False,
+    ) -> Dict[str, Any]: ...
+
+
+def _read_streamer_config(server: "DashboardServer") -> Dict[str, Any]:
+    """从 main_config 读 agents.streamer 关键字段；缺字段用默认值。
+
+    字段从嵌套子段读取：[agents.streamer.proactive].enabled、
+    [agents.streamer.batch].batch_window_ms 等。planner/replyer LLM profile
+    现已是消费端硬编码用途名（"planner"/"replyer"/"summary"），不再透出。
+    """
+    main_config = server.config_service.main_config if server.config_service else {}
+    streamer_cfg = ((main_config or {}).get("agents") or {}).get("streamer") or {}
+    proactive_cfg = streamer_cfg.get("proactive") if isinstance(streamer_cfg, dict) else {}
+    batch_cfg = streamer_cfg.get("batch") if isinstance(streamer_cfg, dict) else {}
+    return {
+        "proactive_enabled": bool(
+            (proactive_cfg or {}).get("enabled", True) if isinstance(proactive_cfg, dict) else True
+        ),
+        "rundown_id": str(streamer_cfg.get("rundown_id", "") or ""),
+        "batch_window_ms": int((batch_cfg or {}).get("batch_window_ms", 3000) if isinstance(batch_cfg, dict) else 3000),
+    }
+
+
+@router.get("/status", response_model=StreamerStatusResponse)
+async def get_streamer_status(server: ServerDep) -> StreamerStatusResponse:
+    """主播 Agent 状态（降级安全：未注册返回 available=false，不抛 404）。"""
+    agent = resolve_streamer_agent(server)
+    if agent is None:
+        return StreamerStatusResponse(
+            available=False,
+            message="主播 Agent 未启用（请在 agents.toml 的 [agents].enabled 启用 streamer）",
+        )
+    try:
+        statistics = dict(agent.get_statistics())
+    except Exception as exc:
+        logger.warning(f"读取 streamer statistics 失败: {exc}")
+        statistics = {}
+    return StreamerStatusResponse(
+        available=True,
+        message=None,
+        config=_read_streamer_config(server),
+        statistics=statistics,
+    )
+
+
+@router.post("/test-decision", response_model=StreamerTestDecisionResponse)
+async def test_decision(
+    request: StreamerTestDecisionRequest,
+    server: ServerDep,
+) -> StreamerTestDecisionResponse:
+    """手动驱动一次两阶段决策（同步长请求；前端需放宽超时）。
+
+    错误约定（不抛 HTTPException）：
+    - agent 未注册 / 门面缺失 → ``success=false`` + 原因
+    - batch 与 proactive 互斥、batch 为空 → ``success=false`` + 校验消息
+    - 决策失败（Planner 拒绝/LLM 异常/reply 失败）→ ``success=true`` 但
+      ``error``/``plan`` 如实回传——"没回复"本身是有效测试结果
+    """
+    agent = resolve_streamer_agent(server)
+    if agent is None:
+        return StreamerTestDecisionResponse(success=False, message="主播 Agent 未启用")
+    if not callable(getattr(agent, "debug_test_decision", None)):
+        return StreamerTestDecisionResponse(success=False, message="Agent 不支持调试决策门面")
+
+    if request.proactive and request.batch:
+        return StreamerTestDecisionResponse(
+            success=False,
+            forced=request.forced,
+            proactive=True,
+            message="proactive 模式不接受弹幕批次",
+        )
+    if not request.proactive and not request.batch:
+        return StreamerTestDecisionResponse(
+            success=False,
+            forced=request.forced,
+            message="弹幕批次为空：请至少提供一条弹幕",
+        )
+
+    debug_fn = cast(_DebugTestDecisionCallable, agent.debug_test_decision)
+    batch_dicts: Optional[list] = None
+    if not request.proactive:
+        batch_dicts = [{"nickname": item.nickname, "text": item.text} for item in request.batch]
+    try:
+        result = await debug_fn(
+            batch=batch_dicts,
+            forced=request.forced,
+            proactive=request.proactive,
+        )
+    except Exception as exc:
+        logger.exception(f"test-decision 调用异常: {exc}")
+        return StreamerTestDecisionResponse(
+            success=False,
+            forced=request.forced,
+            proactive=request.proactive,
+            message=f"调用失败: {exc}",
+        )
+
+    if not result.get("success"):
+        return StreamerTestDecisionResponse(
+            success=False,
+            forced=request.forced,
+            proactive=request.proactive,
+            error=result.get("error"),
+            message=result.get("error") or "决策未执行",
+        )
+
+    return StreamerTestDecisionResponse(
+        success=True,
+        trigger_reason=result.get("trigger_reason"),
+        proactive=bool(result.get("proactive")),
+        forced=request.forced,
+        elapsed_ms=result.get("elapsed_ms"),
+        plan=result.get("plan"),
+        speech=result.get("speech"),
+        emotion=result.get("emotion"),
+        utterance_id=result.get("utterance_id"),
+        error=result.get("error"),
+    )
+
+
+@router.post("/proactive-toggle", response_model=ProactiveToggleResponse)
+async def toggle_proactive(
+    request: ProactiveToggleRequest,
+    server: ServerDep,
+) -> ProactiveToggleResponse:
+    """切换主动发言总开关（运行时立即生效；配置落盘保持，重启不丢）。"""
+    agent = resolve_streamer_agent(server)
+    if agent is not None:
+        setter = getattr(agent, "set_proactive_enabled", None)
+        if callable(setter):
+            setter(request.enabled)
+
+    # 落盘复用 config PATCH 的统一管线写回（Schema 校验 + 注释重生成）
+    if not server.config_service:
+        raise HTTPException(status_code=503, detail="Config service 不可用")
+    outcome = await apply_config_updates(
+        server.config_service,
+        resolve_config_dir(server),
+        [("agents.agents.streamer.proactive.enabled", request.enabled)],
+    )
+    message = "主动发言已切换" if outcome.success else f"已切换（运行时生效），配置保存失败: {outcome.message}"
+    return ProactiveToggleResponse(enabled=request.enabled, message=message)
+
+
+@router.post("/trigger-proactive", response_model=TriggerProactiveResponse)
+async def trigger_proactive(
+    request: TriggerProactiveRequest,
+    server: ServerDep,
+) -> TriggerProactiveResponse:
+    """真实限流链路的外部主动发言触发（置位语义）。
+
+    仅置位 pending flag，下个 flush tick 由 ProactiveTrigger 判定：受
+    ``proactive_enabled`` / 防接龙间隔 / 每小时上限 / 话题要求四道约束，
+    任一不满足则静默丢弃——这是**有意保留的真实行为**（测限流本身）；
+    想绕过限流立即开口请用 ``/test-decision`` 的 proactive 模式。
+    """
+    agent = resolve_streamer_agent(server)
+    if agent is None:
+        return TriggerProactiveResponse(success=False, message="主播 Agent 未启用")
+    if not callable(getattr(agent, "trigger_external_proactive", None)):
+        return TriggerProactiveResponse(success=False, message="Agent 不支持外部主动发言触发")
+
+    try:
+        agent.trigger_external_proactive(request.topic_hint)
+    except Exception as exc:
+        logger.exception(f"trigger-proactive 调用异常: {exc}")
+        return TriggerProactiveResponse(success=False, message=f"触发失败: {exc}")
+
+    enabled_getter = getattr(agent, "is_proactive_enabled", None)
+    if not (callable(enabled_getter) and enabled_getter()):
+        return TriggerProactiveResponse(
+            success=True,
+            message=(
+                "已提醒，但主动发言总开关当前是关的：主播不会开口。"
+                "可在直播控制台打开开关，或改用「让主播马上回应」（不受规则约束）。"
+            ),
+        )
+    return TriggerProactiveResponse(
+        success=True,
+        message=("已提醒：主播会在下个决策周期决定是否开口（受防接龙/每小时上限/话题要求约束，可能不开口）。"),
+    )

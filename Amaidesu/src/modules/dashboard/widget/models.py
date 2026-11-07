@@ -1,0 +1,133 @@
+"""
+弹幕小部件数据模型
+
+定义用于弹幕小部件显示的消息类型。
+用于 Warudo 等虚拟形象软件的网页道具场景。
+"""
+
+from enum import StrEnum
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.modules.utils.time_utils import now_ms
+from src.modules.types.guard_levels import DEFAULT_GUARD_NAME, GUARD_LEVEL_NAMES
+
+
+class SubtitleWidgetMessage(BaseModel):
+    text: str = Field(description="字幕文本")
+    timestamp_ms: int = Field(default_factory=now_ms, description="消息时间（Unix 毫秒）")
+    duration_ms: int = Field(default=5000, ge=1000, le=30000, description="显示持续时间（毫秒）")
+
+
+class SubtitleWidgetConfig(BaseModel):
+    enabled: bool = Field(default=True, description="是否启用字幕小部件")
+    max_messages: int = Field(default=10, ge=1, le=50, description="最大字幕显示数量")
+    auto_hide_after_ms: int = Field(default=5000, ge=1000, le=30000, description="自动隐藏时间（毫秒）")
+    font_size: int = Field(default=32, ge=12, le=72, description="字体大小")
+    font_color: str = Field(default="#ffffff", description="字体颜色")
+    background_color: str = Field(default="rgba(0,0,0,0.45)", description="背景颜色")
+    border_color: str = Field(default="#ff8800", description="左边边框颜色（橙色）")
+    position: str = Field(default="bottom", description="位置: top, bottom, center")
+
+
+class MessageType(StrEnum):
+    """消息类型枚举。
+
+    使用 ``StrEnum``（Python 3.11+）——成员本身就是 ``str``，所以：
+
+    - ``msg.message_type == MessageType.TEXT`` 直接生效（无需 ``.value``）
+    - JSON 序列化仍输出字符串值（前端 Danmaku.vue 不需要联动改动）
+
+    值与直播间行为流事件的 ``message_type`` 对齐（widget 服务层做事件类型
+    到本枚举的翻译），仅 ``REPLY`` 是 widget 内部类型（AI 回复，不来自事件）。
+    """
+
+    TEXT = "text"  # 普通文本（与 data_type 对齐，原 DANMAKU）
+    GIFT = "gift"  # 礼物
+    SUPER_CHAT = "super_chat"  # SuperChat（与 data_type 对齐，原 SUPER_CHAT/superchat）
+    GUARD = "guard"  # 大航海
+    ENTER = "enter"  # 进入直播间
+    REPLY = "reply"  # AI 回复（widget 独有）
+
+
+_DEFAULT_GUARD_LEVEL = 3
+
+# message_type → 前端展示模板（widget 本地映射）。
+# 渲染输出与前端解析严格对齐，不要顺手优化文案。
+_DISPLAY_TEMPLATES: dict[str, str] = {
+    "text": "{content}",
+    "gift": "送出 {gift_name} x{gift_count}",
+    "super_chat": "¥{sc_price} {sc_message}",
+    "guard": "开通了 {guard_name}",
+    "enter": "进入了直播间",
+}
+
+
+class DanmakuWidgetMessage(BaseModel):
+    """
+    弹幕小部件消息
+
+    用于在前端显示的统一消息格式。
+    """
+
+    user_name: str = Field(description="用户昵称")
+    user_id: str = Field(default="", description="用户 ID")
+    content: str = Field(description="消息内容")
+    message_type: MessageType = Field(description="消息类型")
+    timestamp_ms: int = Field(default_factory=now_ms, description="消息时间（Unix 毫秒）")
+    importance: float = Field(default=0.5, ge=0.0, le=1.0, description="重要性评分")
+
+    # 礼物专属字段
+    gift_name: Optional[str] = Field(default=None, description="礼物名称")
+    gift_count: Optional[int] = Field(default=None, description="礼物数量")
+    gift_price: Optional[float] = Field(default=None, description="礼物单价")
+
+    # SuperChat 专属字段
+    sc_price: Optional[float] = Field(default=None, description="SC 金额")
+    sc_message: Optional[str] = Field(default=None, description="SC 消息内容")
+
+    # 大航海专属字段
+    guard_level: Optional[int] = Field(default=None, description="大航海等级")
+
+    # 来源信息
+    platform: str = Field(default="bilibili", description="平台来源")
+    room_id: Optional[str] = Field(default=None, description="直播间 ID")
+    simulated: bool = Field(default=False, description="模拟消息标记（simulator/mock 产生，供前端过滤）")
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    def to_display_text(self) -> str:
+        """生成显示文本。
+
+        ``REPLY`` 是 widget 独有类型，无模板，按 content 兜底；其余类型查
+        本模块的展示模板映射，未知类型按 content 兜底。
+        """
+        if self.message_type == MessageType.REPLY:
+            return self.content
+
+        template = _DISPLAY_TEMPLATES.get(str(self.message_type), "{content}")
+        return template.format(
+            content=self.content,
+            gift_name=self.gift_name or "礼物",
+            gift_count=self.gift_count or 1,
+            sc_price=self.sc_price or 0,
+            sc_message=self.sc_message or self.content,
+            guard_name=GUARD_LEVEL_NAMES.get(self.guard_level or _DEFAULT_GUARD_LEVEL, DEFAULT_GUARD_NAME),
+        )
+
+
+class DanmakuWidgetConfig(BaseModel):
+    """弹幕小部件配置"""
+
+    enabled: bool = Field(default=True, description="是否启用弹幕小部件")
+    font_size: int = Field(default=16, ge=10, le=72, description="弹幕字号（像素），连接握手时随 style 消息下发")
+    max_messages: int = Field(default=30, ge=5, le=100, description="最大消息数量")
+    show_danmaku: bool = Field(default=True, description="显示普通弹幕")
+    show_gift: bool = Field(default=True, description="显示礼物")
+    show_super_chat: bool = Field(default=True, description="显示 SuperChat")
+    show_guard: bool = Field(default=True, description="显示大航海")
+    show_enter: bool = Field(default=False, description="显示进入直播间")
+    show_reply: bool = Field(default=True, description="显示 AI 回复")
+    show_subtitle: bool = Field(default=True, description="显示字幕（AI 回复文本）")
+    min_importance: float = Field(default=0.0, ge=0.0, le=1.0, description="最小重要性过滤")

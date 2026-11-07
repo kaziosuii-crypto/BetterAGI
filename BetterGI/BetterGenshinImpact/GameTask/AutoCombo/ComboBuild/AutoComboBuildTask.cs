@@ -1,0 +1,402 @@
+using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.GameTask.AutoCombo.ComboRun;
+using BetterGenshinImpact.GameTask.AutoFight.Model;
+using BetterGenshinImpact.GameTask.Common;
+using BetterGenshinImpact.GameTask.Common.BgiVision;
+using BetterGenshinImpact.GameTask.Common.Job;
+using BetterGenshinImpact.GameTask.Runtime;
+using BetterGenshinImpact.GameTask.SoloTask;
+using BetterGenshinImpact.Service;
+using BetterGenshinImpact.ViewModel.Windows;
+using Anthropic;
+using CsTrees.Blackboard;
+using CsTrees.Composites;
+using CsTrees.MEAI;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
+using OpenAI;
+using System;
+using System.ClientModel;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using static BetterGenshinImpact.GameTask.Common.TaskControl;
+
+namespace BetterGenshinImpact.GameTask.AutoCombo.ComboBuild;
+
+/// <summary>
+/// 自动连招任务
+/// 识别队伍 → 调用 LLM 通过 Function Calling 逐节点构建连招行为树 → 打印树给用户
+/// 建树发生在战斗开始之前，树暂存内存中，后续集成进 AutoFight 运行
+/// </summary>
+[SoloTaskInfo(TaskId, "自动连招构建", Group = "工具", Order = 440, Scopes = SoloTaskScopes.Standalone)]
+public class AutoComboBuildTask : ISoloTask<NoParam, NoData>
+{
+    /// <summary>
+    /// 任务稳定标识
+    /// </summary>
+    public const string TaskId = "auto_combo_build";
+
+    /// <summary>日志中使用的任务名</summary>
+    private const string TaskName = "自动连招";
+
+    /// <summary>FunctionInvokingChatClient 单次 GetResponseAsync 允许的最大工具调用循环轮数</summary>
+    private const int MaxToolCallIterations = 128;
+
+    /// <summary>
+    /// Anthropic 请求的默认最大输出 token 数。
+    /// Anthropic SDK 自身的默认值是 1024，对逐节点建树的多轮工具调用偏小；
+    /// 且开启思考（thinking）时思考内容同样计入 max_tokens，过小会直接把这一轮截断。
+    /// </summary>
+    private const int AnthropicDefaultMaxOutputTokens = 8192;
+
+    /// <summary>
+    /// 识别队伍所用的运行环境
+    /// </summary>
+    private readonly GameRuntime _runtime;
+
+    /// <summary>
+    /// 配置根
+    /// </summary>
+    private readonly AllConfig _config;
+
+    /// <summary>
+    /// 创建自动连招建树任务
+    /// </summary>
+    /// <param name="runtime">识别队伍所用的运行环境</param>
+    /// <param name="config">配置根</param>
+    public AutoComboBuildTask(GameRuntime runtime, AllConfig config)
+    {
+        _runtime = runtime;
+        _config = config;
+    }
+
+    /// <summary>
+    /// 识别当前队伍并调用 LLM 构建连招行为树，构建完成后暂存到 <see cref="AutoComboRuntime.Session"/>。
+    /// 拿到建树会话即确认构建完成，返回 Success；取消时抛出 OperationCanceledException
+    /// </summary>
+    /// <param name="param">无业务参数</param>
+    /// <param name="ct">取消令牌</param>
+    /// <returns>任务结果</returns>
+    public async Task<SoloTaskResult<NoData>> RunAsync(NoParam param, CancellationToken ct)
+    {
+        try
+        {
+            Logger.LogInformation("{Name}任务启动", TaskName);
+
+            var avatars = await EnsureMainUiAndRecognizeTeamAsync(_runtime, _config, Logger, ct);
+            var avatarNames = avatars.Select(a => a.Name).ToList();
+            Logger.LogInformation("识别队伍：{Avatars}", string.Join("、", avatarNames));
+
+            var config = _config.AutoComboBuildConfig;
+
+            // 只暂存建树会话；CombatScenes 的绑定与生命周期由消费方（测试按钮/后续 AutoFight）负责
+            AutoComboRuntime.Session = await BuildComboTreeAsync(avatars, config, Logger, ct);
+
+            // 建树会话已生成并暂存，构建结果可确认
+            return SoloTaskResult.Success("连招行为树构建完成");
+        }
+        catch (Exception e)
+        {
+            Logger.LogError(e, "{Name}任务异常", TaskName);
+            throw;
+        }
+        finally
+        {
+            Logger.LogInformation("{Name}任务结束", TaskName);
+        }
+    }
+
+    /// <summary>
+    /// 确保处于主界面或秘境中后识别队伍角色并返回识别出的队伍成员
+    /// 秘境中左上角没有派蒙图标不算主界面，且按 ESC 打开的是秘境菜单，跳过返回主界面
+    /// </summary>
+    /// <param name="runtime">截图与识别所用的运行环境，识别出的成员绑定到它</param>
+    /// <param name="config">配置根</param>
+    /// <param name="logger">日志</param>
+    /// <param name="ct">取消令牌</param>
+    public static async Task<Avatar[]> EnsureMainUiAndRecognizeTeamAsync(GameRuntime runtime, AllConfig config, ILogger logger, CancellationToken ct)
+    {
+        // 秘境中按 ESC 打开的是秘境菜单而非关闭界面，不能走返回主界面流程
+        using (var initialCapture = runtime.CaptureToRectArea())
+        {
+            if (Bv.IsInDomain(initialCapture))
+            {
+                logger.LogInformation("当前处于秘境中，跳过返回主界面");
+            }
+            else
+            {
+                await new ReturnMainUiTask(runtime).Start(ct);
+            }
+        }
+
+        using var capture = runtime.CaptureToRectArea();
+        if (!Bv.IsInMainUi(capture) && !Bv.IsInDomain(capture))
+        {
+            throw new InvalidOperationException("未能返回主界面或识别到秘境界面，无法识别队伍角色");
+        }
+
+        var combatScenes = CombatScenes.GetCombatScenesWithRetry(runtime, config);
+        var avatars = combatScenes.GetAvatars().ToArray();
+        // 启用 E 技能 ONNX 分类识别
+        foreach (var avatar in avatars)
+        {
+            avatar.EnableESkillClassify = true;
+        }
+
+        return avatars;
+    }
+
+    /// <summary>
+    /// 从已知队伍成员开始，调用 LLM 通过 Function Calling 逐节点构建连招行为树（不含角色识别，可脱离游戏运行）
+    /// 队伍成员实例会存入建树会话
+    /// 日志由调用方注入：主任务传 TaskControl.Logger，单测可传自定义实现，避免触及主程序静态初始化
+    /// 返回建树会话（含构建器、黑板与队伍成员）；异常退出时尝试打印当前已构建的行为树预览，便于定位 LLM 建树进度
+    /// </summary>
+    public static async Task<ComboTreeSession> BuildComboTreeAsync(Avatar[] avatars, AutoComboBuildConfig config, ILogger logger, CancellationToken ct)
+    {
+        // 展示行为树浮窗：建树过程（含 LLM 多轮 preview）实时可见
+        AutoComboTreeWindowService.Instance.Show();
+        AutoComboTreeViewModel.Instance.Clear();
+        var avatarNames = avatars.Select(a => a.Name).ToList();
+        AutoComboBuildBuilder? builder = null;
+        try
+        {
+            // 队伍名单随构建器注入 Catalog，Build 时按名解析节点目标角色；成员实例同时注入工具宿主，供设置类工具修改其状态
+            var blackboard = new Blackboard();
+            builder = new AutoComboBuildBuilder(avatars).WithBlackboard(blackboard);
+            var tools = new AutoComboBuildTools(builder, avatars);
+
+            var chatClient = CreateChatClient(config, logger, tools, builder);
+
+            var aiFunctions = tools.Tools
+                // 禁止 LLM 调用 RunTree/ShowTreeStatus
+                .Where(d => !new[] { nameof(AutoComboBuildTools.RunTree), nameof(AutoComboBuildTools.ShowTreeStatus) }.Contains(d.Method.Name))
+                .Select(d => AIFunctionFactory.Create(d))
+                .ToArray();
+
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, AutoComboBuildPrompts.BuildMain(avatarNames, config, logger)),
+                new(ChatRole.User, $"请为当前队伍构建战斗策略行为树"),
+            };
+            var options = new ChatOptions { Tools = aiFunctions };
+
+            logger.LogInformation("开始调用 LLM 构建行为树（模型：{Model}）", config.ModelName);
+            var response = await chatClient.GetResponseAsync(messages, options, ct);
+            logger.LogInformation("LLM 返回：{Text}", response.Text);
+
+            // FunctionInvokingChatClient 正常完成时每个 FunctionCallContent 都有配对 FunctionResultContent（CallId 相同）；
+            // 达到 MaximumIterationsPerRequest 上限时最后一轮调用不执行，是唯一出现无配对调用的退出路径，以此显式报错
+            var executedCallIds = response.Messages.SelectMany(m => m.Contents)
+                .OfType<FunctionResultContent>().Select(r => r.CallId).ToHashSet();
+            if (response.Messages.SelectMany(m => m.Contents).OfType<FunctionCallContent>()
+                .Any(c => !executedCallIds.Contains(c.CallId)))
+            {
+                throw new Exception($"LLM 工具调用循环达到上限（{MaxToolCallIterations} 轮）仍未完成建树，最后响应中还有未执行的工具调用");
+            }
+
+            // LLM 已通过 BuildTree 工具完成构建；此处再次 Build 获取根节点用于打印
+            var root = builder.Build();
+
+            var ascii = CsTrees.Display.Display.AsciiTree(root);
+            // 更新行为树浮窗数据源（建树预览一次性，INPC 通知自动推送到 UI）
+            AutoComboTreeViewModel.Instance.LatestTreeAscii = ascii;
+            logger.LogInformation("生成的行为树：\n{Tree}", ascii);
+
+            // 第二次调用：兜底攻击建树，失败则降级为使用队伍第一个角色普攻
+            AutoComboBuildFallbackBuilder? fallbackBuilder = null;
+            try
+            {
+                fallbackBuilder = await BuildFallbackTreeAsync(avatars, blackboard, config, logger, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                logger.LogWarning(e, "兜底建树失败，降级为单个普攻叶子");
+                fallbackBuilder = new AutoComboBuildFallbackBuilder(avatars)
+                    .WithBlackboard(blackboard)
+                        .PushComposite(children => new Sequence("兜底攻击序列", true, children))
+                            .Attack("降级普攻", avatars[0].Name)
+                        .End()
+                    .End();
+            }
+
+            return new ComboTreeSession
+            {
+                Builder = builder,
+                Blackboard = blackboard,
+                FallbackBuilder = fallbackBuilder!,
+                Avatars = avatars,
+                BuiltAt = DateTimeOffset.Now,
+            };
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "建树异常");
+            if (builder is not null)
+            {
+                try
+                {
+                    // Preview 不消耗 builder，未关闭作用域以占位节点呈现并自动回滚
+                    var preview = builder.Preview();
+                    var previewAscii = CsTrees.Display.Display.AsciiTree(preview);
+                    AutoComboTreeViewModel.Instance.LatestTreeAscii = previewAscii;
+                    logger.LogInformation("异常时的行为树预览：\n{Tree}", previewAscii);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning("行为树预览失败：{Message}", ex.Message);
+                }
+            }
+
+            throw;
+        }
+        finally
+        {
+            AutoComboTreeWindowService.Instance.Hide();
+        }
+    }
+
+    /// <summary>
+    /// 调用 LLM 构建兜底攻击行为树（根 Sequence 已预建，工具调用只含基础动作叶子）
+    /// 调用方需容错：本方法异常时兜底树缺位，运行时降级为单个普攻叶子
+    /// </summary>
+    private static async Task<AutoComboBuildFallbackBuilder> BuildFallbackTreeAsync(
+        Avatar[] avatars, Blackboard blackboard, AutoComboBuildConfig config, ILogger logger, CancellationToken ct)
+    {
+        var avatarNames = avatars.Select(a => a.Name).ToList();
+
+        var builder = new AutoComboBuildFallbackBuilder(avatars).WithBlackboard(blackboard).PushComposite(children => new Sequence("兜底攻击序列", true, children));
+        var tools = new AutoComboBuildFallbackTools(builder);
+
+        var chatClient = CreateChatClient(config, logger, tools, null, builder);
+
+        var aiFunctions = tools.Tools
+            // 禁止 LLM 调用 RunTree/ShowTreeStatus
+            .Where(d => !new[] { nameof(AutoComboBuildTools.RunTree), nameof(AutoComboBuildTools.ShowTreeStatus) }.Contains(d.Method.Name))
+            .Select(d => AIFunctionFactory.Create(d))
+            .ToArray();
+
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, AutoComboBuildPrompts.BuildFallback(avatarNames, config, logger)),
+            new(ChatRole.User, $"请为当前队伍构建兜底攻击行为树"),
+        };
+        var options = new ChatOptions { Tools = aiFunctions };
+
+        logger.LogInformation("开始调用 LLM 构建兜底行为树（模型：{Model}）", config.ModelName);
+        var response = await chatClient.GetResponseAsync(messages, options, ct);
+        logger.LogInformation("兜底建树 LLM 返回：{Text}", response.Text);
+
+        // 与主建树相同的配对校验：达到迭代上限时最后一轮调用不执行，以此显式报错
+        var executedCallIds = response.Messages.SelectMany(m => m.Contents)
+            .OfType<FunctionResultContent>().Select(r => r.CallId).ToHashSet();
+        if (response.Messages.SelectMany(m => m.Contents).OfType<FunctionCallContent>()
+            .Any(c => !executedCallIds.Contains(c.CallId)))
+        {
+            throw new Exception($"兜底建树的工具调用循环达到上限（{MaxToolCallIterations} 轮）仍未完成，最后响应中还有未执行的工具调用");
+        }
+
+        var root = builder.Build();
+        var ascii = CsTrees.Display.Display.AsciiTree(root);
+        // 兜底树写入浮窗的兜底栏位（INPC 通知自动推送到 UI）
+        AutoComboTreeViewModel.Instance.LatestFallbackTreeAscii = ascii;
+        logger.LogInformation("生成的兜底行为树：\n{Tree}", ascii);
+
+        return builder;
+    }
+
+    /// <summary>
+    /// 根据 LLM 配置创建带工具调用循环的 IChatClient
+    /// </summary>
+    private static IChatClient CreateChatClient(AutoComboBuildConfig config, ILogger logger, IBuildToolsState buildTools, AutoComboBuildBuilder? mainBuilder, AutoComboBuildFallbackBuilder? fallbackBuilder = null)
+    {
+        var provider = AutoComboLlmProvider.Normalize(config.Provider);
+
+        if (string.IsNullOrWhiteSpace(config.ModelName))
+        {
+            throw new Exception("请先在任务设置页的“自动连招”卡片中配置 LLM 模型名");
+        }
+
+        // OpenAI 兼容端点必须由用户提供；Anthropic 允许留空，由 SDK 使用官方地址
+        var endpoint = AutoComboLlmEndpoint.Resolve(config.PlanningLlmEndpoint, provider, out var isLoopback);
+
+        // 密钥随每个请求发送，非 HTTPS 传输时会在网络中明文暴露；仅豁免本机回环地址（本地中转/本地模型）
+        if (string.IsNullOrWhiteSpace(config.ApiKey) && !isLoopback)
+        {
+            throw new Exception("请先在任务设置页的“自动连招”卡片中配置 LLM 密钥（本机回环地址除外）");
+        }
+
+        IChatClient client = provider == AutoComboLlmProvider.Anthropic
+            ? CreateAnthropicChatClient(config, endpoint)
+            : CreateOpenAiCompatibleChatClient(config, endpoint!);
+
+        // CsTrees.MEAI 自带 tree 字段裁剪装饰：每次请求前移除历史中旧的树预览（只保留最后一个），降低多轮 token 消耗
+        client = new CompactResultChatClient(client);
+
+        // 对话记录装饰：逐轮记录发给 LLM 与 LLM 发出的内容（回退解析前的原始响应，含藏在 reasoning/文本里的 XML 原文），便于观察 FunctionInvokingChatClient 的中间多轮过程
+        client = new ConversationLoggingChatClient(client, logger);
+
+        // XML 工具调用回退解析装饰：解析模型塞进 reasoning/文本里的 XML tool_calls 并注入单独的 tool_calls 字段；
+        // 放在记录层外层，回退解析告警会先于"LLM 发出"日志打印
+        client = new XmlToolCallFallbackParseChatClient(client, logger);
+
+        // CsTrees.MEAI 自带工具屏蔽装饰：builder 尚在初始检查点（空树）时屏蔽 ResetTree/Undo，避免模型在没有任何上下文时误用
+        client = new ResetTreeGuardChatClient(client, buildTools);
+
+        // 中途行为树 preview 刷新装饰：每轮请求入口把当前 builder 预览写入 AutoComboRuntime 供 UI 浮窗展示
+        client = new TreePreviewRefreshChatClient(client, logger, buildTools, mainBuilder, fallbackBuilder);
+
+        // 外层装饰：自动执行 LLM 的工具调用并把结果回传，循环直至 LLM 输出最终回复
+        client = new FunctionInvokingChatClient(client)
+        {
+            MaximumIterationsPerRequest = MaxToolCallIterations,
+            IncludeDetailedErrors = true
+        };
+
+        // 截断检查装饰：LLM 因上下文耗尽或达到 max_tokens 被截断时（finish_reason=length）显式报错
+        return new LengthCutoffCheckChatClient(client, logger);
+    }
+
+    /// <summary>
+    /// 创建 OpenAI 兼容端点的 IChatClient。
+    /// </summary>
+    private static IChatClient CreateOpenAiCompatibleChatClient(AutoComboBuildConfig config, Uri endpoint)
+    {
+        // 在 HTTP 传输层前注入原生 JSON 请求/响应日志，用于查验最终发送给 API 及 API 返回的原始内容
+        var openAiOptions = new OpenAIClientOptions
+        {
+            Endpoint = endpoint,
+            NetworkTimeout = TimeSpan.FromMinutes(10),
+        };
+
+        // 密钥为空时传占位符：OpenAI 客户端拒绝空密钥，而本地服务不校验该头的值
+        var apiKey = string.IsNullOrWhiteSpace(config.ApiKey) ? "missing-api-key" : config.ApiKey;
+        var openAiClient = new OpenAIClient(new ApiKeyCredential(apiKey), openAiOptions);
+        return openAiClient.GetChatClient(config.ModelName).AsIChatClient();
+    }
+
+    /// <summary>
+    /// 创建 Anthropic 官方 Messages API 的 IChatClient。
+    /// 返回的客户端会把 stop_reason 映射到 ChatFinishReason（max_tokens → Length），
+    /// 因此外层的截断检查装饰对两个服务商同样生效。
+    /// </summary>
+    private static IChatClient CreateAnthropicChatClient(AutoComboBuildConfig config, Uri? endpoint)
+    {
+        var anthropicClient = new AnthropicClient
+        {
+            ApiKey = config.ApiKey,
+
+            // 地址留空时回落到官方地址；填写时去掉结尾斜杠，避免与 SDK 自行拼接的 /v1/messages 组成双斜杠
+            // （此处应填服务根地址，不含 /v1）
+            BaseUrl = AutoComboLlmEndpoint.ResolveAnthropicBaseUrl(endpoint),
+        };
+
+        return anthropicClient.AsIChatClient(config.ModelName, AnthropicDefaultMaxOutputTokens);
+    }
+}

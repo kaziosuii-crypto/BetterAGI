@@ -1,0 +1,271 @@
+"""
+BiliDanmakuCollector —— Bilibili 旧版弹幕采集器
+
+- 与官方版（``official/``）并列保留，旧版 WebSocket 作为备选采集器
+- 继承 ``BaseCollector``，emit ``room.message.danmaku`` 语义事件
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any, AsyncIterator, Dict, Optional
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+from pydantic import Field
+
+from src.modules.collectors.base import BaseCollector
+from src.modules.config.schemas.base import BaseConfig
+from src.modules.events.event_bus import EventBus
+from src.modules.events.names import CoreEvents
+from src.modules.events.payloads.room import RoomMessagePayload, RoomMessageUser
+from src.modules.logging import get_logger
+from src.modules.utils.time_utils import now_ms
+
+# 平台标识是身份键 (platform, user_id) 的组成部分，由采集器作为装配期常量盖章，不开放配置
+_PLATFORM = "bilibili"
+
+
+class BiliDanmakuCollector(BaseCollector):
+    """Bilibili 直播弹幕采集器（轮询旧版 API）
+
+    通过轮询 Bilibili 旧版 API 获取直播间弹幕，emit ``room.message.danmaku``
+    语义事件；``collect()`` 由 BaseCollector 后台任务消费。
+    """
+
+    name = "bili_danmaku"
+    description = "通过轮询 Bilibili 旧版 API 获取直播间弹幕（与官方版并存）"
+
+    class ConfigSchema(BaseConfig):
+        """Bilibili弹幕采集器配置
+
+        room_id 默认 0（=未配置）：默认值会随物化落盘，下次加载是
+        显式键、跑完整校验，因此默认值必须自身满足约束、不能靠
+        gt 正数约束表达"必填"——未配置的轮询在运行期失败暴露。
+        """
+
+        room_id: int = Field(default=0, title="直播间号", description="B站直播间号（0 = 未配置）")
+        poll_interval: int = Field(default=3, title="轮询间隔", description="多久拉一次新弹幕（秒）", ge=1)
+        emit_semantic_events: bool = Field(
+            default=True,
+            title="发语义事件",
+            description="是否向系统发出标准弹幕事件（关闭后主播听不到弹幕）",
+            json_schema_extra={"x-ui-advanced": True},
+        )
+
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        event_bus: Optional[EventBus] = None,
+    ) -> None:
+        """初始化 BiliDanmakuCollector
+
+        Args:
+            config: 配置字典
+            event_bus: 事件总线实例（可选）
+        """
+        super().__init__(event_bus=event_bus)
+        self.config = config or {}
+        self.logger = get_logger(self.__class__.__name__)
+
+        # 依赖检查
+        if aiohttp is None:
+            self.logger.error("aiohttp library not found. Please install it (`pip install aiohttp`).")
+            raise ImportError("aiohttp is required for BiliDanmakuCollector")
+
+        # 配置
+        self.typed_config = self.ConfigSchema.from_dict(self.config)
+        self.room_id = self.typed_config.room_id
+        self.poll_interval = self.typed_config.poll_interval
+        self._emit_semantic_events = self.typed_config.emit_semantic_events
+        self.api_url = f"https://api.live.bilibili.com/xlive/web-room/v1/dM/gethistory?roomid={self.room_id}"
+
+        # 状态变量
+        # 去重水位线：时刻统一毫秒 int（B 站接口返回秒级 ts，比较点在边界换算）
+        self._latest_timestamp: int = int(time.time() * 1000)
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.is_started: bool = False
+        # 缺 uid 的弹幕每轮轮询都可能出现：只有第一次记 warning，之后降为 debug，避免刷屏
+        self._uid_missing_warned: bool = False
+
+    async def start(self) -> None:
+        """启动：开后台任务消费 collect()（内部 emit room.message.*）。"""
+        if not self.is_started:
+            self.is_started = True
+            await self._start_collect_task()
+
+    async def stop(self) -> None:
+        """停止：取消后台消费任务。"""
+        if self.is_started:
+            self.is_started = False
+            await self._stop_collect_task()
+
+    async def cleanup(self) -> None:
+        """清理资源"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self.logger.debug("关闭了 aiohttp Session")
+
+        self.logger.info("BiliDanmakuCollector 已清理")
+
+    async def collect(self) -> AsyncIterator[RoomMessagePayload]:
+        """
+        采集弹幕数据（旧版轮询）
+
+        Yields:
+            RoomMessagePayload: 弹幕事件载荷
+        """
+        self.is_started = True
+
+        try:
+            self.logger.info("开始采集 Bilibili 弹幕数据...")
+
+            # 创建 aiohttp session
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": f"https://live.bilibili.com/{self.room_id}",
+                "Accept": "application/json",
+            }
+
+            async with aiohttp.ClientSession(headers=headers) as session:
+                self._session = session
+
+                while self.is_started:
+                    try:
+                        async for message in self._fetch_and_process():
+                            yield message
+                    except Exception as e:
+                        self.logger.exception(f"采集弹幕时出错: {e}")
+
+                    # 等待下次轮询
+                    try:
+                        await asyncio.wait_for(asyncio.sleep(self.poll_interval), timeout=None)
+                    except asyncio.CancelledError:
+                        break
+
+        except asyncio.CancelledError:
+            self.logger.info("采集被取消")
+        except Exception as e:
+            self.logger.exception(f"数据采集出错: {e}")
+        finally:
+            self.is_started = False
+            self.logger.info("Bilibili 弹幕采集已停止")
+
+    async def _fetch_and_process(self) -> AsyncIterator[RoomMessagePayload]:
+        """
+        获取并处理弹幕
+
+        从 Bilibili API 获取弹幕，过滤新弹幕并转换为事件载荷。
+        """
+        if not self._session or self._session.closed:
+            self.logger.warning("aiohttp session 未初始化或已关闭，跳过本次轮询。")
+            return
+
+        new_max_timestamp_ms = self._latest_timestamp
+
+        try:
+            self.logger.debug(f"轮询 Bilibili API: {self.api_url}")
+            async with self._session.get(self.api_url, timeout=10) as response:
+                if response.status != 200:
+                    self.logger.warning(f"Bilibili API 请求失败，状态码: {response.status}")
+                    await asyncio.sleep(self.poll_interval * 2)
+                    return
+
+                data = await response.json()
+                self.logger.debug(f"收到 API 响应: code={data.get('code')}")
+
+                if data.get("code") == 0:
+                    room_data = data.get("data", {}).get("room", [])
+                    if not room_data:
+                        self.logger.debug("API 返回的弹幕列表为空")
+                        return
+
+                    new_danmakus = []
+                    for item in room_data:
+                        timestamp = item.get("check_info", {}).get("ts")
+                        item.get("uid")
+
+                        # B 站 ts 为秒级，换算毫秒后与水位线比较，禁止单位混比
+                        if timestamp and timestamp * 1000 > self._latest_timestamp:
+                            new_danmakus.append(item)
+                            new_max_timestamp_ms = max(new_max_timestamp_ms, timestamp * 1000)
+
+                    if new_danmakus:
+                        new_danmakus.sort(key=lambda x: x.get("check_info", {}).get("ts", 0))
+                        self.logger.debug(f"收到 {len(new_danmakus)} 条新弹幕")
+
+                        for item in new_danmakus:
+                            payload = await self._create_danmaku_message(item)
+                            if payload:
+                                # emit room.message.danmaku 语义事件
+                                if self._emit_semantic_events:
+                                    await self._emit_semantic_event(payload)
+                                yield payload
+                    else:
+                        self.logger.debug("没有新的弹幕")
+
+                    self._latest_timestamp = new_max_timestamp_ms
+                else:
+                    self.logger.warning(
+                        f"Bilibili API 返回错误: code={data.get('code')}, message={data.get('message')}"
+                    )
+
+        except aiohttp.ClientError as e:
+            self.logger.warning(f"轮询 Bilibili API 时发生网络错误: {e}")
+        except asyncio.TimeoutError:
+            self.logger.warning("轮询 Bilibili API 超时")
+        except Exception as e:
+            self.logger.exception(f"处理 Bilibili 弹幕时发生未知错误: {e}")
+
+    async def _emit_semantic_event(self, payload: RoomMessagePayload) -> None:
+        """emit room.message.danmaku 语义事件"""
+        try:
+            # 场次归属由场次盖章拦截器统一注入；message_id 透传（回复关联键）
+            await self.emit_event(CoreEvents.ROOM_MESSAGE_DANMAKU, payload)
+        except Exception as e:
+            self.logger.debug(f"emit 语义事件失败: {e}", exc=True)
+
+    async def _create_danmaku_message(self, item: Dict[str, Any]) -> Optional[RoomMessagePayload]:
+        """
+        创建弹幕事件载荷
+
+        Args:
+            item: Bilibili API 返回的弹幕项
+
+        Returns:
+            RoomMessagePayload: 弹幕事件载荷；无文本或缺 uid 时返回 None（丢弃）
+        """
+        text = item.get("text", "")
+        nickname = item.get("nickname", "未知用户")
+
+        if not text:
+            return None
+
+        # 接口没给 uid（缺字段或匿名请求时的 0）就丢弃这条弹幕：用昵称或固定占位符顶替，
+        # 会让多个观众并成同一个身份、画像互相串，宁缺毋滥。同一实例只在第一次记 warning
+        uid = item.get("uid")
+        if not uid:
+            detail = f"uid={uid!r}, nickname={nickname!r}"
+            if not self._uid_missing_warned:
+                self._uid_missing_warned = True
+                self.logger.warning(f"B 站弹幕缺少 uid（已丢弃，防多用户退化混淆）: {detail}；后续同类弹幕降为 debug")
+            else:
+                self.logger.debug(f"B 站弹幕缺少 uid（已丢弃）: {detail}")
+            return None
+
+        # 弹幕时间戳：优先使用 Bilibili API 返回的秒级时间戳（check_info.ts），缺失时兜底当前时间
+        ts = item.get("check_info", {}).get("ts")
+        timestamp_ms = int(ts * 1000) if ts else now_ms()
+
+        # platform 与官方源、LAPLACE 源统一盖 bilibili，uid 和 LAPLACE 的 uid 同属 B 站数字账号
+        return RoomMessagePayload(
+            message_type="danmaku",
+            platform=_PLATFORM,
+            user=RoomMessageUser(id=str(uid), name=nickname),
+            content=text,
+            timestamp_ms=timestamp_ms,
+        )

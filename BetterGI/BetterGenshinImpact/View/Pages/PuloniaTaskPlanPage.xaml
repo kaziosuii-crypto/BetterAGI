@@ -1,0 +1,690 @@
+<UserControl x:Class="BetterGenshinImpact.View.Pages.PuloniaTaskPlanPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+             xmlns:behavior="clr-namespace:BetterGenshinImpact.View.Behavior"
+             xmlns:controls="clr-namespace:BetterGenshinImpact.View.Controls"
+             xmlns:converters="clr-namespace:BetterGenshinImpact.View.Converters"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:dd="urn:gong-wpf-dragdrop"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:pulonia="clr-namespace:BetterGenshinImpact.ViewModel.Pages.Pulonia"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             d:DesignHeight="800"
+             d:DesignWidth="1180"
+             ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+             ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+             FontFamily="{StaticResource TextThemeFontFamily}"
+             Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+             mc:Ignorable="d">
+    <b:Interaction.Triggers>
+        <b:EventTrigger EventName="Loaded">
+            <b:InvokeCommandAction Command="{Binding ViewModel.OpenPageCommand}" />
+        </b:EventTrigger>
+        <b:EventTrigger EventName="Unloaded">
+            <b:InvokeCommandAction Command="{Binding ViewModel.ClosePageCommand}" />
+        </b:EventTrigger>
+    </b:Interaction.Triggers>
+
+    <UserControl.Resources>
+        <!-- ContextMenu 位于独立可视树，必须通过 Freezable 代理稳定访问页面 ViewModel。 -->
+        <behavior:BindingProxy x:Key="PageBindingProxy" Data="{Binding}" />
+        <converters:MultiValueArrayConverter x:Key="MultiValueArrayConverter" />
+
+        <!--
+            “添加独立任务”子菜单的菜单项。叶子项执行 AddSoloTaskCommand，参数为 [目标节点, 任务类型]；
+            目标节点取自父菜单项的 Tag，两处右键菜单因此共用同一个样式。分隔项显示为分隔线，不可点击、不可聚焦。
+        -->
+        <Style x:Key="SoloTaskMenuItemStyle"
+               BasedOn="{StaticResource {x:Type MenuItem}}"
+               TargetType="MenuItem">
+            <Setter Property="Header" Value="{Binding Header}" />
+            <Setter Property="Command" Value="{Binding Data.ViewModel.AddSoloTaskCommand, Source={StaticResource PageBindingProxy}}" />
+            <Setter Property="CommandParameter">
+                <Setter.Value>
+                    <MultiBinding Converter="{StaticResource MultiValueArrayConverter}">
+                        <Binding Path="Tag" RelativeSource="{RelativeSource AncestorType=MenuItem}" />
+                        <Binding Path="TaskType" />
+                    </MultiBinding>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsSeparator}" Value="True">
+                    <Setter Property="Focusable" Value="False" />
+                    <Setter Property="IsHitTestVisible" Value="False" />
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="MenuItem">
+                                <Separator Style="{DynamicResource {x:Static MenuItem.SeparatorStyleKey}}" />
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="EditorCardStyle" TargetType="Border">
+            <Setter Property="Padding" Value="12" />
+            <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="8" />
+        </Style>
+
+        <!-- 计划列表不能使用系统默认高亮色，否则深色主题下会出现过亮蓝底。 -->
+        <Style x:Key="PlanListBoxItemStyle" TargetType="ListBoxItem">
+            <Setter Property="Margin" Value="0,0,0,4" />
+            <Setter Property="Padding" Value="12,10" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="ItemBorder"
+                                Padding="{TemplateBinding Padding}"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6"
+                                SnapsToDevicePixels="True">
+                            <Grid>
+                                <Border x:Name="SelectionIndicator"
+                                        Width="3"
+                                        Height="22"
+                                        Margin="-8,0,0,0"
+                                        HorizontalAlignment="Left"
+                                        VerticalAlignment="Center"
+                                        Background="{DynamicResource AccentFillColorDefaultBrush}"
+                                        CornerRadius="2"
+                                        Visibility="Collapsed" />
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ItemBorder"
+                                        Property="Background"
+                                        Value="{DynamicResource ControlFillColorSecondaryBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="ItemBorder" Property="Background">
+                                    <Setter.Value>
+                                        <SolidColorBrush Color="{DynamicResource AccentFillColorDefault}" Opacity="0.12" />
+                                    </Setter.Value>
+                                </Setter>
+                                <Setter TargetName="ItemBorder"
+                                        Property="BorderBrush"
+                                        Value="{DynamicResource ControlStrokeColorDefaultBrush}" />
+                                <Setter TargetName="SelectionIndicator" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ItemBorder" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!--
+        TreeViewItem 的系统模板会在深色主题下使用白色选中背景，并压缩嵌套项的内容宽度。
+        自定义模板让所有层级共用右边界，只有名称列随树深度缩进。
+        -->
+        <Style x:Key="TaskTreeViewItemStyle" TargetType="TreeViewItem">
+            <Setter Property="Margin" Value="0,1,0,1" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TreeViewItem">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="20" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <ToggleButton x:Name="Expander"
+                                          Grid.Row="0"
+                                          Grid.Column="0"
+                                          Width="20"
+                                          Height="34"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center"
+                                          Background="Transparent"
+                                          BorderThickness="0"
+                                          Focusable="False"
+                                          IsChecked="{Binding IsExpanded, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Grid Background="Transparent">
+                                            <Path x:Name="Chevron"
+                                                  Width="5"
+                                                  Height="9"
+                                                  HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center"
+                                                  Data="M 0,0 L 4,4.5 L 0,9"
+                                                  RenderTransformOrigin="0.5,0.5"
+                                                  Stroke="{DynamicResource TextFillColorSecondaryBrush}"
+                                                  StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"
+                                                  StrokeStartLineCap="Round"
+                                                  StrokeThickness="1.4" />
+                                        </Grid>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="Chevron"
+                                                        Property="Stroke"
+                                                        Value="{DynamicResource TextFillColorPrimaryBrush}" />
+                                            </Trigger>
+                                            <Trigger Property="IsChecked" Value="True">
+                                                <Setter TargetName="Chevron" Property="RenderTransform">
+                                                    <Setter.Value>
+                                                        <RotateTransform Angle="90" />
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+
+                            <Border x:Name="HeaderBorder"
+                                    Grid.Row="0"
+                                    Grid.Column="1"
+                                    Padding="0"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="Transparent"
+                                    BorderThickness="1"
+                                    CornerRadius="5"
+                                    SnapsToDevicePixels="True">
+                                <Grid>
+                                    <Border x:Name="TreeSelectionIndicator"
+                                            Width="3"
+                                            Height="20"
+                                            Margin="2,0,0,0"
+                                            HorizontalAlignment="Left"
+                                            VerticalAlignment="Center"
+                                            Background="{DynamicResource AccentFillColorDefaultBrush}"
+                                            CornerRadius="2"
+                                            Visibility="Collapsed" />
+                                    <ContentPresenter x:Name="PART_Header"
+                                                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                                      ContentSource="Header"
+                                                      RecognizesAccessKey="True"
+                                                      SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}" />
+                                </Grid>
+                            </Border>
+
+                            <ItemsPresenter x:Name="ItemsHost"
+                                            Grid.Row="1"
+                                            Grid.Column="1"
+                                            HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="HasItems" Value="False">
+                                <Setter TargetName="Expander" Property="Visibility" Value="Hidden" />
+                            </Trigger>
+                            <Trigger Property="IsExpanded" Value="False">
+                                <Setter TargetName="ItemsHost" Property="Visibility" Value="Collapsed" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="HeaderBorder"
+                                        Property="Background"
+                                        Value="{DynamicResource SubtleFillColorSecondaryBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="HeaderBorder"
+                                        Property="Background"
+                                        Value="{DynamicResource ControlFillColorSecondaryBrush}" />
+                                <Setter TargetName="HeaderBorder"
+                                        Property="BorderBrush"
+                                        Value="{DynamicResource ControlStrokeColorDefaultBrush}" />
+                                <Setter TargetName="TreeSelectionIndicator" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="HeaderBorder" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <HierarchicalDataTemplate DataType="{x:Type pulonia:PuloniaTaskNodeViewModel}"
+                                  ItemsSource="{Binding Children}">
+            <Border x:Name="NodeRow"
+                    MinHeight="34"
+                    Padding="8,2"
+                    Background="Transparent"
+                    CornerRadius="4">
+                <Border.ContextMenu>
+                    <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                        <MenuItem Header="编辑配置…"
+                                  Command="{Binding Data.ViewModel.EditNodeConfigurationCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}"
+                                  InputGestureText="F2" />
+                        <Separator />
+                        <MenuItem Header="添加分组"
+                                  Command="{Binding Data.ViewModel.AddGroupCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <!-- Tag 记录目标节点，子菜单项从父菜单项读取它作为命令参数的第一项。 -->
+                        <MenuItem Header="添加独立任务"
+                                  ItemContainerStyle="{StaticResource SoloTaskMenuItemStyle}"
+                                  ItemsSource="{Binding Data.ViewModel.SoloTaskMenu, Source={StaticResource PageBindingProxy}}"
+                                  Tag="{Binding}" />
+                        <MenuItem Header="添加地图追踪任务"
+                                  Command="{Binding Data.ViewModel.AddPathingTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <MenuItem Header="添加 JS 脚本任务"
+                                  Command="{Binding Data.ViewModel.AddJavascriptTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <MenuItem Header="添加录制回放任务"
+                                  Command="{Binding Data.ViewModel.AddKeyMouseTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <MenuItem Header="添加 Shell 任务"
+                                  Command="{Binding Data.ViewModel.AddShellTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <MenuItem Header="添加进程内 C# 任务"
+                                  Command="{Binding Data.ViewModel.AddCSharpTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <MenuItem Header="引用已有任务计划…"
+                                  Command="{Binding Data.ViewModel.AddPlanReferenceCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}" />
+                        <Separator />
+                        <MenuItem Header="复制子树"
+                                  Command="{Binding CopyCommand}"
+                                  InputGestureText="Ctrl+C" />
+                        <MenuItem Header="粘贴"
+                                  Command="{Binding Data.ViewModel.PasteCommand, Source={StaticResource PageBindingProxy}}"
+                                  CommandParameter="{Binding}"
+                                  InputGestureText="Ctrl+V"
+                                  IsEnabled="{Binding Data.ViewModel.CanPaste, Source={StaticResource PageBindingProxy}}" />
+                        <MenuItem Header="删除"
+                                  Command="{Binding DeleteCommand}"
+                                  InputGestureText="Delete"
+                                  IsEnabled="{Binding IsRoot, Converter={StaticResource InverseBooleanConverter}}" />
+                        <Separator />
+                        <MenuItem Header="撤销上次编辑"
+                                  Command="{Binding Data.ViewModel.SelectedDocument.UndoCommand, Source={StaticResource PageBindingProxy}}"
+                                  InputGestureText="Ctrl+Z" />
+                        <MenuItem Header="启用全部子任务"
+                                  Command="{Binding EnableAllChildrenCommand}"
+                                  IsEnabled="{Binding HasChildren}" />
+                        <MenuItem Header="更新此任务资源…"
+                                  Command="{Binding Data.ViewModel.Session.UpdateResourceVersionCommand, Source={StaticResource PageBindingProxy}, Mode=OneWay}"
+                                  CommandParameter="{Binding}"
+                                  IsEnabled="{Binding CanUpdateResourceVersion}" />
+                    </ContextMenu>
+                </Border.ContextMenu>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" MinWidth="180" />
+                        <ColumnDefinition Width="105" />
+                        <ColumnDefinition Width="70" />
+                    </Grid.ColumnDefinitions>
+                    <Grid Grid.Column="0" HorizontalAlignment="Left" VerticalAlignment="Center">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" />
+                        <Border Grid.Column="1" Margin="8,0,0,0" Padding="5,1" CornerRadius="3"
+                                Background="{DynamicResource SubtleFillColorSecondaryBrush}"
+                                Visibility="{Binding HasResourceNotice, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                ToolTip="{Binding ResourceUpdateToolTip}">
+                            <TextBlock FontSize="11" Text="{Binding ResourceUpdateText}"
+                                       Foreground="{DynamicResource SystemFillColorCautionBrush}" />
+                        </Border>
+                    </Grid>
+                    <TextBlock Grid.Column="1"
+                               Margin="8,0"
+                               VerticalAlignment="Center"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               Text="{Binding TypeDisplayName}" />
+                    <!-- 启用开关使用 Fluent Switch 样式；父级关闭时子节点开关仍保留自身选择，仅整行弱化显示。 -->
+                    <ui:ToggleSwitch Grid.Column="2"
+                                     HorizontalAlignment="Center"
+                                     VerticalAlignment="Center"
+                                     IsChecked="{Binding IsEnabled, Mode=TwoWay}"
+                                     ToolTip="关闭父组不会改写子任务的选择" />
+                </Grid>
+            </Border>
+            <HierarchicalDataTemplate.Triggers>
+                <DataTrigger Binding="{Binding IsEffectivelyEnabled}" Value="False">
+                    <Setter TargetName="NodeRow" Property="Opacity" Value="0.52" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsDisabledByParent}" Value="True">
+                    <Setter TargetName="NodeRow" Property="ToolTip" Value="父组已关闭；该节点自身的启用选择仍保留" />
+                </DataTrigger>
+            </HierarchicalDataTemplate.Triggers>
+        </HierarchicalDataTemplate>
+    </UserControl.Resources>
+
+    <Grid Margin="16,12,16,16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="220" MinWidth="160" />
+                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*" MinWidth="360" />
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Style="{StaticResource EditorCardStyle}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <DockPanel Margin="4,0,4,8">
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <ui:Button Width="26" Height="26" MinWidth="0" MinHeight="0" Padding="3" Margin="0,0,2,0"
+                                       Appearance="Transparent" Icon="{ui:SymbolIcon ArrowSync24}"
+                                       Command="{Binding ViewModel.Session.SyncAndUpdateResourcesCommand, Mode=OneWay}" ToolTip="同步全部计划引用的仓库，并更新所有可用任务资源"
+                                       AutomationProperties.Name="一键同步并更新" />
+                            <ui:Button Width="26" Height="26" MinWidth="0" MinHeight="0" Padding="3" Margin="0,0,2,0"
+                                       Appearance="Transparent" Icon="{ui:SymbolIcon ArrowDownload24}"
+                                       Command="{Binding ViewModel.Session.UpdateAllResourceVersionsCommand, Mode=OneWay}" ToolTip="使用本机仓库内容更新所有任务计划"
+                                       AutomationProperties.Name="更新所有任务计划" />
+                            <ui:Button Width="26" Height="26" MinWidth="0" MinHeight="0" Padding="3"
+                                       Appearance="Transparent" Icon="{ui:SymbolIcon ArrowClockwise24}"
+                                       Command="{Binding ViewModel.Session.RefreshResourceVersionsCommand, Mode=OneWay}" ToolTip="只检查本机仓库与任务使用版本，不访问远端"
+                                       AutomationProperties.Name="检查任务资源更新" />
+                        </StackPanel>
+                        <TextBlock FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" Text="计划" />
+                    </DockPanel>
+                    <ListBox x:Name="PlanList"
+                             Grid.Row="1"
+                              Padding="0"
+                              Background="Transparent"
+                              BorderThickness="0"
+                              behavior:RightClickSelectBehavior.Enabled="True"
+                              dd:DragDrop.DropHandler="{Binding ViewModel}"
+                              dd:DragDrop.IsDragSource="True"
+                              dd:DragDrop.IsDropTarget="True"
+                              dd:DragDrop.UseDefaultDragAdorner="True"
+                              ItemContainerStyle="{StaticResource PlanListBoxItemStyle}"
+                              ItemsSource="{Binding ViewModel.Documents}"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                              SelectedItem="{Binding ViewModel.SelectedDocument, Mode=TwoWay}">
+                        <ListBox.InputBindings>
+                            <KeyBinding Key="F2"
+                                        Command="{Binding ViewModel.RenamePlanCommand}"
+                                        CommandParameter="{Binding SelectedItem, ElementName=PlanList}" />
+                        </ListBox.InputBindings>
+                        <ListBox.ContextMenu>
+                            <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                <MenuItem Header="新建计划"
+                                          Command="{Binding Data.ViewModel.NewPlanCommand, Source={StaticResource PageBindingProxy}}" />
+                                <MenuItem Header="重命名"
+                                          Command="{Binding Data.ViewModel.RenamePlanCommand, Source={StaticResource PageBindingProxy}}"
+                                          CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType={x:Type ContextMenu}}}" />
+                                <MenuItem Header="复制"
+                                          Command="{Binding Data.ViewModel.CopyPlanCommand, Source={StaticResource PageBindingProxy}}"
+                                          CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType={x:Type ContextMenu}}}" />
+                                <MenuItem Header="删除"
+                                          Command="{Binding Data.ViewModel.DeletePlanCommand, Source={StaticResource PageBindingProxy}}"
+                                          CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType={x:Type ContextMenu}}}" />
+                                <Separator />
+                                <MenuItem Header="重新加载"
+                                          Command="{Binding Data.ViewModel.ReloadCommand, Source={StaticResource PageBindingProxy}}" />
+                            </ContextMenu>
+                        </ListBox.ContextMenu>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid MinHeight="38">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <!-- 双击重命名只响应名称区域，不能把图标按钮的快速点击当成重命名。 -->
+                                    <ContentControl VerticalAlignment="Center" Margin="0,0,4,0" HorizontalContentAlignment="Stretch">
+                                        <b:Interaction.Triggers>
+                                            <b:EventTrigger EventName="MouseDoubleClick">
+                                                <b:InvokeCommandAction Command="{Binding Data.ViewModel.RenamePlanCommand, Source={StaticResource PageBindingProxy}}"
+                                                                       CommandParameter="{Binding}" />
+                                            </b:EventTrigger>
+                                        </b:Interaction.Triggers>
+                                        <StackPanel>
+                                            <TextBlock FontWeight="SemiBold" Text="{Binding Name}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" />
+                                            <TextBlock FontSize="11"
+                                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                                       Text="{Binding Revision, StringFormat=修订 {0}}" />
+                                        </StackPanel>
+                                    </ContentControl>
+                                    <!-- 新运行入口位于每张计划卡片，不依赖历史选中状态；续跑仍使用记录视图中的独立命令。 -->
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                        <!-- 资源已是最新或没有可更新项时，直接隐藏按钮而不是置灰。 -->
+                                        <ui:Button Width="26" Height="26" MinWidth="0" MinHeight="0" Padding="3" Margin="0,0,2,0"
+                                                   Appearance="Transparent" Icon="{ui:SymbolIcon ArrowDownload24}"
+                                                   Visibility="{Binding HasResourceUpdates, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                   Command="{Binding Data.ViewModel.Session.ConfirmResourceUpdatesCommand, Source={StaticResource PageBindingProxy}, Mode=OneWay}"
+                                                   CommandParameter="{Binding}" ToolTip="{Binding ResourceUpdateSummary}"
+                                                   ToolTipService.ShowOnDisabled="True"
+                                                   AutomationProperties.Name="更新此计划任务资源" />
+                                        <ui:Button Width="26" Height="26" MinWidth="0" MinHeight="0" Padding="3"
+                                                   Appearance="Transparent" Icon="{ui:SymbolIcon Play24}"
+                                                   Command="{Binding Data.ViewModel.RunPlanCommand, Source={StaticResource PageBindingProxy}}"
+                                                   CommandParameter="{Binding}" ToolTip="新执行此计划（默认不限时，不续跑历史）"
+                                                   AutomationProperties.Name="新执行此计划" />
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Border>
+
+            <!-- 计划面板与任务面板之间的拖拽分割条，平时与背景同色，悬停时显色提示可拖拽。 -->
+            <GridSplitter Grid.Column="1"
+                          Width="4"
+                          HorizontalAlignment="Center"
+                          VerticalAlignment="Stretch"
+                          Focusable="False">
+                <GridSplitter.Style>
+                    <Style TargetType="GridSplitter">
+                        <Setter Property="Background" Value="Transparent" />
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </GridSplitter.Style>
+            </GridSplitter>
+
+            <Border Grid.Column="2" Padding="0" Style="{StaticResource EditorCardStyle}">
+                <TabControl BorderThickness="0" SelectedIndex="{Binding ViewModel.SelectedPlanTabIndex}">
+                    <TabItem Header="任务">
+                        <Grid Margin="8">
+                            <Grid>
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+                                    <Border Padding="22,6,4,6"
+                                             Background="{DynamicResource SubtleFillColorSecondaryBrush}"
+                                             CornerRadius="4">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                 <ColumnDefinition Width="*" />
+                                                 <ColumnDefinition Width="105" />
+                                                 <ColumnDefinition Width="70" />
+                                             </Grid.ColumnDefinitions>
+                                             <TextBlock FontWeight="SemiBold" Text="名称" />
+                                             <TextBlock Grid.Column="1" Margin="8,0" FontWeight="SemiBold" Text="类型" />
+                                             <TextBlock Grid.Column="2" HorizontalAlignment="Center" FontWeight="SemiBold" Text="启用" />
+                                         </Grid>
+                                     </Border>
+                                    <TreeView x:Name="TaskTree"
+                                              Grid.Row="1"
+                                              Padding="2,6"
+                                               Background="Transparent"
+                                               BorderThickness="0"
+                                               behavior:RightClickSelectBehavior.Enabled="True"
+                                               dd:DragDrop.DropHandler="{Binding ViewModel}"
+                                              dd:DragDrop.IsDragSource="True"
+                                              dd:DragDrop.IsDropTarget="True"
+                                              dd:DragDrop.UseDefaultDragAdorner="True"
+                                              Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                              ItemContainerStyle="{StaticResource TaskTreeViewItemStyle}"
+                                              ItemsSource="{Binding ViewModel.SelectedDocument.RootNode.Children}"
+                                               ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                               ScrollViewer.VerticalScrollBarVisibility="Auto">
+                                        <!-- 计划根节点属于内部结构；在树空白处打开的菜单始终向根级任务集合操作。 -->
+                                        <TreeView.ContextMenu>
+                                            <ContextMenu>
+                                                <MenuItem Header="添加分组"
+                                                          Command="{Binding Data.ViewModel.AddGroupCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <!-- 空白处菜单的目标节点固定为当前计划的根节点。 -->
+                                                <MenuItem Header="添加独立任务"
+                                                          ItemContainerStyle="{StaticResource SoloTaskMenuItemStyle}"
+                                                          ItemsSource="{Binding Data.ViewModel.SoloTaskMenu, Source={StaticResource PageBindingProxy}}"
+                                                          Tag="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="添加地图追踪任务"
+                                                          Command="{Binding Data.ViewModel.AddPathingTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="添加 JS 脚本任务"
+                                                          Command="{Binding Data.ViewModel.AddJavascriptTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="添加录制回放任务"
+                                                          Command="{Binding Data.ViewModel.AddKeyMouseTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="添加 Shell 任务"
+                                                          Command="{Binding Data.ViewModel.AddShellTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="添加进程内 C# 任务"
+                                                          Command="{Binding Data.ViewModel.AddCSharpTaskCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <MenuItem Header="引用已有任务计划…"
+                                                          Command="{Binding Data.ViewModel.AddPlanReferenceCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}" />
+                                                <Separator />
+                                                <MenuItem Header="粘贴到计划末尾"
+                                                          Command="{Binding Data.ViewModel.PasteCommand, Source={StaticResource PageBindingProxy}}"
+                                                          CommandParameter="{Binding Data.ViewModel.SelectedDocument.RootNode, Source={StaticResource PageBindingProxy}}"
+                                                          InputGestureText="Ctrl+V"
+                                                          IsEnabled="{Binding Data.ViewModel.CanPaste, Source={StaticResource PageBindingProxy}}" />
+                                                <Separator />
+                                                <MenuItem Header="撤销上次编辑"
+                                                          Command="{Binding Data.ViewModel.SelectedDocument.UndoCommand, Source={StaticResource PageBindingProxy}}"
+                                                          InputGestureText="Ctrl+Z" />
+                                                <MenuItem Header="启用全部任务"
+                                                          Command="{Binding Data.ViewModel.SelectedDocument.RootNode.EnableAllChildrenCommand, Source={StaticResource PageBindingProxy}}"
+                                                          IsEnabled="{Binding Data.ViewModel.SelectedDocument.RootNode.HasChildren, Source={StaticResource PageBindingProxy}}" />
+                                            </ContextMenu>
+                                        </TreeView.ContextMenu>
+                                        <TreeView.InputBindings>
+                                            <KeyBinding Key="F2"
+                                                        Command="{Binding ViewModel.EditNodeConfigurationCommand}"
+                                                        CommandParameter="{Binding SelectedItem, ElementName=TaskTree}" />
+                                            <KeyBinding Key="C"
+                                                        Modifiers="Control"
+                                                        Command="{Binding ViewModel.SelectedDocument.SelectedNode.CopyCommand}" />
+                                            <KeyBinding Key="V"
+                                                        Modifiers="Control"
+                                                        Command="{Binding ViewModel.PasteCommand}"
+                                                        CommandParameter="{Binding ViewModel.SelectedDocument.SelectedNode}" />
+                                            <KeyBinding Key="Z"
+                                                        Modifiers="Control"
+                                                        Command="{Binding ViewModel.SelectedDocument.UndoCommand}" />
+                                            <KeyBinding Key="Delete"
+                                                        Command="{Binding ViewModel.SelectedDocument.SelectedNode.DeleteCommand}" />
+                                        </TreeView.InputBindings>
+                                        <TreeView.Resources>
+                                            <Style BasedOn="{StaticResource TaskTreeViewItemStyle}"
+                                                   TargetType="TreeViewItem" />
+                                        </TreeView.Resources>
+                                        <b:Interaction.Triggers>
+                                            <b:EventTrigger EventName="MouseDoubleClick">
+                                                <b:InvokeCommandAction Command="{Binding ViewModel.EditNodeConfigurationCommand}"
+                                                                       CommandParameter="{Binding SelectedItem, ElementName=TaskTree}" />
+                                            </b:EventTrigger>
+                                        </b:Interaction.Triggers>
+                                        <b:Interaction.Behaviors>
+                                            <behavior:TreeViewSelectedItemBehavior SelectedItem="{Binding ViewModel.SelectedDocument.SelectedNode, Mode=TwoWay}" />
+                                        </b:Interaction.Behaviors>
+                                    </TreeView>
+                                    <TextBlock Grid.Row="1"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                               IsHitTestVisible="False"
+                                               Text="暂无任务，在空白处右键添加">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding ViewModel.SelectedDocument.RootNode.HasChildren}"
+                                                                 Value="False">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+                            </Grid>
+                        </Grid>
+                    </TabItem>
+                    <TabItem Header="执行记录">
+                        <controls:PuloniaTaskHistoryView Margin="12" DataContext="{Binding ViewModel.History}" />
+                    </TabItem>
+                    <TabItem Header="触发方式">
+                        <controls:PuloniaTaskTriggerView DataContext="{Binding ViewModel.TriggerSettings, Mode=OneWay}" />
+                    </TabItem>
+                </TabControl>
+            </Border>
+        </Grid>
+
+        <Grid Grid.Row="1" Margin="2,10,2,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock VerticalAlignment="Center"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Text="{Binding ViewModel.StatusMessage, Mode=OneWay}"
+                       TextTrimming="CharacterEllipsis" />
+            <ProgressBar Grid.Column="1"
+                         Width="110"
+                         Height="4"
+                         Margin="12,0,0,0"
+                         IsIndeterminate="True">
+                <ProgressBar.Style>
+                    <Style TargetType="ProgressBar" BasedOn="{StaticResource {x:Type ProgressBar}}">
+                        <Setter Property="Visibility" Value="Collapsed" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding ViewModel.IsBusy, Mode=OneWay}" Value="True">
+                                <Setter Property="Visibility" Value="Visible" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </ProgressBar.Style>
+            </ProgressBar>
+        </Grid>
+    </Grid>
+</UserControl>

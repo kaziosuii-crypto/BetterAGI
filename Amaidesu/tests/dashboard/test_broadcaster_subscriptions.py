@@ -1,0 +1,254 @@
+"""EventBroadcaster：start 订阅哪些事件、各事件转成什么 WS type 与载荷、stop 退订全部"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+
+from src.modules.dashboard.websocket.broadcaster import EventBroadcaster
+from src.modules.events.names import CoreEvents
+from src.modules.events.payloads import (
+    BodyEventPayload,
+    GameChatPayload,
+    GamePayload,
+    RoomMessagePayload,
+    RoomMessageUser,
+    RoomStateWatchedPayload,
+    RundownChangedPayload,
+    StreamerNotebookChangedPayload,
+    StreamerSpeechPayload,
+    TaskChangedPayload,
+    ToolResultPayload,
+    UtteranceFailedPayload,
+    UtteranceFinishedPayload,
+    UtteranceStartedPayload,
+)
+from src.modules.events.payloads.tool_health import ToolHealthPayload
+
+
+class _FakeEventBus:
+    def __init__(self) -> None:
+        self.subscribed: dict[str, Any] = {}
+        self.unsubscribed: list[tuple[str, Any]] = []
+
+    def on(self, event_name: str, handler, model_class) -> None:
+        self.subscribed[event_name] = (handler, model_class)
+
+    def off(self, event_name: str, handler) -> None:
+        self.unsubscribed.append((event_name, handler))
+        self.subscribed.pop(event_name, None)
+
+
+class _FakeWS:
+    def __init__(self) -> None:
+        self.broadcast = AsyncMock(return_value=1)
+
+
+@pytest.fixture
+async def started():
+    """(bus, ws, deliver)：deliver(event, payload) 走已订阅的 handler，返回最近一次广播调用。"""
+    bus, ws = _FakeEventBus(), _FakeWS()
+    broadcaster = EventBroadcaster(event_bus=bus, ws_handler=ws)
+    await broadcaster.start()
+    bus.broadcaster = broadcaster  # type: ignore[attr-defined]
+
+    async def deliver(event_name: str, payload: Any, subscription: str | None = None):
+        handler, _model = bus.subscribed[subscription or event_name]
+        await handler(event_name, payload, source="test")
+        return ws.broadcast.await_args
+
+    yield bus, ws, deliver
+    await broadcaster.stop()
+
+
+def _room(message_type: str) -> RoomMessagePayload:
+    return RoomMessagePayload(message_type=message_type, user=RoomMessageUser(id="u1", name="测试"), content="")  # type: ignore[arg-type]
+
+
+async def test_start_subscribes_to_every_forwarded_event_and_stop_unsubscribes_all(started) -> None:
+    bus, _ws, _deliver = started
+    expected = {
+        CoreEvents.ROOM_MESSAGE_DANMAKU,
+        CoreEvents.ROOM_MESSAGE_GIFT,
+        CoreEvents.ROOM_MESSAGE_SUPER_CHAT,
+        CoreEvents.ROOM_MESSAGE_GUARD,
+        CoreEvents.ROOM_MESSAGE_ENTER,
+        CoreEvents.ROOM_STATE_WATCHED_COUNT,
+        CoreEvents.RUNDOWN_CHANGED,
+        CoreEvents.TOOL_RESULT_WILDCARD,
+        CoreEvents.TOOL_HEALTH_WILDCARD,
+        CoreEvents.STREAMER_SPEECH,
+        CoreEvents.STREAMER_NOTEBOOK_CHANGED,
+        CoreEvents.GAME_REPORT,
+        CoreEvents.GAME_ATTENTION_REQUIRED,
+        CoreEvents.GAME_ERROR,
+        CoreEvents.GAME_MILESTONE,
+        CoreEvents.GAME_BODY_WILDCARD,
+        CoreEvents.GAME_CHAT_WILDCARD,
+        CoreEvents.TTS_UTTERANCE_STARTED,
+        CoreEvents.TTS_UTTERANCE_FINISHED,
+        CoreEvents.TASK_CHANGED,
+    }
+    assert expected <= set(bus.subscribed)
+    assert bus.subscribed[CoreEvents.TASK_CHANGED][1] is TaskChangedPayload
+
+    subscribed_count = len(bus.subscribed)
+    await bus.broadcaster.stop()  # type: ignore[attr-defined]
+    assert len(bus.unsubscribed) == subscribed_count and bus.subscribed == {}
+
+
+@pytest.mark.parametrize(
+    "event_name",
+    [
+        CoreEvents.ROOM_MESSAGE_GIFT,
+        CoreEvents.ROOM_MESSAGE_SUPER_CHAT,
+        CoreEvents.ROOM_MESSAGE_GUARD,
+        CoreEvents.ROOM_MESSAGE_ENTER,
+    ],
+)
+async def test_room_message_events_share_one_ws_type(started, event_name: str) -> None:
+    _bus, _ws, deliver = started
+    payload = _room(event_name.rsplit(".", 1)[-1])
+    call = await deliver(event_name, payload)
+    assert call.args[0] == "room.message" and isinstance(call.args[1], dict)
+    assert call.kwargs.get("message_id") == payload.id
+
+
+async def test_room_state_watched_count_folds_to_room_state(started) -> None:
+    """累计观看人次状态快照折叠进 room.state 族类型，载荷字段透传。"""
+    _bus, _ws, deliver = started
+    payload = RoomStateWatchedPayload(platform="bilibili", audience_total=12000)
+    call = await deliver(CoreEvents.ROOM_STATE_WATCHED_COUNT, payload)
+    assert call.args[0] == "room.state" and isinstance(call.args[1], dict)
+    assert (call.args[1]["platform"], call.args[1]["audience_total"]) == ("bilibili", 12000)
+    assert call.kwargs.get("message_id") == payload.id
+
+
+async def test_rundown_changed_and_streamer_speech_payloads(started) -> None:
+    _bus, _ws, deliver = started
+    rundown = RundownChangedPayload(
+        rundown_id="rd_test", segment_id="self_intro", segment_title="自我介绍", index=1, total=4, by="human"
+    )
+    call = await deliver(CoreEvents.RUNDOWN_CHANGED, rundown)
+    assert call.args[0] == "rundown.changed"
+    assert (call.args[1]["segment_id"], call.args[1]["by"]) == ("self_intro", "human")
+
+    speech = StreamerSpeechPayload(
+        utterance_id="utt_1700000000000_1", text="欢迎来到直播间！", emotion="happy", emotion_intensity=0.5
+    )
+    call = await deliver(CoreEvents.STREAMER_SPEECH, speech)
+    assert call.args[0] == "streamer.speech" and call.kwargs.get("message_id") == speech.id
+    assert (call.args[1]["utterance_id"], call.args[1]["text"], call.args[1]["emotion"]) == (
+        "utt_1700000000000_1",
+        "欢迎来到直播间！",
+        "happy",
+    )
+
+
+async def test_streamer_notebook_changed_payload_passthrough(started) -> None:
+    """备忘录观测事件直通广播：WS type 为精确事件名，notebook 全文透传。"""
+    _bus, _ws, deliver = started
+    payload = StreamerNotebookChangedPayload(notebook="屋里没有床，别再找床了")
+    call = await deliver(CoreEvents.STREAMER_NOTEBOOK_CHANGED, payload)
+    assert call.args[0] == "streamer.notebook.changed" and call.kwargs.get("message_id") == payload.id
+    assert call.args[1]["notebook"] == "屋里没有床，别再找床了"
+
+
+async def test_wildcard_subscriptions_keep_concrete_event_name_as_ws_type(started) -> None:
+    """tool.result.# / tool.health.# 通配订阅收到具体事件名后，WS type 沿用该具体名而不是通配串。"""
+    _bus, _ws, deliver = started
+    result = ToolResultPayload(tool_name="speak", status="success", result={"speech_text": "你好"})
+    call = await deliver("tool.result.speak", result, CoreEvents.TOOL_RESULT_WILDCARD)
+    assert call.args[0] == "tool.result.speak"
+    assert (call.args[1]["tool_name"], call.args[1]["status"]) == ("speak", "success")
+
+    health = ToolHealthPayload(
+        tool_name="maicraft_speak",
+        provider="maicraft",
+        state="open",
+        failure_count=3,
+        last_error="ConnectionError: MCP server 未连接且重连失败",
+        timestamp_ms=1706745600000,
+    )
+    call = await deliver("tool.health.maicraft_speak", health, CoreEvents.TOOL_HEALTH_WILDCARD)
+    assert call.args[0] == "tool.health.maicraft_speak" and call.kwargs.get("message_id") == health.id
+    for field in ("tool_name", "provider", "state", "failure_count", "last_error", "timestamp_ms"):
+        assert call.args[1][field] == getattr(health, field)
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event_type", "extra"),
+    [
+        (CoreEvents.GAME_REPORT, "report", {"report_kind": "delivery"}),
+        (CoreEvents.GAME_ATTENTION_REQUIRED, "attention_required", {}),
+        (CoreEvents.GAME_ERROR, "error", {}),
+        (CoreEvents.GAME_MILESTONE, "milestone", {}),
+    ],
+)
+async def test_game_events_pass_through_with_concrete_name(started, event_name, event_type, extra) -> None:
+    _bus, _ws, deliver = started
+    payload = GamePayload(game="minecraft", event_type=event_type, message="交付总结", **extra)  # type: ignore[arg-type]
+    call = await deliver(event_name, payload)
+    assert call.args[0] == event_name and call.kwargs.get("message_id") == payload.id
+    assert (call.args[1]["event_type"], call.args[1]["message"]) == (event_type, "交付总结")
+
+
+async def test_task_event_passes_through(started) -> None:
+    _bus, _ws, deliver = started
+    task = TaskChangedPayload(
+        task_id="deleg_1", status="running", initiator="operator", executor="minecraft", summary="执行 Agent 已开始处理"
+    )
+    assert (await deliver(CoreEvents.TASK_CHANGED, task)).args[0] == CoreEvents.TASK_CHANGED
+
+
+async def test_game_body_and_chat_wildcards_keep_concrete_event_name(started) -> None:
+    """game.body.# / game.chat.# 通配订阅收到具体事件名后，WS type 沿用该具体名。"""
+    _bus, _ws, deliver = started
+    body = BodyEventPayload(
+        game="minecraft", kind="attacked", summary="正在被僵尸攻击", attacker="minecraft:zombie", hits=2
+    )
+    call = await deliver(CoreEvents.GAME_BODY_ATTACKED, body, CoreEvents.GAME_BODY_WILDCARD)
+    assert call.args[0] == CoreEvents.GAME_BODY_ATTACKED and call.kwargs.get("message_id") == body.id
+    assert (call.args[1]["kind"], call.args[1]["attacker"], call.args[1]["hits"]) == ("attacked", "minecraft:zombie", 2)
+
+    chat = GameChatPayload(game="minecraft", kind="player", sender="Steve", content="你在干嘛")
+    call = await deliver(CoreEvents.GAME_CHAT_RECEIVED, chat, CoreEvents.GAME_CHAT_WILDCARD)
+    assert call.args[0] == CoreEvents.GAME_CHAT_RECEIVED
+    assert (call.args[1]["sender"], call.args[1]["content"]) == ("Steve", "你在干嘛")
+
+
+@pytest.mark.asyncio
+async def test_tts_utterance_started_and_finished_pass_through(started) -> None:
+    """TTS 播报态两端点直通转发：前端按 utterance_id 关联到发言行显示播报态。"""
+    _bus, _ws, deliver = started
+    started_payload = UtteranceStartedPayload(
+        utterance_id="utt_1", speech_text="大家好", engine="edge", duration_ms=None
+    )
+    call = await deliver(CoreEvents.TTS_UTTERANCE_STARTED, started_payload)
+    assert call.args[0] == CoreEvents.TTS_UTTERANCE_STARTED
+    assert call.args[1]["utterance_id"] == "utt_1"
+
+    finished_payload = UtteranceFinishedPayload(utterance_id="utt_1", engine="edge", duration_ms=2000)
+    call = await deliver(CoreEvents.TTS_UTTERANCE_FINISHED, finished_payload)
+    assert call.args[0] == CoreEvents.TTS_UTTERANCE_FINISHED
+    assert call.args[1]["duration_ms"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_tts_utterance_failed_passes_through(started) -> None:
+    """TTS 发声失败进时间线：订阅 tts.utterance.failed 并以事件名直通转发。"""
+    bus, _ws, deliver = started
+    _handler, model_cls = bus.subscribed[CoreEvents.TTS_UTTERANCE_FAILED]
+    assert model_cls is UtteranceFailedPayload, "模型类必须是 UtteranceFailedPayload"
+
+    payload = UtteranceFailedPayload(
+        utterance_id="utt_1",
+        speech_text="大家好呀",
+        engine="gptsovits",
+        error_message="connection refused",
+    )
+    call = await deliver(CoreEvents.TTS_UTTERANCE_FAILED, payload)
+    assert call.args[0] == CoreEvents.TTS_UTTERANCE_FAILED
+    assert call.args[1]["error_message"] == "connection refused"

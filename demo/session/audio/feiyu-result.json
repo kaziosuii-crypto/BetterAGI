@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "style": "cute",
+  "sample_rate": 24000,
+  "load_seconds": 14.69,
+  "peak_vram_gb": 3.32,
+  "results": [
+    {
+      "index": 1,
+      "text": "大家好，今天来跑一段须弥的探索路线。",
+      "path": "E:\\BetterAGI\\demo\\session\\audio\\tts-001.wav",
+      "seconds": 3.8,
+      "peak": 0.52878,
+      "elapsed": 7.332
+    },
+    {
+      "index": 2,
+      "text": "哎？这边居然藏着一个宝箱！",
+      "path": "E:\\BetterAGI\\demo\\session\\audio\\tts-002.wav",
+      "seconds": 3.08,
+      "peak": 0.45174,
+      "elapsed": 3.335
+    },
+    {
+      "index": 3,
+      "text": "拿到了，今天的运气不错嘛。",
+      "path": "E:\\BetterAGI\\demo\\session\\audio\\tts-003.wav",
+      "seconds": 2.8,
+      "peak": 0.47046,
+      "elapsed": 3.058
+    }
+  ]
+}

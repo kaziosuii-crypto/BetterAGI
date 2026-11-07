@@ -1,0 +1,748 @@
+<template>
+  <div class="event-log">
+    <!-- 页面标题 -->
+    <header class="page-header">
+      <div class="header-left">
+        <h1 class="page-title">事件日志</h1>
+        <p class="page-subtitle">实时监控系统事件流，可回查落盘历史（跨启动）</p>
+      </div>
+      <div class="header-actions">
+        <el-popover placement="bottom-end" :width="380" trigger="click" @show="fetchBusStats">
+          <template #reference>
+            <el-tag type="info" effect="plain" size="small" class="bus-stats-tag">
+              累计发射 {{ busStats?.total_events ?? 0 }} 次
+            </el-tag>
+          </template>
+          <div class="bus-stats">
+            <div class="bus-stats-header">
+              <span>EventBus 累计（进程启动以来）</span>
+              <el-button
+                size="small"
+                text
+                :icon="Refresh"
+                aria-label="刷新事件总线统计"
+                :loading="busStatsLoading"
+                @click="fetchBusStats"
+              />
+            </div>
+            <div class="bus-stats-summary">
+              共 {{ busStats?.total_events ?? 0 }} 次发射 · {{ busStats?.total_subscribers ?? 0 }}
+              个订阅
+            </div>
+            <el-table
+              v-if="busStatsByName.length > 0"
+              :data="busStatsByName"
+              size="small"
+              max-height="320"
+            >
+              <el-table-column prop="name" label="事件名">
+                <template #default="{ row }">
+                  <code class="bus-event-name">{{ row.name }}</code>
+                </template>
+              </el-table-column>
+              <el-table-column prop="count" label="发射次数" width="90" align="right" />
+            </el-table>
+            <el-empty v-else description="暂无统计" :image-size="60" />
+          </div>
+        </el-popover>
+        <el-tag :type="windowActive ? 'warning' : 'primary'" effect="plain" size="small">
+          {{ windowActive ? '历史浏览' : '实时' }}
+        </el-tag>
+        <el-tag type="info" effect="plain" size="small">
+          {{ filteredEvents.length }} / {{ displayEvents.length }} 条事件
+        </el-tag>
+      </div>
+    </header>
+
+    <!-- 筛选工具栏 -->
+    <section class="filter-toolbar">
+      <div class="filter-left">
+        <!-- 搜索框（在当前显示列表内检索：实时尾部或已加载的历史窗口） -->
+        <el-input
+          v-model="searchQuery"
+          placeholder="搜索事件内容..."
+          :prefix-icon="Search"
+          clearable
+          style="width: 240px"
+        />
+
+        <!-- 事件类型筛选（动态生成） -->
+        <el-select
+          v-model="selectedTypes"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          placeholder="筛选事件类型"
+          clearable
+          filterable
+          style="width: 280px"
+        >
+          <el-option v-for="type in availableEventTypes" :key="type" :label="type" :value="type">
+            <span class="type-option">
+              <span class="type-name">{{ type }}</span>
+              <span class="type-count">{{ getEventTypeCount(type) }}</span>
+            </span>
+          </el-option>
+        </el-select>
+      </div>
+
+      <div class="filter-right">
+        <!-- 暂停/继续（冻结显示，后台仍在接收） -->
+        <el-button :type="isPaused ? 'primary' : 'default'" @click="togglePause">
+          <el-icon><component :is="pausePlayIcon" /></el-icon>
+          {{ isPaused ? '继续' : '暂停' }}
+        </el-button>
+
+        <!-- 清空 -->
+        <el-button :disabled="displayEvents.length === 0" @click="clearEvents">
+          <el-icon><Delete /></el-icon>
+          清空
+        </el-button>
+      </div>
+    </section>
+
+    <!-- 历史查询栏（加载更早 / 加载更晚 / 时间跳转 / 回到实时） -->
+    <section class="history-section">
+      <HistoryBar
+        :loading="windowLoading"
+        :has-older="windowHasOlder"
+        :has-newer="windowHasNewer"
+        :window-active="windowActive"
+        exhausted-text="已到可查范围最早的记录（默认范围=本次启动，更早请用时间跳转）"
+        @load-older="loadOlder"
+        @load-newer="loadNewer"
+        @jump="jump"
+        @exit="onExitWindow"
+      />
+    </section>
+
+    <!-- 事件列表 -->
+    <section class="event-list-section">
+      <div ref="eventListRef" class="event-list" @scroll="handleScroll">
+        <div v-if="filteredEvents.length === 0" class="empty-state">
+          <el-icon :size="48" color="var(--text-placeholder)">
+            <Document />
+          </el-icon>
+          <span>{{
+            isPaused
+              ? '事件显示已暂停（后台仍在接收）'
+              : displayEvents.length === 0
+                ? '等待事件...'
+                : '没有匹配的事件'
+          }}</span>
+        </div>
+
+        <div v-else class="events-container">
+          <div v-if="renderTrimmed" class="render-trim-note">
+            仅显示最新 {{ MAX_RENDER_ROWS }} 条，可加载更早或缩小筛选范围
+          </div>
+          <div
+            v-for="event in visibleEvents"
+            :key="event.id"
+            class="event-row"
+            role="button"
+            tabindex="0"
+            @click="toggleEventExpand(event.id)"
+            @keydown.enter.prevent="toggleEventExpand(event.id)"
+            @keydown.space.prevent="toggleEventExpand(event.id)"
+          >
+            <span class="event-time mono">{{ formatEventTime(event.timestamp_ms) }}</span>
+            <span class="event-type" :class="getEventClass(event.type)">{{ event.type }}</span>
+            <div class="event-data-wrapper">
+              <pre
+                class="event-data"
+                :class="{ expanded: expandedEvents.has(event.id) }"
+                v-html="formatEventDataHtml(event.data, expandedEvents.has(event.id))"
+              ></pre>
+              <span v-if="shouldShowExpand(event.data)" class="expand-hint">
+                {{ expandedEvents.has(event.id) ? '点击收起' : '点击展开' }}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, markRaw, onMounted, onUnmounted, ref } from 'vue';
+import { Document, VideoPause, VideoPlay, Search, Delete, Refresh } from '@element-plus/icons-vue';
+import { ElMessage } from 'element-plus';
+import { useEventsStore } from '@/stores';
+import { storeToRefs } from 'pinia';
+import { EVENT } from '@/types/events';
+import { useLogStreamQuery } from '@/composables/useLogStreamQuery';
+import { useStreamPageQuery } from '@/composables/useStreamPageQuery';
+import { useAutoScrollFollow } from '@/composables/useAutoScrollFollow';
+import { debugApi } from '@/api';
+import { confirmAction } from '@/utils/confirmAction';
+import type { EventBusStatsResponse } from '@/types';
+import DOMPurify from 'dompurify';
+import { formatDateMD, formatTimeHMS } from '@/utils/format';
+import hljs from 'highlight.js/lib/core';
+import json from 'highlight.js/lib/languages/json';
+import 'highlight.js/styles/atom-one-dark.min.css';
+
+// 注册 JSON 语言
+hljs.registerLanguage('json', json);
+
+const eventsStore = useEventsStore();
+const { events, windowEvents, windowHasOlder, windowHasNewer, windowLoading } =
+  storeToRefs(eventsStore);
+
+// 状态
+const eventListRef = ref<HTMLElement | null>(null);
+const isPaused = ref(false);
+const searchQuery = ref('');
+const selectedTypes = ref<string[]>([]);
+const expandedEvents = ref<Set<string>>(new Set());
+
+// 深链四件套（初始化/回写/恢复）：机械在 useStreamPageQuery，
+// 键名映射与搜索词的单值/trim 语义是本页域知识
+useStreamPageQuery({
+  fields: [
+    {
+      key: 'q',
+      single: true,
+      get: () => (searchQuery.value.trim() ? [searchQuery.value] : []),
+      set: values => {
+        searchQuery.value = values[0] ?? '';
+      },
+    },
+    {
+      key: 'type',
+      get: () => selectedTypes.value,
+      set: values => {
+        selectedTypes.value = values;
+      },
+    },
+  ],
+  watchSources: [searchQuery, selectedTypes],
+});
+
+// 渲染上限：非虚拟滚动下列表面积的护栏（超出时渲染最新一端并提示）
+const MAX_RENDER_ROWS = 400;
+
+// 动态图标
+const pausePlayIcon = computed(() => (isPaused.value ? markRaw(VideoPlay) : markRaw(VideoPause)));
+
+// 显示列表/筛选/计数/翻页锚定：共享查询机械（谓词为本页域知识）
+const {
+  displayItems: displayEvents,
+  windowActive,
+  filteredItems: filteredEvents,
+  countBy,
+  loadOlder,
+  loadNewer,
+  jump,
+} = useLogStreamQuery({
+  live: events,
+  window: windowEvents,
+  fetchOlder: () => eventsStore.fetchOlder(),
+  fetchNewer: () => eventsStore.fetchNewer(),
+  jumpTo: timestampMs => eventsStore.jumpTo(timestampMs),
+  listEl: eventListRef,
+  predicates: [
+    event => selectedTypes.value.length === 0 || selectedTypes.value.includes(event.type),
+    event => {
+      if (!searchQuery.value.trim()) return true;
+      const query = searchQuery.value.toLowerCase();
+      if (event.type.toLowerCase().includes(query)) return true;
+      return JSON.stringify(event.data).toLowerCase().includes(query);
+    },
+  ],
+});
+
+// 获取显示列表中出现过的唯一事件类型（动态生成）
+const availableEventTypes = computed(() => {
+  const types = new Set<string>();
+  displayEvents.value.forEach(event => {
+    types.add(event.type);
+  });
+  return Array.from(types).sort();
+});
+
+// 获取某个事件类型的数量
+function getEventTypeCount(type: string): number {
+  return countBy(event => event.type === type);
+}
+
+// EventBus 累计统计（进程启动以来的发射/订阅计数；与上方会话内实时流计数互补）
+const busStats = ref<EventBusStatsResponse | null>(null);
+const busStatsLoading = ref(false);
+
+const busStatsByName = computed(() => {
+  const byName = busStats.value?.events_by_name ?? {};
+  return Object.entries(byName)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count);
+});
+
+async function fetchBusStats(): Promise<void> {
+  busStatsLoading.value = true;
+  try {
+    const response = await debugApi.getEventBusStats();
+    busStats.value = response.data;
+  } catch (error) {
+    console.error('获取 EventBus 统计失败:', error);
+  } finally {
+    busStatsLoading.value = false;
+  }
+}
+
+// 筛选后的事件列表由 useLogStreamQuery 的 filteredEvents 承载（谓词见上）
+
+// 渲染窗口：取筛选结果最新一端，超出上限时提示
+const visibleEvents = computed(() => {
+  if (filteredEvents.value.length <= MAX_RENDER_ROWS) return filteredEvents.value;
+  return filteredEvents.value.slice(-MAX_RENDER_ROWS);
+});
+
+const renderTrimmed = computed(() => filteredEvents.value.length > MAX_RENDER_ROWS);
+
+// ------------------------------------------------------------------
+// 动作
+// ------------------------------------------------------------------
+
+function onExitWindow() {
+  eventsStore.exitWindow();
+  scrollToBottom();
+}
+
+// 暂停/继续自动滚动（事件始终在后台接收,仅停止自动滚动）
+function togglePause() {
+  isPaused.value = !isPaused.value;
+  if (isPaused.value) {
+    ElMessage.info('显示已暂停(后台仍在接收)');
+  } else {
+    ElMessage.success('显示已恢复');
+  }
+}
+
+// 清空事件
+async function clearEvents() {
+  if (
+    !(await confirmAction(
+      '将清空当前事件列表（仅内存缓冲，不影响落盘文件）。确定要清空吗？',
+      '清空事件列表',
+    ))
+  )
+    return;
+  eventsStore.clearEvents();
+  expandedEvents.value.clear();
+  ElMessage.success('已清空事件列表');
+}
+
+// ------------------------------------------------------------------
+// 展示辅助
+// ------------------------------------------------------------------
+
+// 跨天条目时间列补日期前缀（历史浏览跨启动时定位用）
+const newestTimestampMs = computed(() => displayEvents.value.at(-1)?.timestamp_ms ?? 0);
+
+function isSameDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function formatEventTime(timestampMs: number): string {
+  const hms = formatTimeHMS(timestampMs);
+  const date = new Date(timestampMs);
+  const newest = newestTimestampMs.value ? new Date(newestTimestampMs.value) : null;
+  if (newest && !isSameDay(date, newest)) {
+    return `${formatDateMD(timestampMs)} ${hms}`;
+  }
+  return hms;
+}
+
+// 获取事件类型的 CSS 类（v2 事件族颜色映射）
+function getEventClass(type: string): string {
+  if (type.startsWith('room.message')) return 'type-collector';
+  if (type === EVENT.streamerSpeech) return 'type-agent';
+  if (type === EVENT.rundownChanged) return 'type-agent';
+  if (type.startsWith('planner')) return 'type-agent';
+  if (type.startsWith('tool.result')) return 'type-tool';
+  if (type.startsWith('tts.utterance')) return 'type-tool';
+  if (type.startsWith('game')) return 'type-game';
+  if (type.startsWith('live')) return 'type-live';
+  if (type.includes('error')) return 'type-error';
+  if (type.startsWith('system')) return 'type-system';
+  return 'type-default';
+}
+
+// 格式化事件数据（带语法高亮和 XSS 防护）
+function formatEventDataHtml(data: Record<string, unknown>, expanded: boolean = false): string {
+  if (expanded) {
+    const jsonStr = JSON.stringify(data, null, 2);
+    const highlighted = hljs.highlight(jsonStr, { language: 'json' }).value;
+    return DOMPurify.sanitize(highlighted);
+  }
+  const str = JSON.stringify(data);
+  const truncated = str.length > 150 ? str.substring(0, 150) + '...' : str;
+  const highlighted = hljs.highlight(truncated, { language: 'json' }).value;
+  return DOMPurify.sanitize(highlighted);
+}
+
+// 判断是否需要展开按钮
+function shouldShowExpand(data: Record<string, unknown>): boolean {
+  const str = JSON.stringify(data);
+  return str.length > 150;
+}
+
+// 切换事件展开状态
+function toggleEventExpand(key: string): void {
+  if (expandedEvents.value.has(key)) {
+    expandedEvents.value.delete(key);
+  } else {
+    expandedEvents.value.add(key);
+  }
+  expandedEvents.value = new Set(expandedEvents.value);
+}
+
+// ------------------------------------------------------------------
+// 滚动
+// ------------------------------------------------------------------
+
+// 滚动锚定已收进 useLogStreamQuery（scrollListTo 随需解构；翻页/跳转自动锚定）
+// 自动滚底的 RAF 节流/初始滚底/卸载清理收进 useAutoScrollFollow；
+// 非历史浏览态才判离底，滚离即暂停跟随
+const { scrollToBottom, handleScroll } = useAutoScrollFollow({
+  container: eventListRef,
+  canHandleScroll: () => !windowActive.value,
+  onLeaveBottom: () => {
+    isPaused.value = true;
+  },
+});
+
+// 生命周期
+let unsubscribe: (() => void) | null = null;
+
+onMounted(() => {
+  // 订阅事件变化,自动滚动 (事件接收由 store setup 阶段统一处理)
+  unsubscribe = eventsStore.$subscribe(() => {
+    if (!isPaused.value && !windowActive.value) {
+      scrollToBottom();
+    }
+  });
+  void fetchBusStats();
+});
+
+onUnmounted(() => {
+  if (unsubscribe) {
+    unsubscribe();
+  }
+});
+</script>
+
+<style scoped>
+.event-log {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - var(--header-height) - var(--spacing-lg) * 2);
+  overflow: hidden;
+}
+
+/* 页面标题 */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--spacing-md);
+  flex-shrink: 0;
+}
+
+.header-left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+/* EventBus 累计统计 */
+.bus-stats-tag {
+  cursor: pointer;
+}
+
+.bus-stats-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--spacing-xs);
+}
+
+.bus-stats-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: var(--spacing-sm);
+}
+
+.bus-event-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+/* 筛选工具栏 */
+.filter-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color-light);
+  margin-bottom: var(--spacing-sm);
+  flex-shrink: 0;
+}
+
+/* 历史查询栏 */
+.history-section {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color-light);
+  margin-bottom: var(--spacing-md);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.filter-left {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.filter-right {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.type-option {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.type-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+/* 事件列表 */
+.event-list-section {
+  flex: 1;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color-light);
+  overflow: hidden;
+}
+
+.event-list {
+  height: 100%;
+  overflow-y: auto;
+  background-color: var(--bg-elevated);
+}
+
+.empty-state {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-md);
+  color: var(--text-placeholder);
+}
+
+.render-trim-note {
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 12px;
+  color: var(--text-placeholder);
+  background: var(--bg-hover);
+}
+
+.events-container {
+  padding: var(--spacing-sm) 0;
+}
+
+.event-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-bottom: 1px solid var(--border-color-light);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color var(--transition-fast);
+}
+
+.event-row:hover {
+  background-color: var(--bg-hover);
+}
+
+.event-row:last-child {
+  border-bottom: none;
+}
+
+.event-time {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 128px;
+  font-size: 12px;
+}
+
+.event-type {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  min-width: 120px;
+  text-align: center;
+  background-color: var(--bg-hover);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.event-type.type-collector {
+  background-color: var(--color-collector-bg);
+  color: var(--color-collector);
+}
+
+.event-type.type-agent {
+  background-color: var(--color-agent-bg);
+  color: var(--color-agent);
+}
+
+.event-type.type-tool {
+  background-color: var(--color-tool-bg);
+  color: var(--color-tool);
+}
+
+.event-type.type-game {
+  background-color: var(--color-game-bg, var(--bg-hover));
+  color: var(--color-game, var(--text-secondary));
+}
+
+.event-type.type-live {
+  background-color: var(--color-live-bg, var(--bg-hover));
+  color: var(--color-live, var(--text-secondary));
+}
+
+.event-type.type-error {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+
+.event-type.type-system {
+  background-color: var(--bg-hover);
+  color: var(--text-placeholder);
+}
+
+.event-data-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.event-data {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 0;
+  word-break: break-all;
+  white-space: pre-wrap;
+  max-height: 60px;
+  overflow: hidden;
+  transition: max-height var(--transition-normal);
+}
+
+.event-data.expanded {
+  max-height: 400px;
+  overflow-y: auto;
+  background-color: var(--bg-elevated);
+  padding: var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  white-space: pre;
+}
+
+.event-row:hover .expand-hint {
+  opacity: 1;
+}
+
+/* 滚动条样式 */
+.event-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.event-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.event-list::-webkit-scrollbar-thumb {
+  background: var(--border-color-dark);
+  border-radius: 4px;
+}
+
+.event-list::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* 响应式 */
+@media (max-width: 1200px) {
+  .filter-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filter-left,
+  .filter-right {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    gap: var(--spacing-sm);
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .filter-left {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filter-left .el-input,
+  .filter-left .el-select {
+    width: 100% !important;
+  }
+}
+</style>
