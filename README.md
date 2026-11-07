@@ -64,7 +64,28 @@ BetterAGI/
 
 ## 快速起步
 
-### 1. 准备配置与安全凭证
+### 一键启动实时解说（新架构）
+
+双击根目录下的 `start_commentary.bat` 或在终端执行：
+
+```bash
+# 模式 A: 盯住电脑全屏幕实时解说
+python live_commentator.py
+
+# 模式 B: 针对指定游戏窗口实时解说 (如 "原神"、"UNDERTALE")
+python live_commentator.py --window 原神
+
+# 可选参数
+python live_commentator.py --window 原神 --interval 2.5 --max-tokens 120
+```
+
+* **模型端点**：`wss://api.modelbest.cn/v1/realtime?mode=chat&model=MiniCPM-o-4.5-Realtime`
+* **API Key**：优先从 `keys/minicpm.key` 读取，或设置环境变量 `MINICPM_API_KEY`，亦可通过 `--key` 传参。
+* **特性**：毫秒级高性能 Windows GDI 截帧，全双工流式吐字解说，智能重连与日志保存。
+
+---
+
+## 历史录制流水线（参考）
 流水线默认不内嵌任何访问密钥。开始前需创建对应凭证（相关模板文件见 `*.example.json`）：
 * 将 BetterGI 访问令牌保存至 `tools/bettergi_token.txt`；
 * 如使用 DeepSeek 导演，准备 `tools/deepseek_key.txt`；
