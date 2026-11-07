@@ -40,6 +40,11 @@ flowchart TD
 
 ```text
 BetterAGI/
+├── new-structure/          # 【全新设计】MiniCPM-o-4.5 实时盯屏实况解说核心
+│   ├── live_commentator.py # 实时解说主程序
+│   ├── minicpm_realtime.py # MiniCPM-o 4.5 Realtime WebSocket 客户端
+│   ├── screen_capture.py   # Windows 高性能屏幕截取
+│   └── start_commentary.bat# 一键启动脚本
 ├── agent/                  # 智能体核心控制流、思考循环、意图管理与 TUI
 ├── BetterGI/               # 游戏操作与自动化主体（含 C# 源码与 integrations/ 适配层）
 │   └── integrations/       # 会话录制、后期渲染、Lumine 桥接驱动
@@ -64,11 +69,13 @@ BetterAGI/
 
 ## 快速起步
 
-### 一键启动实时解说（新架构）
+### 一键启动实时解说（新架构：new-structure）
 
-双击根目录下的 `start_commentary.bat` 或在终端执行：
+进入 `new-structure/` 目录双击运行 `start_commentary.bat` 或在终端执行：
 
 ```bash
+cd new-structure
+
 # 模式 A: 盯住电脑全屏幕实时解说
 python live_commentator.py
 

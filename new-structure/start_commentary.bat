@@ -13,7 +13,9 @@ echo.
 
 :: 1. 查找 Python 环境
 set "PYTHON_EXE="
-if exist ".venv\Scripts\python.exe" (
+if exist "..\.venv\Scripts\python.exe" (
+    set "PYTHON_EXE=..\.venv\Scripts\python.exe"
+) else if exist ".venv\Scripts\python.exe" (
     set "PYTHON_EXE=.venv\Scripts\python.exe"
 ) else (
     where python >nul 2>nul

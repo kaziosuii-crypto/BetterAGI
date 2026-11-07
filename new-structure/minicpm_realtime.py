@@ -16,7 +16,10 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional
 import websockets
 
 DEFAULT_API_URL = "wss://api.modelbest.cn/v1/realtime?mode=chat&model=MiniCPM-o-4.5-Realtime"
-DEFAULT_KEY_PATH = Path(__file__).resolve().parent / "keys" / "minicpm.key"
+POSSIBLE_KEY_PATHS = [
+    Path(__file__).resolve().parent / "keys" / "minicpm.key",
+    Path(__file__).resolve().parent.parent / "keys" / "minicpm.key",
+]
 FALLBACK_API_KEY = "sk-live-l8dH04OnSnTrMIgtptpt9jXh6zczN7USdNVS4xce_34"
 
 DEFAULT_SYSTEM_PROMPT = """你是一位富有激情、反应敏锐、幽默风趣的游戏与桌面实时实况主播。
@@ -36,13 +39,14 @@ def load_api_key(explicit_key: str = "") -> str:
     if env_key:
         return env_key
         
-    if DEFAULT_KEY_PATH.exists():
-        try:
-            k = DEFAULT_KEY_PATH.read_text(encoding="utf-8").strip()
-            if k:
-                return k
-        except Exception:
-            pass
+    for key_path in POSSIBLE_KEY_PATHS:
+        if key_path.exists():
+            try:
+                k = key_path.read_text(encoding="utf-8").strip()
+                if k:
+                    return k
+            except Exception:
+                pass
             
     return FALLBACK_API_KEY
 
